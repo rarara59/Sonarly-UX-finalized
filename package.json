@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "A meme coin edge detection system",
   "scripts": {
+    "setup-db": "ts-node src/scripts/setup-mongodb.ts",
+    "setup-db-js": "node src/scripts-js/setup-mongodb.js",
     "test:jupiter": "ts-node src/tests/jupiter-monitor.test.ts",
     "test:chain": "ts-node src/scripts/test-chain-monitor.ts",
     "test:connection": "ts-node src/scripts/test-connection.ts",
@@ -21,24 +23,28 @@
   "dependencies": {
     "@solana/spl-token": "^0.4.12",
     "@solana/web3.js": "^1.98.0",
+    "@types/dotenv": "^6.1.1",
     "axios": "^1.8.1",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "mongoose": "^8.12.0",
+    "mongodb": "^6.14.2",
+    "mongoose": "^8.12.1",
     "node-cache": "^5.1.2",
     "node-fetch": "^3.3.2",
+    "puppeteer": "^24.4.0",
     "winston": "^3.17.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.14",
     "@types/mongoose": "^5.11.96",
-    "@types/node": "^20.17.23",
+    "@types/node": "^20.17.24",
     "@types/node-fetch": "^2.6.12",
+    "@types/puppeteer": "^5.4.7",
     "jest": "^29.7.0",
     "nodemon": "^3.0.1",
     "ts-jest": "^29.2.5",
-    "ts-node": "^10.9.1",
+    "ts-node": "^10.9.2",
     "typescript": "^5.8.2"
   },
   "jest": {
@@ -55,5 +61,20 @@
       "json",
       "node"
     ]
-  }
+  },
+  "main": "jest.config.js",
+  "directories": {
+    "test": "tests"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rarara59/thorpv1.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/rarara59/thorpv1/issues"
+  },
+  "homepage": "https://github.com/rarara59/thorpv1#readme"
 }

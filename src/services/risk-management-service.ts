@@ -768,3 +768,6 @@ class RiskManagementService {
       };
       
       // 5. Confidence based - Adjust position size based on confidence score
+      
+// Create a singleton instance and export it
+export const riskManagementService = new RiskManagementService();

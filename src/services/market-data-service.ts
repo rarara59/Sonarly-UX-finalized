@@ -3,7 +3,7 @@ import axios from 'axios';
 import winston from 'winston';
 import mongoose, { Document, Schema, Model } from 'mongoose';
 import NodeCache from 'node-cache';
-import config from '../config/config';
+import { config } from '../config'; // Fixed import to use named export
 import rpcConnectionManager from './rpc-connection-manager';
 import { PublicKey } from '@solana/web3.js';
 
@@ -69,7 +69,8 @@ export interface TokenSwapRoute {
 }
 
 export interface TokenMarketData {
-  token: TokenMetadata;
+  tokenAddress: string; // Fixed: changed from token: TokenMetadata
+  metadata: TokenMetadata; // New field to hold the token metadata
   price: TokenPrice;
   liquidity: TokenLiquidity[];
   volume: TokenVolumeData;
@@ -89,7 +90,7 @@ export interface CandleData {
 }
 
 export interface MarketHistory {
-  token: string;
+  tokenAddress: string; // Fixed: Changed from token: string
   network: string;
   timeframe: string;
   candles: CandleData[];
@@ -135,513 +136,6 @@ const marketHistorySchema = new Schema<MarketHistory & Document>({
     low: { type: Number, required: true },
     close: { type: Number, required: true },
     volume: { type: Number, required: true }
-  }
-  
-  /**
-   * Get complete market data for a token
-   */
-  async getTokenMarketData(address: string, network: string): Promise<TokenMarketData | null> {
-    try {
-      if (network !== 'solana') {
-        throw new Error(`Unsupported network: ${network}`);
-      }
-
-      const cacheKey = `token-market-data-${network}-${address}`;
-      
-      // Check cache first
-      const cachedData = this.cache.get<TokenMarketData>(cacheKey);
-      if (cachedData) {
-        return cachedData;
-      }
-      
-      // Get token metadata
-      const tokenMetadata = await this.getTokenMetadata(address, network);
-      if (!tokenMetadata) {
-        return null;
-      }
-      
-      // Get price data
-      const priceData = await this.getTokenPrice(address, network);
-      if (!priceData) {
-        return null;
-      }
-      
-      // Get liquidity data
-      const liquidityDistribution = await this.getTokenLiquidity(address, network) || [];
-      
-      // Get volume data
-      const volumeData = await this.getTokenVolume(address, network);
-      if (!volumeData) {
-        return null;
-      }
-      
-      // Calculate manipulation score
-      const manipulationScore = await this.calculateManipulationScore(address, network);
-      
-      // Build complete market data object
-      const marketData: TokenMarketData = {
-        token: tokenMetadata,
-        price: priceData,
-        liquidity: [], // Will be populated from distribution data
-        volume: volumeData,
-        liquidityDistribution,
-        manipulationScore: manipulationScore || undefined
-      };
-      
-      // Cache the result
-      this.cache.set(cacheKey, marketData, 60 * 10); // 10 minute TTL
-      
-      return marketData;
-    } catch (error) {
-      this.logger.error(`Error getting token market data for ${address} on ${network}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Discover new tokens on Solana
-   */
-  async discoverNewTokens(network: string, minLiquidityUSD: number = 10000): Promise<TokenMetadata[]> {
-    try {
-      if (network !== 'solana') {
-        throw new Error(`Unsupported network: ${network}`);
-      }
-
-      const discoveredTokens: TokenMetadata[] = [];
-      
-      // First try using Helius via RPC Connection Manager if available
-      // Temporarily assume Helius is not active until we implement the method
-      const isHeliusActive = false;
-      if (isHeliusActive) {
-        try {
-          // Temporarily use an empty array until we implement the method
-          const recentTokens: any[] = [];
-          // TODO: Implement getLatestTokens in rpc-connection-manager.ts
-          
-          for (const token of recentTokens) {
-            const tokenAddress = token.address || token.mint;
-            
-            // Get token metadata
-            const tokenData = await this.getTokenMetadata(tokenAddress, network);
-            
-            if (tokenData) {
-              discoveredTokens.push(tokenData);
-            }
-          }
-          
-          if (discoveredTokens.length > 0) {
-            return discoveredTokens;
-          }
-        } catch (error) {
-          this.logger.error(`Error discovering tokens with Helius on ${network}:`, error);
-        }
-      }
-      
-      // Try Birdeye API
-      const birdeyeApi = this.dexApis.get('birdeye');
-      try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/trending_tokens`, {
-          params: {
-            chain: 'solana'
-          },
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
-        });
-        
-        if (response.data && response.data.data && response.data.data.items) {
-          for (const token of response.data.data.items) {
-            // Skip if liquidity is too low
-            if (token.liquidity < minLiquidityUSD) {
-              continue;
-            }
-            
-            // Check if we already know this token
-            const existingToken = await TokenMetadata.findOne({
-              address: token.address,
-              network
-            });
-            
-            if (!existingToken) {
-              // Get full token data
-              const tokenData = await this.getTokenMetadata(token.address, network);
-              
-              if (tokenData) {
-                discoveredTokens.push(tokenData);
-              }
-            }
-          }
-        }
-      } catch (error) {
-        this.logger.error(`Error discovering tokens with Birdeye on ${network}:`, error);
-      }
-      
-      // Try DexScreener API
-      const dexscreenerApi = this.dexApis.get('dexscreener');
-      try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/trending`, {
-          params: {
-            chainId: 'solana'
-          }
-        });
-        
-        if (response.data && response.data.pairs) {
-          for (const pair of response.data.pairs) {
-            // Skip if liquidity is too low
-            if (parseFloat(pair.liquidity?.usd || '0') < minLiquidityUSD) {
-              continue;
-            }
-            
-            // Check if we already know this token
-            const existingToken = await TokenMetadata.findOne({
-              address: pair.baseToken.address,
-              network
-            });
-            
-            if (!existingToken) {
-              // Get full token data
-              const tokenData = await this.getTokenMetadata(pair.baseToken.address, network);
-              
-              if (tokenData) {
-                discoveredTokens.push(tokenData);
-              }
-            }
-          }
-        }
-      } catch (error) {
-        this.logger.error(`Error discovering tokens with DexScreener on ${network}:`, error);
-      }
-      
-      return discoveredTokens;
-    } catch (error) {
-      this.logger.error(`Error discovering new tokens on ${network}:`, error);
-      return [];
-    }
-  }
-}
-
-export default new MarketDataService();
-
-  /**
-   * Analyze token security (new method using RPC manager)
-   */
-  async analyzeTokenSecurity(address: string, network: string): Promise<{
-    hasMintAuthority: boolean;
-    hasFreezingAuthority: boolean;
-    supplyControlledByTeam: boolean;
-    suspiciousTransactions: number;
-    securityScore: number;
-    warnings: string[];
-  } | null> {
-    try {
-      if (network !== 'solana') {
-        throw new Error(`Unsupported network for token security analysis: ${network}`);
-      }
-      
-      // Get token mint account info
-      const mintInfo = await rpcConnectionManager.getAccountInfo(address);
-      
-      if (!mintInfo) {
-        return null;
-      }
-      
-      const warnings: string[] = [];
-      let securityScore = 100; // Start with perfect score
-      
-      // Check if mint authority exists and is enabled
-      const hasMintAuthority = !!mintInfo.data?.parsed?.info?.mintAuthority;
-      if (hasMintAuthority) {
-        warnings.push('Token has an active mint authority that can create new tokens');
-        securityScore -= 30;
-      }
-      
-      // Check if freeze authority exists
-      const hasFreezingAuthority = !!mintInfo.data?.parsed?.info?.freezeAuthority;
-      if (hasFreezingAuthority) {
-        warnings.push('Token has a freeze authority that can freeze user accounts');
-        securityScore -= 20;
-      }
-      
-      // Get recent transactions to analyze for suspicious patterns
-      const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 50);
-      let suspiciousTransactions = 0;
-      
-      // Simple logic to detect suspicious transactions - would be more sophisticated in practice
-      if (signatures) {
-        for (const sig of signatures.slice(0, 20)) {
-          try {
-            const tx = await rpcConnectionManager.getTransaction(sig.signature);
-            
-            // Look for specific instruction patterns that might indicate minting, privilege changes, etc.
-            if (tx && tx.meta && tx.meta.logMessages) {
-              const logs = tx.meta.logMessages;
-              
-              // Example: Check for mint instructions
-              if (logs.some((log: string) => log.includes('Instruction: MintTo'))) {
-                suspiciousTransactions++;
-                securityScore -= 2; // Deduct points for each suspicious transaction
-              }
-              
-              // Check for authority changes
-              if (logs.some((log: string) => log.includes('Instruction: SetAuthority'))) {
-                suspiciousTransactions++;
-                securityScore -= 5;
-              }
-            }
-          } catch (e) {
-            // Skip errors for individual transactions
-          }
-        }
-      }
-      
-      // Cap suspicious transaction deductions
-      securityScore = Math.max(0, securityScore);
-      
-      // Analyze ownership concentration
-      // This is a placeholder for a more complete implementation
-      const supplyControlledByTeam = false;
-      
-      return {
-        hasMintAuthority,
-        hasFreezingAuthority,
-        supplyControlledByTeam,
-        suspiciousTransactions,
-        securityScore,
-        warnings
-      };
-    } catch (error) {
-      this.logger.error(`Error analyzing token security for ${address} on ${network}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Get best swap route for a token on Solana
-   */
-  async getSwapRoute(fromToken: string, toToken: string, amount: string, network: string): Promise<TokenSwapRoute | null> {
-    try {
-      if (network !== 'solana') {
-        throw new Error(`Unsupported network for swap route: ${network}`);
-      }
-      
-      // Use Jupiter API
-      const jupiterApi = this.dexApis.get('jupiter');
-      
-      const response = await axios.get(`${jupiterApi.baseUrl}/quote`, {
-        params: {
-          inputMint: fromToken,
-          outputMint: toToken,
-          amount,
-          slippageBps: 50 // 0.5% slippage
-        }
-      });
-      
-      if (response.data && response.data.data) {
-        const routeData = response.data.data;
-        
-        return {
-          fromToken,
-          toToken,
-          exchanges: routeData.marketInfos.map((market: any) => market.label),
-          estimatedOutput: parseFloat(routeData.outAmount),
-          priceImpact: parseFloat(routeData.priceImpactPct),
-          path: [fromToken, ...routeData.marketInfos.map((market: any) => market.outputMint)]
-        };
-      }
-      
-      return null;
-    } catch (error) {
-      this.logger.error(`Error getting swap route from ${fromToken} to ${toToken} on ${network}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Calculate manipulation score for a token
-   * This is a composite metric that considers:
-   * - Liquidity distribution (concentrated in one place is suspicious)
-   * - Trading volume vs liquidity ratio
-   * - Buy/sell transaction ratio
-   * - Price volatility
-   * - Holder concentration
-   * Returns a score from 0-100 where higher is more likely to be manipulated
-   */
-  async calculateManipulationScore(address: string, network: string): Promise<number | null> {
-    try {
-      if (network !== 'solana') {
-        throw new Error(`Unsupported network: ${network}`);
-      }
-
-      // Get required data
-      const liquidityDistribution = await this.getTokenLiquidity(address, network);
-      const volumeData = await this.getTokenVolume(address, network);
-      const marketHistory = await this.getMarketHistory(address, network, '15m', 96); // Last 24 hours
-      
-      if (!liquidityDistribution || !volumeData || !marketHistory) {
-        return null;
-      }
-      
-      // 1. Liquidity concentration score (0-25)
-      const topLiquidityPercentage = liquidityDistribution[0]?.percentage || 0;
-      const liquidityConcentrationScore = Math.min(25, (topLiquidityPercentage / 100) * 25);
-      
-      // 2. Volume to liquidity ratio score (0-25)
-      const totalLiquidity = liquidityDistribution.reduce((sum, item) => sum + item.liquidityUSD, 0);
-      const volumeToLiquidityRatio = volumeData.volume24h / totalLiquidity;
-      
-      // Very high volume compared to liquidity is suspicious
-      let volumeToLiquidityScore = 0;
-      if (volumeToLiquidityRatio > 5) {
-        volumeToLiquidityScore = 25; // Extremely high turnover
-      } else if (volumeToLiquidityRatio > 2) {
-        volumeToLiquidityScore = 15 + ((volumeToLiquidityRatio - 2) / 3) * 10;
-      } else if (volumeToLiquidityRatio > 1) {
-        volumeToLiquidityScore = 5 + ((volumeToLiquidityRatio - 1)) * 10;
-      } else if (volumeToLiquidityRatio > 0.5) {
-        volumeToLiquidityScore = 5;
-      }
-      
-      // 3. Buy/sell ratio score (0-20)
-      const totalTxns = volumeData.buys24h + volumeData.sells24h;
-      let buyToSellScore = 0;
-      
-      if (totalTxns > 10) { // Only count if there's significant activity
-        const buyRatio = volumeData.buys24h / totalTxns;
-        
-        // Extreme buy or sell pressure can indicate manipulation
-        if (buyRatio > 0.9 || buyRatio < 0.1) {
-          buyToSellScore = 20;
-        } else if (buyRatio > 0.8 || buyRatio < 0.2) {
-          buyToSellScore = 15;
-        } else if (buyRatio > 0.7 || buyRatio < 0.3) {
-          buyToSellScore = 10;
-        } else if (buyRatio > 0.65 || buyRatio < 0.35) {
-          buyToSellScore = 5;
-        }
-      }
-      
-      // 4. Price volatility score (0-30)
-      let volatilityScore = 0;
-      
-      if (marketHistory.length > 0) {
-        // Calculate standard deviation of price changes
-        const priceChanges = [];
-        for (let i = 1; i < marketHistory.length; i++) {
-          const percentChange = ((marketHistory[i].close - marketHistory[i-1].close) / marketHistory[i-1].close) * 100;
-          priceChanges.push(percentChange);
-        }
-        
-        // Calculate standard deviation
-        const mean = priceChanges.reduce((sum, value) => sum + value, 0) / priceChanges.length;
-        const variance = priceChanges.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / priceChanges.length;
-        const stdDev = Math.sqrt(variance);
-        
-        // Score based on standard deviation of 15-min candles
-        if (stdDev > 8) {
-          volatilityScore = 30; // Extremely volatile
-        } else if (stdDev > 5) {
-          volatilityScore = 20 + ((stdDev - 5) / 3) * 10;
-        } else if (stdDev > 3) {
-          volatilityScore = 10 + ((stdDev - 3) / 2) * 10;
-        } else if (stdDev > 1) {
-          volatilityScore = ((stdDev - 1) / 2) * 10;
-        }
-      }
-
-      // 5. Add on-chain transaction analysis using RPC manager
-      let onChainManipulationScore = 0;
-      try {
-        // Get recent signatures for this token
-        const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 100);
-        
-        if (signatures && signatures.length > 0) {
-          // Analyze transaction patterns
-          const uniqueAccounts = new Set<string>();
-          const transactionTimestamps: number[] = [];
-          
-          for (let i = 0; i < Math.min(signatures.length, 50); i++) {
-            try {
-              const sig = signatures[i];
-              if (sig.blockTime) {
-                transactionTimestamps.push(sig.blockTime);
-              }
-              
-              const tx = await rpcConnectionManager.getTransaction(sig.signature);
-              
-              if (tx && tx.transaction && tx.transaction.message) {
-                // Collect unique accounts involved
-                tx.transaction.message.accountKeys.forEach((key: string) => {
-                  uniqueAccounts.add(key);
-                });
-              }
-            } catch (e) {
-              // Skip errors for individual transactions
-            }
-          }
-          
-          // Calculate unique account ratio
-          // Lower ratio indicates fewer unique accounts involved = higher manipulation risk
-          const uniqueAccountRatio = uniqueAccounts.size / Math.min(signatures.length, 50);
-          
-          // Calculate transaction timing pattern
-          // Sort timestamps
-          transactionTimestamps.sort((a, b) => a - b);
-          
-          // Calculate time differences between transactions
-          const timeDiffs = [];
-          for (let i = 1; i < transactionTimestamps.length; i++) {
-            timeDiffs.push(transactionTimestamps[i] - transactionTimestamps[i-1]);
-          }
-          
-          // Check for unnaturally regular patterns
-          let regularPatternCount = 0;
-          for (let i = 1; i < timeDiffs.length; i++) {
-            // If consecutive time differences are very similar, could indicate bot activity
-            if (Math.abs(timeDiffs[i] - timeDiffs[i-1]) < 2) { // Within 2 seconds
-              regularPatternCount++;
-            }
-          }
-          
-          // Score based on unique account ratio
-          if (uniqueAccountRatio < 0.2) {
-            onChainManipulationScore += 15; // Very concentrated activity
-          } else if (uniqueAccountRatio < 0.4) {
-            onChainManipulationScore += 10;
-          } else if (uniqueAccountRatio < 0.6) {
-            onChainManipulationScore += 5;
-          }
-          
-          // Score based on regular transaction patterns
-          if (regularPatternCount > 10) {
-            onChainManipulationScore += 15; // Very regular transaction timing
-          } else if (regularPatternCount > 5) {
-            onChainManipulationScore += 10;
-          } else if (regularPatternCount > 2) {
-            onChainManipulationScore += 5;
-          }
-          
-          // Cap on-chain manipulation score
-          onChainManipulationScore = Math.min(30, onChainManipulationScore);
-        }
-      } catch (error) {
-        this.logger.error(`Error in on-chain manipulation analysis for ${address}:`, error);
-        // Continue with other score components
-      }
-      
-      // Calculate final score
-      const manipulationScore = Math.min(100, 
-        liquidityConcentrationScore + 
-        volumeToLiquidityScore + 
-        buyToSellScore + 
-        volatilityScore +
-        onChainManipulationScore
-      );
-      
-      return manipulationScore;
-    } catch (error) {
-      this.logger.error(`Error calculating manipulation score for ${address} on ${network}:`, error);
-      return null;
-    }
   }],
   lastUpdated: { type: Date, default: Date.now }
 }, { timestamps: true });
@@ -999,39 +493,52 @@ class MarketDataService {
       // Try Birdeye API first
       const birdeyeApi = this.dexApis.get('birdeye');
       try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/pools`, {
-          params: {
-            address: address,
-            chain: 'solana'
-          },
+        const response = await axios.get(`${birdeyeApi.baseUrl}/public/price?address=${address}&chain=solana`, {
           headers: {
             'X-API-KEY': birdeyeApi.apiKey
           }
         });
         
-        if (response.data && response.data.data && response.data.data.items) {
-          const pools = response.data.data.items;
-          
-          // Calculate total liquidity
-          const totalLiquidity = pools.reduce((sum: number, pool: any) => 
-            sum + (pool.liquidity || 0), 0
-          );
-          
-          if (totalLiquidity === 0) return null;
-          
-          // Create distribution data
-          const distribution = pools.map((pool: any) => ({
-            exchange: pool.exchange,
-            percentage: (pool.liquidity / totalLiquidity) * 100,
-            liquidityUSD: pool.liquidity,
-            pairAddress: pool.poolAddress
-          }));
-          
-          // Sort by liquidity
-          return distribution.sort((a: any, b: any) => b.liquidityUSD - a.liquidityUSD);
+        if (response.data && response.data.data && response.data.data.value) {
+          const priceData = response.data.data;
+          return {
+            price: priceData.value,
+            priceChange24h: priceData.priceChange24h || 0,
+            priceChange1h: priceData.priceChange1h || 0,
+            timestamp: new Date()
+          };
         }
       } catch (error) {
-        this.logger.debug(`Failed to get token liquidity from Birdeye for ${address}:`, error);
+        this.logger.debug(`Failed to get token price from Birdeye for ${address}:`, error);
+      }
+      
+      // Try Jupiter API
+      const jupiterApi = this.dexApis.get('jupiter');
+      try {
+        // Jupiter doesn't have a direct price API, so use the quote API with a small amount
+        // This is a workaround to get the current price
+        const WSOL_ADDRESS = 'So11111111111111111111111111111111111111112'; // Wrapped SOL
+        const response = await axios.get(`${jupiterApi.baseUrl}/quote`, {
+          params: {
+            inputMint: WSOL_ADDRESS,
+            outputMint: address,
+            amount: 1000000000 // 1 SOL in lamports
+          }
+        });
+        
+        if (response.data && response.data.data) {
+          const quoteData = response.data.data;
+          // Calculate price in SOL
+          const price = parseInt(quoteData.outAmount) / 1000000000;
+          
+          return {
+            price: price,
+            priceChange24h: 0, // Jupiter doesn't provide this
+            timestamp: new Date()
+          };
+        }
+      } catch (error) {
+        this.logger.debug(`Failed to get token price from Jupiter for ${address}:`, error);
       }
       
       // Try DexScreener API
@@ -1040,58 +547,38 @@ class MarketDataService {
         const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
         
         if (response.data && response.data.pairs && response.data.pairs.length > 0) {
-          const pairs = response.data.pairs;
-          
-          // Calculate total liquidity
-          const totalLiquidity = pairs.reduce((sum: number, pair: any) => 
-            sum + parseFloat(pair.liquidity?.usd || '0'), 0
+          // Find the pair with highest liquidity
+          const sortedPairs = response.data.pairs.sort((a: any, b: any) => 
+            parseFloat(b.liquidity?.usd || '0') - parseFloat(a.liquidity?.usd || '0')
           );
           
-          if (totalLiquidity === 0) return null;
-          
-          // Create distribution data
-          const distribution = pairs.map((pair: any) => {
-            const liquidityUSD = parseFloat(pair.liquidity?.usd || '0');
-            return {
-              exchange: pair.dexId,
-              percentage: (liquidityUSD / totalLiquidity) * 100,
-              liquidityUSD,
-              pairAddress: pair.pairAddress
-            };
-          });
-          
-          // Sort by liquidity
-          return distribution.sort((a: any, b: any) => b.liquidityUSD - a.liquidityUSD);
+          const pair = sortedPairs[0];
+          return {
+            price: parseFloat(pair.priceUsd),
+            priceChange24h: parseFloat(pair.priceChange.h24),
+            priceChange1h: parseFloat(pair.priceChange.h1),
+            timestamp: new Date()
+          };
         }
       } catch (error) {
-        this.logger.debug(`Failed to get token liquidity from DexScreener for ${address}:`, error);
+        this.logger.debug(`Failed to get token price from DexScreener for ${address}:`, error);
       }
       
-      // Try on-chain method using RPC manager
+      // Try on-chain DEX pools via RPC manager
       try {
-        // This would be complex as it requires querying multiple Solana DEXes
-        // For now, only relying on APIs for liquidity data
-        
-        // Sample code to fetch Raydium pools:
-        const RAYDIUM_PROGRAM_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-        
-        const raydiumPools = await rpcConnectionManager.getProgramAccounts(RAYDIUM_PROGRAM_ID, [
-          { memcmp: { offset: 8, bytes: address } }
-        ]);
-        
-        // Processing Raydium pools would require specific knowledge of their data structure
-        // This is just a placeholder for a real implementation
+        // This would be an advanced implementation querying Solana DEX pools
+        // For now, only relying on APIs for price data
       } catch (error) {
-        this.logger.debug(`Failed to get on-chain liquidity data for ${address}:`, error);
+        this.logger.debug(`Failed to calculate on-chain price for ${address}:`, error);
       }
       
       return null;
     } catch (error) {
-      this.logger.error(`Error fetching token liquidity for ${address} on ${network}:`, error);
+      this.logger.error(`Error fetching token price for ${address} on ${network}:`, error);
       return null;
     }
   }
-
+  
   /**
    * Get token volume data
    */
@@ -1241,92 +728,6 @@ class MarketDataService {
       return null;
     } catch (error) {
       this.logger.error(`Error fetching token volume for ${address} on ${network}:`, error);
-      return null;
-    }
-  }birdeye');
-      try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/price?address=${address}&chain=solana`, {
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
-        });
-        
-        if (response.data && response.data.data && response.data.data.value) {
-          const priceData = response.data.data;
-          return {
-            price: priceData.value,
-            priceChange24h: priceData.priceChange24h || 0,
-            priceChange1h: priceData.priceChange1h || 0,
-            timestamp: new Date()
-          };
-        }
-      } catch (error) {
-        this.logger.debug(`Failed to get token price from Birdeye for ${address}:`, error);
-      }
-      
-      // Try Jupiter API
-      const jupiterApi = this.dexApis.get('jupiter');
-      try {
-        // Jupiter doesn't have a direct price API, so use the quote API with a small amount
-        // This is a workaround to get the current price
-        const WSOL_ADDRESS = 'So11111111111111111111111111111111111111112'; // Wrapped SOL
-        const response = await axios.get(`${jupiterApi.baseUrl}/quote`, {
-          params: {
-            inputMint: WSOL_ADDRESS,
-            outputMint: address,
-            amount: 1000000000 // 1 SOL in lamports
-          }
-        });
-        
-        if (response.data && response.data.data) {
-          const quoteData = response.data.data;
-          // Calculate price in SOL
-          const price = parseInt(quoteData.outAmount) / 1000000000;
-          
-          return {
-            price: price,
-            priceChange24h: 0, // Jupiter doesn't provide this
-            timestamp: new Date()
-          };
-        }
-      } catch (error) {
-        this.logger.debug(`Failed to get token price from Jupiter for ${address}:`, error);
-      }
-      
-      // Try DexScreener API
-      const dexscreenerApi = this.dexApis.get('dexscreener');
-      try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
-        
-        if (response.data && response.data.pairs && response.data.pairs.length > 0) {
-          // Find the pair with highest liquidity
-          const sortedPairs = response.data.pairs.sort((a: any, b: any) => 
-            parseFloat(b.liquidity?.usd || '0') - parseFloat(a.liquidity?.usd || '0')
-          );
-          
-          const pair = sortedPairs[0];
-          return {
-            price: parseFloat(pair.priceUsd),
-            priceChange24h: parseFloat(pair.priceChange.h24),
-            priceChange1h: parseFloat(pair.priceChange.h1),
-            timestamp: new Date()
-          };
-        }
-      } catch (error) {
-        this.logger.debug(`Failed to get token price from DexScreener for ${address}:`, error);
-      }
-      
-      // Try on-chain DEX pools via RPC manager
-      try {
-        // This would be an advanced implementation querying Solana DEX pools
-        // For now, only relying on APIs for price data
-      } catch (error) {
-        this.logger.debug(`Failed to calculate on-chain price for ${address}:`, error);
-      }
-      
-      return null;
-    } catch (error) {
-      this.logger.error(`Error fetching token price for ${address} on ${network}:`, error);
       return null;
     }
   }
@@ -1581,4 +982,603 @@ class MarketDataService {
       }
 
       // Try Birdeye API first
-      const birdeyeApi = this.dexApis.get('
+      const birdeyeApi = this.dexApis.get('birdeye');
+      try {
+        const response = await axios.get(`${birdeyeApi.baseUrl}/public/pools`, {
+          params: {
+            address: address,
+            chain: 'solana'
+          },
+          headers: {
+            'X-API-KEY': birdeyeApi.apiKey
+          }
+        });
+        
+        if (response.data && response.data.data && response.data.data.items) {
+          const pools = response.data.data.items;
+          
+          // Calculate total liquidity
+          const totalLiquidity = pools.reduce((sum: number, pool: any) => 
+            sum + (pool.liquidity || 0), 0
+          );
+          
+          if (totalLiquidity === 0) return null;
+          
+          // Create distribution data
+          const distribution = pools.map((pool: any) => ({
+            exchange: pool.exchange,
+            percentage: (pool.liquidity / totalLiquidity) * 100,
+            liquidityUSD: pool.liquidity,
+            pairAddress: pool.poolAddress
+          }));
+          
+          // Sort by liquidity
+          return distribution.sort((a: any, b: any) => b.liquidityUSD - a.liquidityUSD);
+        }
+      } catch (error) {
+        this.logger.debug(`Failed to get token liquidity from Birdeye for ${address}:`, error);
+      }
+      
+      // Try DexScreener API
+      const dexscreenerApi = this.dexApis.get('dexscreener');
+      try {
+        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        
+        if (response.data && response.data.pairs && response.data.pairs.length > 0) {
+          const pairs = response.data.pairs;
+          
+          // Calculate total liquidity
+          const totalLiquidity = pairs.reduce((sum: number, pair: any) => 
+            sum + parseFloat(pair.liquidity?.usd || '0'), 0
+          );
+          
+          if (totalLiquidity === 0) return null;
+          
+          // Create distribution data
+          const distribution = pairs.map((pair: any) => {
+            const liquidityUSD = parseFloat(pair.liquidity?.usd || '0');
+            return {
+              exchange: pair.dexId,
+              percentage: (liquidityUSD / totalLiquidity) * 100,
+              liquidityUSD,
+              pairAddress: pair.pairAddress
+            };
+          });
+          
+          // Sort by liquidity
+          return distribution.sort((a: any, b: any) => b.liquidityUSD - a.liquidityUSD);
+        }
+      } catch (error) {
+        this.logger.debug(`Failed to get token liquidity from DexScreener for ${address}:`, error);
+      }
+      
+      // Try on-chain method using RPC manager
+      try {
+        // This would be complex as it requires querying multiple Solana DEXes
+        // For now, only relying on APIs for liquidity data
+        
+        // Sample code to fetch Raydium pools:
+        const RAYDIUM_PROGRAM_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+        
+        const raydiumPools = await rpcConnectionManager.getProgramAccounts(RAYDIUM_PROGRAM_ID, [
+          { memcmp: { offset: 8, bytes: address } }
+        ]);
+        
+        // Processing Raydium pools would require specific knowledge of their data structure
+        // This is just a placeholder for a real implementation
+      } catch (error) {
+        this.logger.debug(`Failed to get on-chain liquidity data for ${address}:`, error);
+      }
+      
+      return null;
+    } catch (error) {
+      this.logger.error(`Error fetching token liquidity for ${address} on ${network}:`, error);
+      return null;
+    }
+  }
+  
+  /**
+   * Get complete market data for a token
+   */
+  async getTokenMarketData(address: string, network: string): Promise<TokenMarketData | null> {
+    try {
+      if (network !== 'solana') {
+        throw new Error(`Unsupported network: ${network}`);
+      }
+
+      const cacheKey = `token-market-data-${network}-${address}`;
+      
+      // Check cache first
+      const cachedData = this.cache.get<TokenMarketData>(cacheKey);
+      if (cachedData) {
+        return cachedData;
+      }
+      
+      // Get token metadata
+      const tokenMetadata = await this.getTokenMetadata(address, network);
+      if (!tokenMetadata) {
+        return null;
+      }
+      
+      // Get price data
+      const priceData = await this.getTokenPrice(address, network);
+      if (!priceData) {
+        return null;
+      }
+      
+      // Get liquidity data
+      const liquidityDistribution = await this.getTokenLiquidity(address, network) || [];
+      
+      // Get volume data
+      const volumeData = await this.getTokenVolume(address, network);
+      if (!volumeData) {
+        return null;
+      }
+      
+      // Calculate manipulation score
+      const manipulationScore = await this.calculateManipulationScore(address, network);
+      
+      // Build complete market data object
+      const marketData: TokenMarketData = {
+        tokenAddress: address, // Changed from token: tokenMetadata
+        metadata: tokenMetadata, // New field to hold the metadata
+        price: priceData,
+        liquidity: [], // Will be populated from distribution data
+        volume: volumeData,
+        liquidityDistribution,
+        manipulationScore: manipulationScore || undefined
+      };
+      
+      // Cache the result
+      this.cache.set(cacheKey, marketData, 60 * 10); // 10 minute TTL
+      
+      return marketData;
+    } catch (error) {
+      this.logger.error(`Error getting token market data for ${address} on ${network}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Discover new tokens on Solana
+   */
+  async discoverNewTokens(network: string, minLiquidityUSD: number = 10000): Promise<TokenMetadata[]> {
+    try {
+      if (network !== 'solana') {
+        throw new Error(`Unsupported network: ${network}`);
+      }
+
+      const discoveredTokens: TokenMetadata[] = [];
+      
+      // First try using RPC Connection Manager's getLatestTokens method
+      const isHeliusActive = rpcConnectionManager.isEndpointActive('helius');
+      if (isHeliusActive) {
+        try {
+          // Use the new RPC Connection Manager method
+          const recentTokens = await rpcConnectionManager.getLatestTokens(20, 5);
+          
+          for (const token of recentTokens) {
+            const tokenAddress = token.mintAddress;
+            
+            // Get token metadata
+            const tokenData = await this.getTokenMetadata(tokenAddress, network);
+            
+            if (tokenData) {
+              discoveredTokens.push(tokenData);
+            }
+          }
+          
+          if (discoveredTokens.length > 0) {
+            return discoveredTokens;
+          }
+        } catch (error) {
+          this.logger.error(`Error discovering tokens with RPC connection manager on ${network}:`, error);
+        }
+      }
+      
+      // Try Birdeye API
+      const birdeyeApi = this.dexApis.get('birdeye');
+      try {
+        const response = await axios.get(`${birdeyeApi.baseUrl}/public/trending_tokens`, {
+          params: {
+            chain: 'solana'
+          },
+          headers: {
+            'X-API-KEY': birdeyeApi.apiKey
+          }
+        });
+        
+        if (response.data && response.data.data && response.data.data.items) {
+          for (const token of response.data.data.items) {
+            // Skip if liquidity is too low
+            if (token.liquidity < minLiquidityUSD) {
+              continue;
+            }
+            
+            // Check if we already know this token
+            const existingToken = await TokenMetadata.findOne({
+              address: token.address,
+              network
+            });
+            
+            if (!existingToken) {
+              // Get full token data
+              const tokenData = await this.getTokenMetadata(token.address, network);
+              
+              if (tokenData) {
+                discoveredTokens.push(tokenData);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Error discovering tokens with Birdeye on ${network}:`, error);
+      }
+      
+      // Try DexScreener API
+      const dexscreenerApi = this.dexApis.get('dexscreener');
+      try {
+        const response = await axios.get(`${dexscreenerApi.baseUrl}/trending`, {
+          params: {
+            chainId: 'solana'
+          }
+        });
+        
+        if (response.data && response.data.pairs) {
+          for (const pair of response.data.pairs) {
+            // Skip if liquidity is too low
+            if (parseFloat(pair.liquidity?.usd || '0') < minLiquidityUSD) {
+              continue;
+            }
+            
+            // Check if we already know this token
+            const existingToken = await TokenMetadata.findOne({
+              address: pair.baseToken.address,
+              network
+            });
+            
+            if (!existingToken) {
+              // Get full token data
+              const tokenData = await this.getTokenMetadata(pair.baseToken.address, network);
+              
+              if (tokenData) {
+                discoveredTokens.push(tokenData);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Error discovering tokens with DexScreener on ${network}:`, error);
+      }
+      
+      return discoveredTokens;
+    } catch (error) {
+      this.logger.error(`Error discovering new tokens on ${network}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Analyze token security (using RPC manager)
+   */
+  async analyzeTokenSecurity(address: string, network: string): Promise<{
+    hasMintAuthority: boolean;
+    hasFreezingAuthority: boolean;
+    supplyControlledByTeam: boolean;
+    suspiciousTransactions: number;
+    securityScore: number;
+    warnings: string[];
+  } | null> {
+    try {
+      if (network !== 'solana') {
+        throw new Error(`Unsupported network for token security analysis: ${network}`);
+      }
+      
+      // Get token mint account info
+      const mintInfo = await rpcConnectionManager.getAccountInfo(address);
+      
+      if (!mintInfo) {
+        return null;
+      }
+      
+      const warnings: string[] = [];
+      let securityScore = 100; // Start with perfect score
+      
+      // Check if mint authority exists and is enabled
+      const hasMintAuthority = !!mintInfo.data?.parsed?.info?.mintAuthority;
+      if (hasMintAuthority) {
+        warnings.push('Token has an active mint authority that can create new tokens');
+        securityScore -= 30;
+      }
+      
+      // Check if freeze authority exists
+      const hasFreezingAuthority = !!mintInfo.data?.parsed?.info?.freezeAuthority;
+      if (hasFreezingAuthority) {
+        warnings.push('Token has a freeze authority that can freeze user accounts');
+        securityScore -= 20;
+      }
+      
+      // Get recent transactions to analyze for suspicious patterns
+      const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 50);
+      let suspiciousTransactions = 0;
+      
+      // Simple logic to detect suspicious transactions - would be more sophisticated in practice
+      if (signatures) {
+        for (const sig of signatures.slice(0, 20)) {
+          try {
+            const tx = await rpcConnectionManager.getTransaction(sig.signature);
+            
+            // Look for specific instruction patterns that might indicate minting, privilege changes, etc.
+            if (tx && tx.meta && tx.meta.logMessages) {
+              const logs = tx.meta.logMessages;
+              
+              // Example: Check for mint instructions
+              if (logs.some((log: string) => log.includes('Instruction: MintTo'))) {
+                suspiciousTransactions++;
+                securityScore -= 2; // Deduct points for each suspicious transaction
+              }
+              
+              // Check for authority changes
+              if (logs.some((log: string) => log.includes('Instruction: SetAuthority'))) {
+                suspiciousTransactions++;
+                securityScore -= 5;
+              }
+            }
+          } catch (e) {
+            // Skip errors for individual transactions
+          }
+        }
+      }
+      
+      // Cap suspicious transaction deductions
+      securityScore = Math.max(0, securityScore);
+      
+      // Analyze ownership concentration
+      // This is a placeholder for a more complete implementation
+      const supplyControlledByTeam = false;
+      
+      return {
+        hasMintAuthority,
+        hasFreezingAuthority,
+        supplyControlledByTeam,
+        suspiciousTransactions,
+        securityScore,
+        warnings
+      };
+    } catch (error) {
+      this.logger.error(`Error analyzing token security for ${address} on ${network}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get best swap route for a token on Solana
+   */
+  async getSwapRoute(fromToken: string, toToken: string, amount: string, network: string): Promise<TokenSwapRoute | null> {
+    try {
+      if (network !== 'solana') {
+        throw new Error(`Unsupported network for swap route: ${network}`);
+      }
+      
+      // Use Jupiter API
+      const jupiterApi = this.dexApis.get('jupiter');
+      
+      const response = await axios.get(`${jupiterApi.baseUrl}/quote`, {
+        params: {
+          inputMint: fromToken,
+          outputMint: toToken,
+          amount,
+          slippageBps: 50 // 0.5% slippage
+        }
+      });
+      
+      if (response.data && response.data.data) {
+        const routeData = response.data.data;
+        
+        return {
+          fromToken,
+          toToken,
+          exchanges: routeData.marketInfos.map((market: any) => market.label),
+          estimatedOutput: parseFloat(routeData.outAmount),
+          priceImpact: parseFloat(routeData.priceImpactPct),
+          path: [fromToken, ...routeData.marketInfos.map((market: any) => market.outputMint)]
+        };
+      }
+      
+      return null;
+    } catch (error) {
+      this.logger.error(`Error getting swap route from ${fromToken} to ${toToken} on ${network}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Calculate manipulation score for a token
+   * This is a composite metric that considers:
+   * - Liquidity distribution (concentrated in one place is suspicious)
+   * - Trading volume vs liquidity ratio
+   * - Buy/sell transaction ratio
+   * - Price volatility
+   * - Holder concentration
+   * Returns a score from 0-100 where higher is more likely to be manipulated
+   */
+  async calculateManipulationScore(address: string, network: string): Promise<number | null> {
+    try {
+      if (network !== 'solana') {
+        throw new Error(`Unsupported network: ${network}`);
+      }
+
+      // Get required data
+      const liquidityDistribution = await this.getTokenLiquidity(address, network);
+      const volumeData = await this.getTokenVolume(address, network);
+      const marketHistory = await this.getMarketHistory(address, network, '15m', 96); // Last 24 hours
+      
+      if (!liquidityDistribution || !volumeData || !marketHistory) {
+        return null;
+      }
+      
+      // 1. Liquidity concentration score (0-25)
+      const topLiquidityPercentage = liquidityDistribution[0]?.percentage || 0;
+      const liquidityConcentrationScore = Math.min(25, (topLiquidityPercentage / 100) * 25);
+      
+      // 2. Volume to liquidity ratio score (0-25)
+      const totalLiquidity = liquidityDistribution.reduce((sum, item) => sum + item.liquidityUSD, 0);
+      const volumeToLiquidityRatio = volumeData.volume24h / totalLiquidity;
+      
+      // Very high volume compared to liquidity is suspicious
+      let volumeToLiquidityScore = 0;
+      if (volumeToLiquidityRatio > 5) {
+        volumeToLiquidityScore = 25; // Extremely high turnover
+      } else if (volumeToLiquidityRatio > 2) {
+        volumeToLiquidityScore = 15 + ((volumeToLiquidityRatio - 2) / 3) * 10;
+      } else if (volumeToLiquidityRatio > 1) {
+        volumeToLiquidityScore = 5 + ((volumeToLiquidityRatio - 1)) * 10;
+      } else if (volumeToLiquidityRatio > 0.5) {
+        volumeToLiquidityScore = 5;
+      }
+      
+      // 3. Buy/sell ratio score (0-20)
+      const totalTxns = volumeData.buys24h + volumeData.sells24h;
+      let buyToSellScore = 0;
+      
+      if (totalTxns > 10) { // Only count if there's significant activity
+        const buyRatio = volumeData.buys24h / totalTxns;
+        
+        // Extreme buy or sell pressure can indicate manipulation
+        if (buyRatio > 0.9 || buyRatio < 0.1) {
+          buyToSellScore = 20;
+        } else if (buyRatio > 0.8 || buyRatio < 0.2) {
+          buyToSellScore = 15;
+        } else if (buyRatio > 0.7 || buyRatio < 0.3) {
+          buyToSellScore = 10;
+        } else if (buyRatio > 0.65 || buyRatio < 0.35) {
+          buyToSellScore = 5;
+        }
+      }
+      
+      // 4. Price volatility score (0-30)
+      let volatilityScore = 0;
+      
+      if (marketHistory.length > 0) {
+        // Calculate standard deviation of price changes
+        const priceChanges = [];
+        for (let i = 1; i < marketHistory.length; i++) {
+          const percentChange = ((marketHistory[i].close - marketHistory[i-1].close) / marketHistory[i-1].close) * 100;
+          priceChanges.push(percentChange);
+        }
+        
+        // Calculate standard deviation
+        const mean = priceChanges.reduce((sum, value) => sum + value, 0) / priceChanges.length;
+        const variance = priceChanges.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / priceChanges.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Score based on standard deviation of 15-min candles
+        if (stdDev > 8) {
+          volatilityScore = 30; // Extremely volatile
+        } else if (stdDev > 5) {
+          volatilityScore = 20 + ((stdDev - 5) / 3) * 10;
+        } else if (stdDev > 3) {
+          volatilityScore = 10 + ((stdDev - 3) / 2) * 10;
+        } else if (stdDev > 1) {
+          volatilityScore = ((stdDev - 1) / 2) * 10;
+        }
+      }
+
+      // 5. Add on-chain transaction analysis using RPC manager
+      let onChainManipulationScore = 0;
+      try {
+        // Get recent signatures for this token
+        const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 100);
+        
+        if (signatures && signatures.length > 0) {
+          // Analyze transaction patterns
+          const uniqueAccounts = new Set<string>();
+          const transactionTimestamps: number[] = [];
+          
+          for (let i = 0; i < Math.min(signatures.length, 50); i++) {
+            try {
+              const sig = signatures[i];
+              if (sig.blockTime) {
+                transactionTimestamps.push(sig.blockTime);
+              }
+              
+              const tx = await rpcConnectionManager.getTransaction(sig.signature);
+              
+              if (tx && tx.transaction && tx.transaction.message) {
+                // Collect unique accounts involved
+                tx.transaction.message.accountKeys.forEach((key: string) => {
+                  uniqueAccounts.add(key);
+                });
+              }
+            } catch (e) {
+              // Skip errors for individual transactions
+            }
+          }
+          
+          // Calculate unique account ratio
+          // Lower ratio indicates fewer unique accounts involved = higher manipulation risk
+          const uniqueAccountRatio = uniqueAccounts.size / Math.min(signatures.length, 50);
+          
+          // Calculate transaction timing pattern
+          // Sort timestamps
+          transactionTimestamps.sort((a, b) => a - b);
+          
+          // Calculate time differences between transactions
+          const timeDiffs = [];
+          for (let i = 1; i < transactionTimestamps.length; i++) {
+            timeDiffs.push(transactionTimestamps[i] - transactionTimestamps[i-1]);
+          }
+          
+          // Check for unnaturally regular patterns
+          let regularPatternCount = 0;
+          for (let i = 1; i < timeDiffs.length; i++) {
+            // If consecutive time differences are very similar, could indicate bot activity
+            if (Math.abs(timeDiffs[i] - timeDiffs[i-1]) < 2) { // Within 2 seconds
+              regularPatternCount++;
+            }
+          }
+          
+          // Score based on unique account ratio
+          if (uniqueAccountRatio < 0.2) {
+            onChainManipulationScore += 15; // Very concentrated activity
+          } else if (uniqueAccountRatio < 0.4) {
+            onChainManipulationScore += 10;
+          } else if (uniqueAccountRatio < 0.6) {
+            onChainManipulationScore += 5;
+          }
+          
+          // Score based on regular transaction patterns
+          if (regularPatternCount > 10) {
+            onChainManipulationScore += 15; // Very regular transaction timing
+          } else if (regularPatternCount > 5) {
+            onChainManipulationScore += 10;
+          } else if (regularPatternCount > 2) {
+            onChainManipulationScore += 5;
+          }
+          
+          // Cap on-chain manipulation score
+          onChainManipulationScore = Math.min(30, onChainManipulationScore);
+        }
+      } catch (error) {
+        this.logger.error(`Error in on-chain manipulation analysis for ${address}:`, error);
+        // Continue with other score components
+      }
+      
+      // Calculate final score
+      const manipulationScore = Math.min(100, 
+        liquidityConcentrationScore + 
+        volumeToLiquidityScore + 
+        buyToSellScore + 
+        volatilityScore +
+        onChainManipulationScore
+      );
+      
+      return manipulationScore;
+    } catch (error) {
+      this.logger.error(`Error calculating manipulation score for ${address} on ${network}:`, error);
+      return null;
+    }
+  }
+}
+
+export default new MarketDataService();

@@ -1,6 +1,7 @@
 // src/config/config.ts
 import dotenv from 'dotenv';
 dotenv.config();
+
 interface Config {
   // Original APIs
   dexscreenerApi: string;
@@ -62,6 +63,14 @@ interface Config {
       error: string;
       combined: string;
     };
+  };
+  // Risk Management Configuration
+  riskManagement: {
+    configPath: string;
+    initialCapital: number;
+    maxRiskPerTradePercent: number;
+    maxDrawdownPercent: number;
+    positionSizingStrategy: string;
   };
 }
 
@@ -126,6 +135,14 @@ const config: Config = {
       error: process.env.ERROR_LOG_FILE || 'error.log',
       combined: process.env.COMBINED_LOG_FILE || 'combined.log'
     }
+  },
+  // Risk Management Configuration
+  riskManagement: {
+    configPath: process.env.RISK_CONFIG_PATH || './config/risk-config.json',
+    initialCapital: parseFloat(process.env.INITIAL_CAPITAL || '100000'),
+    maxRiskPerTradePercent: parseFloat(process.env.MAX_RISK_PER_TRADE || '2.0'),
+    maxDrawdownPercent: parseFloat(process.env.MAX_DRAWDOWN_PERCENT || '25'),
+    positionSizingStrategy: process.env.POSITION_SIZING_STRATEGY || 'KELLY_CRITERION'
   }
 };
 

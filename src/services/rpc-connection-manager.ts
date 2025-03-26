@@ -146,9 +146,6 @@ class RPCConnectionManager {
     this.startHealthMonitoring();
   }
 
-  // Rest of the class implementation remains the same
-  // ...
-
   // Get the best available endpoint based on health and load balancing
   getBestEndpoint(): string {
     const activeEndpoints = Object.entries(this.endpoints)
@@ -523,6 +520,102 @@ class RPCConnectionManager {
       return response.result || [];
     } catch (error) {
       this.logger.error(`Failed to get program accounts for ${programId}:`, error);
+      throw error;
+    }
+  }
+  
+  // Method to check if a specific endpoint is active and healthy
+  isEndpointActive(endpointName: string): boolean {
+    if (!this.endpoints[endpointName]) {
+      this.logger.warn(`Endpoint ${endpointName} not found`);
+      return false;
+    }
+    
+    const endpoint = this.endpoints[endpointName];
+    return endpoint.active && endpoint.health > 20; // Consider healthy if above 20%
+  }
+
+  // Method to discover the latest tokens on Solana
+  async getLatestTokens(limit: number = 20, minTransactionCount: number = 5): Promise<any[]> {
+    try {
+      this.logger.info(`Fetching latest token mints with transaction count >= ${minTransactionCount}`);
+      
+      // Use the token metadata program ID for Solana
+      const tokenMetadataProgramId = 'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s'; // Metaplex token metadata program
+      
+      // We'll use a 2-step approach:
+      // 1. Get recent token metadata accounts
+      // 2. Filter them based on activity and return the most active ones
+      
+      // Step 1: Query recent metadata accounts (limit to latest activity)
+      const metadataAccounts = await this.getProgramAccounts(tokenMetadataProgramId, [
+        // Filter for metadata accounts only
+        {
+          dataSize: 679 // Typical size for token metadata accounts
+        }
+      ]);
+      
+      // Step 2: Process and filter the metadata accounts
+      const tokenDetails = [];
+      
+      // Process top accounts up to the requested limit
+      const accountsToProcess = Math.min(metadataAccounts.length, limit * 3); // Process more than needed to allow for filtering
+      
+      for (let i = 0; i < accountsToProcess; i++) {
+        try {
+          const account = metadataAccounts[i];
+          if (!account.account || !account.account.data || !account.account.data.parsed) {
+            continue;
+          }
+          
+          // Parse the metadata to get the mint address
+          const metadata = account.account.data.parsed;
+          const mintAddress = metadata.mint;
+          
+          if (!mintAddress) {
+            continue;
+          }
+          
+          // Get recent signatures for this mint to assess activity
+          const signatures = await this.getSignaturesForAddress(mintAddress, 10);
+          
+          // Filter by minimum transaction count
+          if (signatures.length >= minTransactionCount) {
+            // Get token supply
+            const supply = await this.getTokenSupply(mintAddress);
+            
+            // Get symbol and name from metadata if available
+            const name = metadata.data?.name || 'Unknown';
+            const symbol = metadata.data?.symbol || 'UNKNOWN';
+            
+            tokenDetails.push({
+              mintAddress,
+              name,
+              symbol,
+              supply: supply?.amount,
+              decimals: supply?.decimals || 0,
+              transactionCount: signatures.length,
+              lastTransaction: signatures[0]?.blockTime || null
+            });
+            
+            // Break once we have enough tokens
+            if (tokenDetails.length >= limit) {
+              break;
+            }
+          }
+        } catch (error) {
+          this.logger.debug(`Error processing token metadata account: ${error.message}`);
+          continue; // Skip this account and continue
+        }
+      }
+      
+      // Sort by transaction count (most active first)
+      tokenDetails.sort((a, b) => b.transactionCount - a.transactionCount);
+      
+      // Return the requested number of tokens
+      return tokenDetails.slice(0, limit);
+    } catch (error) {
+      this.logger.error('Failed to get latest tokens:', error);
       throw error;
     }
   }
