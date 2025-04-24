@@ -1,4 +1,8 @@
 // src/utils/logger.ts
+interface Logger {
+  setVerbosity?: (level: string) => void;
+}
+
 import winston from 'winston';
 import path from 'path';
 import fs from 'fs';

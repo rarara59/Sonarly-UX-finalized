@@ -18,13 +18,19 @@
     "test:webhook": "ts-node src/tests/webhook-test.ts",
     "test:monitor": "ts-node src/tests/transaction-monitor-test.ts",
     "test:alerts": "ts-node src/tests/alert-system-test.ts",
-    "test:monitor-alerts": "ts-node src/tests/monitor-alert-test.ts"
+    "test:monitor-alerts": "ts-node src/tests/monitor-alert-test.ts",
+    "seed:dev": "ts-node src/scripts/seed-database.ts",
+    "seed:dev:full": "ts-node src/scripts/seed-database.ts --full",
+    "seed:dev:force": "ts-node src/scripts/seed-database.ts --yes",
+    "seed:dev:verbose": "ts-node src/scripts/seed-database.ts --verbose"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.12",
     "@solana/web3.js": "^1.98.0",
     "@types/dotenv": "^6.1.1",
     "axios": "^1.8.1",
+    "csv-parse": "^5.6.0",
+    "csv-stringify": "^6.5.2",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "mongodb": "^6.14.2",
@@ -32,7 +38,10 @@
     "node-cache": "^5.1.2",
     "node-fetch": "^3.3.2",
     "puppeteer": "^24.4.0",
-    "winston": "^3.17.0"
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "winston": "^3.17.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

@@ -1,5 +1,4 @@
 // src/models/externalWallet.ts
-
 import mongoose, { Document, Schema, Model } from 'mongoose';
 
 // Interface for wallet transaction
@@ -17,13 +16,16 @@ export interface IWalletTransaction {
   transactionValue: number;
   chain: string;
   isSuccessful: boolean;
+  transactionHash?: string; // Add transaction hash for reference
+  holdTime?: string; // Add hold time metric
+  timeframe?: 'fast' | 'slow' | 'other'; // Add timeframe classification
 }
 
 // Interface for external wallet document
 export interface IExternalWallet extends Document {
   address: string;
   network: string;
-  category: string; // Sniper, Gem Spotter, Early Mover
+  category: string; // 'Sniper', 'Gem Spotter', 'Early Mover'
   winRate: number;
   totalPnL: number;
   successfulTrades: number;
@@ -31,13 +33,37 @@ export interface IExternalWallet extends Document {
   avgHoldTime: string;
   firstSeen: Date;
   lastUpdated: Date;
+  lastActivity: Date; // Track last activity date
   isActive: boolean;
   reputationScore: number;
   transactions: IWalletTransaction[];
+  returns4xRate: number; // Percentage of trades that achieve 4x or better returns
+  fastTimeframePreference: number; // 0-100 scale for 1-4h preference
+  slowTimeframePreference: number; // 0-100 scale for 4-48h preference
+  exitEfficiencyScore: number; // 0-100 scale, how close to the top they typically exit
+  predictedSuccessRate: number; // Calculated prediction of success rate
+  confidenceScore: number; // Confidence in the prediction (0-100)
   metadata: {
     preferredTokens: string[];
     tradingFrequency: string;
     lastActiveTimestamp: Date;
+    achieves4xScore?: number; // Percentage of trades that achieve 4x
+    fastTimeframeStats?: {
+      count: number;
+      successRate: number;
+      avgMultiplier: number;
+    };
+    slowTimeframeStats?: {
+      count: number;
+      successRate: number;
+      avgMultiplier: number;
+    };
+    memeTokenStats?: {
+      count: number;
+      successRate: number;
+      avgMultiplier: number;
+    };
+    entryTimingScore?: number; // How early they get in (percentile)
     [key: string]: any;
   };
 }
@@ -56,7 +82,10 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>({
   pnlPercentage: { type: Number, default: 0 },
   transactionValue: { type: Number, default: 0 },
   chain: { type: String, default: 'solana' },
-  isSuccessful: { type: Boolean, default: false }
+  isSuccessful: { type: Boolean, default: false },
+  transactionHash: { type: String },
+  holdTime: { type: String },
+  timeframe: { type: String, enum: ['fast', 'slow', 'other'] }
 });
 
 const ExternalWalletSchema = new Schema<IExternalWallet>({
@@ -70,6 +99,7 @@ const ExternalWalletSchema = new Schema<IExternalWallet>({
   avgHoldTime: { type: String, default: '' },
   firstSeen: { type: Date, default: Date.now },
   lastUpdated: { type: Date, default: Date.now },
+  lastActivity: { type: Date, default: Date.now },
   isActive: { type: Boolean, default: true },
   reputationScore: { type: Number, default: 0 },
   transactions: [WalletTransactionSchema],
@@ -77,6 +107,23 @@ const ExternalWalletSchema = new Schema<IExternalWallet>({
     preferredTokens: [{ type: String }],
     tradingFrequency: { type: String, default: 'Medium' },
     lastActiveTimestamp: { type: Date, default: Date.now },
+    achieves4xScore: { type: Number, default: 0 },
+    fastTimeframeStats: {
+      count: { type: Number, default: 0 },
+      successRate: { type: Number, default: 0 },
+      avgMultiplier: { type: Number, default: 0 }
+    },
+    slowTimeframeStats: {
+      count: { type: Number, default: 0 },
+      successRate: { type: Number, default: 0 },
+      avgMultiplier: { type: Number, default: 0 }
+    },
+    memeTokenStats: {
+      count: { type: Number, default: 0 },
+      successRate: { type: Number, default: 0 },
+      avgMultiplier: { type: Number, default: 0 }
+    },
+    entryTimingScore: { type: Number, default: 0 },
     type: Schema.Types.Mixed
   }
 }, {
@@ -87,6 +134,8 @@ const ExternalWalletSchema = new Schema<IExternalWallet>({
 ExternalWalletSchema.index({ category: 1, winRate: -1 });
 ExternalWalletSchema.index({ category: 1, totalPnL: -1 });
 ExternalWalletSchema.index({ reputationScore: -1 });
+ExternalWalletSchema.index({ 'metadata.achieves4xScore': -1 });
+ExternalWalletSchema.index({ lastActivity: -1 });
 
 // Calculate reputation score before saving
 ExternalWalletSchema.pre('save', function(next) {
@@ -94,8 +143,9 @@ ExternalWalletSchema.pre('save', function(next) {
   if (this.totalTrades > 0) {
     // Weights for different factors
     const winRateWeight = 0.4;
-    const pnlWeight = 0.4;
+    const pnlWeight = 0.3;
     const tradesWeight = 0.2;
+    const achieves4xWeight = 0.1;
     
     // Normalize PnL to a 0-100 scale (assuming 100k is a good PnL)
     const normalizedPnL = Math.min(100, (this.totalPnL / 100000) * 100);
@@ -103,10 +153,14 @@ ExternalWalletSchema.pre('save', function(next) {
     // Normalize trades count (assuming 500 trades is a good number)
     const normalizedTrades = Math.min(100, (this.totalTrades / 500) * 100);
     
-    this.reputationScore = (
+    // Get 4x achievement score (default to 0 if not exists)
+    const achieves4xScore = this.metadata.achieves4xScore || 0;
+    
+    this.reputationScore = Math.round(
       (this.winRate * winRateWeight) + 
       (normalizedPnL * pnlWeight) + 
-      (normalizedTrades * tradesWeight)
+      (normalizedTrades * tradesWeight) +
+      (achieves4xScore * achieves4xWeight)
     );
   }
   next();
