@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { ITransaction } from '../types/database';
 import dataHandler from './dataHandler';
 import alertService from './alertService';
+import { TokenPreFilterService } from './token-pre-filter.service';
 
 interface MonitoringThresholds {
     volume: {
@@ -91,6 +92,30 @@ class TransactionMonitor extends EventEmitter {
         try {
             // Log transaction processing
             console.log(`Processing transaction ${transaction.hash} from wallet ${transaction.walletAddress}`);
+            
+            // STEP: Filter logic — only run on new tokens
+            if (transaction.isNewTokenLaunch) {
+                const filterResult = TokenPreFilterService.evaluateToken({
+                    address: transaction.tokenAddress,
+                    name: transaction.tokenName,
+                    symbol: transaction.tokenSymbol,
+                    lpValueUSD: transaction.lpValueUSD,
+                    uniqueHolders: transaction.uniqueHolders,
+                    buyTransactions: transaction.buyTxCount,
+                    dex: transaction.dexName,
+                    hasMintAuthority: transaction.hasMintAuthority,
+                    hasFreezeAuthority: transaction.hasFreezeAuthority,
+                    largestHolderPercentage: transaction.largestHolderPercent,
+                    firstSeenTimestamp: transaction.tokenFirstSeenTimestamp,
+                    currentTimestamp: Date.now() / 1000,
+                    smartWalletsInteracted: transaction.smartWallets || []
+                });
+  
+                if (!filterResult.passed) {
+                    console.log(`Token ${transaction.tokenAddress} rejected by pre-filter:`, filterResult.rejectionReasons);
+                    return; // Exit early — skip analysis for junk token
+                }
+            }
 
             // Store in database via dataHandler
             await dataHandler.saveTransaction(transaction);

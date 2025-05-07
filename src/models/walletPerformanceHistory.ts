@@ -1,50 +1,62 @@
-// src/models/walletPerformanceHistory.ts
 import mongoose, { Document, Schema, Model } from 'mongoose';
 
-// Interface for recent token in performance history
 export interface IRecentToken {
-  address: string;
   symbol: string;
-  profit: boolean;
-  returnPercentage: number;
+  address: string;
+  successCount: number;
+  totalCount: number;
 }
 
-// Interface for wallet performance history
 export interface IWalletPerformanceHistory extends Document {
   walletAddress: string;
   date: Date;
   successRate: number;
   totalTrades: number;
-  profitableTrades: number;
-  averageReturn: number;
-  returns4xRate: number;
-  confidenceScore: number;
-  recentTokens: IRecentToken[];
+  profitUsd: number;
+  averageReturnPercent?: number;
+  tags?: string[];
+  tokens?: IRecentToken[];
+  metadata?: Record<string, any>;
 }
 
-// Schema for wallet performance history
-const WalletPerformanceHistorySchema = new Schema<IWalletPerformanceHistory>({
-  walletAddress: { type: String, required: true, index: true },
-  date: { type: Date, default: Date.now, index: true },
-  successRate: { type: Number },
-  totalTrades: { type: Number },
-  profitableTrades: { type: Number },
-  averageReturn: { type: Number },
-  returns4xRate: { type: Number },
-  confidenceScore: { type: Number },
-  recentTokens: [{
-    address: { type: String },
-    symbol: { type: String },
-    profit: { type: Boolean },
-    returnPercentage: { type: Number }
-  }]
-}, { timestamps: true });
+const WalletPerformanceHistorySchema = new Schema<IWalletPerformanceHistory>(
+  {
+    walletAddress: { type: String, required: true, index: true },
+    date: { type: Date, required: true, index: true },
+    successRate: { type: Number, required: true },
+    totalTrades: { type: Number, required: true },
+    profitUsd: { type: Number, required: true },
+    averageReturnPercent: { type: Number },
+    tags: [{ type: String }],
+    tokens: [{
+      symbol: { type: String, required: true },
+      address: { type: String, required: true },
+      successCount: { type: Number, required: true },
+      totalCount: { type: Number, required: true }
+    }],
+    metadata: { type: Schema.Types.Mixed }
+  },
+  {
+    timestamps: true
+  }
+);
 
-// Create indexes for queries
-WalletPerformanceHistorySchema.index({ walletAddress: 1, date: -1 });
+// ─── Indexes ────────────────────────────────────────────────────────────────
+// Unique per‐wallet per‐day
+WalletPerformanceHistorySchema.index(
+  { walletAddress: 1, date: 1 },
+  { unique: true }
+);
+// Fast date lookups
+WalletPerformanceHistorySchema.index({ date: 1 });
+// Token‐level filters
+WalletPerformanceHistorySchema.index(
+  { walletAddress: 1, 'tokens.symbol': 1 }
+);
 
-// Create model
-const WalletPerformanceHistory: Model<IWalletPerformanceHistory> = mongoose.models.WalletPerformanceHistory as Model<IWalletPerformanceHistory> ||
-  mongoose.model<IWalletPerformanceHistory>('WalletPerformanceHistory', WalletPerformanceHistorySchema);
-
-export default WalletPerformanceHistory;
+export const WalletPerformanceHistory: Model<IWalletPerformanceHistory> =
+  mongoose.models.WalletPerformanceHistory ||
+  mongoose.model<IWalletPerformanceHistory>(
+    'WalletPerformanceHistory',
+    WalletPerformanceHistorySchema
+  );

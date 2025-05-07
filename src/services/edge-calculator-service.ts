@@ -5703,6 +5703,49 @@ class EdgeCalculatorService {
   }
   
   /**
-   * Estimate target timeframe based on pattern types, expected return, and volatility
-   */
-  private estim
+ * Estimate target timeframe based on pattern types, expected return, and volatility
+ */
+private estimateEnhancedTimeframeHours(
+  patterns: IPattern[],
+  expectedReturn: number,
+  volatility: number
+): number {
+  try {
+    // Set base timeframe based on expected return size
+    let baseHours = 24; // Default: 1 day
+
+    if (expectedReturn >= 0.3) {
+      baseHours = 48; // Larger moves take longer
+    } else if (expectedReturn >= 0.2) {
+      baseHours = 36;
+    } else if (expectedReturn >= 0.1) {
+      baseHours = 24;
+    } else {
+      baseHours = 16; // Smaller expected returns should be faster
+    }
+
+    // Adjust based on volatility
+    if (volatility > 4) {
+      baseHours *= 0.7; // High volatility = faster moves
+    } else if (volatility < 2) {
+      baseHours *= 1.2; // Low volatility = slower moves
+    }
+
+    // Adjust if multiple strong patterns
+    if (patterns.length >= 3) {
+      baseHours *= 0.85; // More confirmation = quicker movement
+    }
+
+    // Minimum and maximum bounds
+    const minHours = 6;
+    const maxHours = 96;
+
+    const finalHours = Math.max(minHours, Math.min(maxHours, Math.round(baseHours)));
+
+    return finalHours;
+  } catch (error) {
+    this.logger.error('Error estimating enhanced timeframe hours:', error);
+    return 24; // Default 24h if error
+  }
+}
+
