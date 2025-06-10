@@ -42,6 +42,7 @@ export interface ITokenTrackingData extends Document {
   manipulationScore: number;
   tags: string[];
   metadata: any;
+  hasAnyPattern: boolean; // Added missing property
 }
 
 const TokenTrackingDataSchema = new Schema<ITokenTrackingData>(

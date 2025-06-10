@@ -2,12 +2,11 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { connectToDatabase, isDatabaseConnected, getDatabaseConnectionStatus } from './config/database';
-import dotenv from 'dotenv';
+import * as dotenv from 'dotenv';
 
-// Import routes (you would have these)
-// import walletRoutes from './routes/wallet.routes';
-// import tokenRoutes from './routes/token.routes';
+import { connectToDatabase, isDatabaseConnected, getDatabaseConnectionStatus } from './config/database';
+import heliusWebhookHandler from './services/webhooks/helius-handler'; // ✅ Correct path
+import './scripts/token-discovery-loop'; // Side effect import to start discovery loop
 
 // Load environment variables
 dotenv.config();
@@ -17,29 +16,25 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(helmet()); // Security headers
-app.use(cors()); // Cross-origin resource sharing
-app.use(express.json()); // Parse JSON bodies
-app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Database health check middleware
+// Register webhook handler
+app.use('/', heliusWebhookHandler);
+
+// DB Health middleware
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (!isDatabaseConnected()) {
-    console.warn('Database is not connected, request may fail');
-    // You could decide to reject requests that need DB access when DB is down
-    // or let them through and fail gracefully
+    console.warn('⚠️ Database not connected');
   }
   next();
 });
 
-// Routes
-// app.use('/api/wallets', walletRoutes);
-// app.use('/api/tokens', tokenRoutes);
-
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
   const dbStatus = getDatabaseConnectionStatus();
-  
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -53,16 +48,16 @@ app.get('/health', (req: Request, res: Response) => {
 
 // 404 handler
 app.use((req: Request, res: Response) => {
-  res.status(404).json({ 
-    error: 'Not Found', 
-    message: `Route ${req.method} ${req.originalUrl} not found` 
+  res.status(404).json({
+    error: 'Not Found',
+    message: `Route ${req.method} ${req.originalUrl} not found`
   });
 });
 
 // Error handler
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({ 
+  res.status(500).json({
     error: 'Internal Server Error',
     message: process.env.NODE_ENV === 'production' ? 'Something went wrong' : err.message
   });
@@ -71,24 +66,22 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 // Start the server
 async function startServer() {
   try {
-    // Connect to the database
+    console.log('⚙️  Starting server – attempting DB connection...');
     await connectToDatabase();
-    
-    // Start the server
+    console.log('✅ DB connection successful, starting Express...');
+
     app.listen(PORT, () => {
       console.log(`🚀 Server is running on port ${PORT}`);
-      console.log(`Health check available at: http://localhost:${PORT}/health`);
+      console.log(`Health check: http://localhost:${PORT}/health`);
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
 
-// Start the server
 if (require.main === module) {
   startServer();
 }
 
-// Export for testing
 export default app;

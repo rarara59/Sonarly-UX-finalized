@@ -1,5 +1,5 @@
 // src/config/config.ts
-import dotenv from 'dotenv';
+import * as dotenv from 'dotenv';
 dotenv.config();
 
 interface Config {

@@ -4,8 +4,8 @@ interface Logger {
 }
 
 import winston from 'winston';
-import path from 'path';
-import fs from 'fs';
+import * as path from 'path';
+import * as fs from 'fs';
 
 // Create logs directory if it doesn't exist
 const logsDir = path.join(process.cwd(), 'logs');
@@ -83,7 +83,7 @@ export const createScraperLogger = (scraperName: string) => {
   );
   
   // Function to change log level
-  scraperLogger.setVerbosity = (level: string) => {
+  (scraperLogger as any).setVerbosity = (level: string) => {
     // Update level for all transports
     scraperLogger.transports.forEach(t => {
       t.level = level;

@@ -1,6 +1,6 @@
 // src/config/database.ts
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
+import * as dotenv from 'dotenv';
 
 // Load environment variables
 dotenv.config();
@@ -8,10 +8,9 @@ dotenv.config();
 // Connection options
 const connectionOptions: mongoose.ConnectOptions = {
   // Set the maximum number of connections in the pool
-  // Default in Mongoose 6+ is 5
   maxPoolSize: process.env.NODE_ENV === 'production' ? 20 : 5,
-
-  // Set the minimum number of connections in the pool
+  
+  // Set the minimum number of connections in the pool  
   minPoolSize: process.env.NODE_ENV === 'production' ? 5 : 1,
   
   // Socket timeout (in milliseconds)
@@ -20,10 +19,13 @@ const connectionOptions: mongoose.ConnectOptions = {
   // Time to wait before failing initial connection
   connectTimeoutMS: 30000,
   
+  // Server selection timeout and max query time
+  serverSelectionTimeoutMS: 30000,  // 30 seconds to find MongoDB server
+  
   // Whether to buffer commands when the connection is lost
   bufferCommands: true,
   
-  // If true, this connection will use createIndex() instead of ensureIndex() for automatic index builds
+  // If true, this connection will use createIndex() instead of ensureIndex()
   autoIndex: process.env.NODE_ENV !== 'production',
 };
 

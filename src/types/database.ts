@@ -11,6 +11,20 @@ export interface ITransaction {
     type: 'BUY' | 'SELL';
     walletAddress: string;
     tokenInfo?: any;
+    tokenName?: string;
+    tokenSymbol?: string;
+    dexName?: string;
+    direction?: 'buy' | 'sell';
+    amount?: number;
+    isNewTokenLaunch?: boolean;
+    lpValueUSD?: number;
+    uniqueHolders?: number;
+    buyTxCount?: number;
+    hasMintAuthority?: boolean;
+    hasFreezeAuthority?: boolean;
+    largestHolderPercent?: number;
+    tokenFirstSeenTimestamp?: number;
+    smartWallets?: string[];
 }
 
 export interface IWallet {

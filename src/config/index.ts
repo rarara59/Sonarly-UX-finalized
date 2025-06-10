@@ -1,6 +1,6 @@
 // src/config/index.ts
-import dotenv from 'dotenv';
-import path from 'path';  // Add this import
+import * as dotenv from 'dotenv';
+import * as path from 'path';  // Add this import
 dotenv.config();
 
 export const config = {
