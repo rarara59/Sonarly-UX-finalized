@@ -23,6 +23,8 @@ import * as path from 'path';
 import winston from 'winston';
 import { EventEmitter } from 'events';
 import PerformanceMonitoringService from './performance-monitoring.service';
+import { TelegramBotService } from './telegram-bot.service';
+import { TelegramConfig, createTelegramConfig, PartialTelegramConfig } from '../types/telegram';
 
 // Input Types - Strictly typed for upstream integration
 interface TokenDataInput {
@@ -139,6 +141,9 @@ interface AlertConfig {
   alertLogPath: string;
   maxLogFiles: number;
   maxLogSizeBytes: number;
+
+  // Telegram
+  telegram?: TelegramConfig;
 }
 
 interface AlertStats {
@@ -169,6 +174,9 @@ export class AlertSystemService extends EventEmitter {
   private hourlyAlertCount: number = 0;
   private lastHourReset: Date = new Date();
 
+  // Telegram
+  private telegramBot?: TelegramBotService;
+
   constructor(
     performanceMonitoring: PerformanceMonitoringService,
     config?: Partial<AlertConfig>
@@ -179,6 +187,8 @@ export class AlertSystemService extends EventEmitter {
     this.config = this.mergeConfig(config);
     this.logger = this.initializeLogger();
     this.alertStats = this.initializeStats();
+
+    this.initializeTelegramBot();
     
     this.initializeAlertSystem();
     this.startCleanupTasks();
@@ -189,7 +199,7 @@ export class AlertSystemService extends EventEmitter {
       // Thresholds
       edgeScoreThreshold: 85,
       confidenceThreshold: 75,
-      
+  
       // Output Methods
       consoleOutput: true,
       fileOutput: true,
@@ -197,24 +207,47 @@ export class AlertSystemService extends EventEmitter {
         maxRetries: 3,
         baseDelayMs: 1000,
         maxDelayMs: 10000,
-        exponentialBackoff: true
+        exponentialBackoff: true,
       },
-      
+  
       // Rate Limiting
       maxAlertsPerHour: 10,
       duplicateFilterMinutes: 30,
-      
+  
       // Alert Levels
       highConfidenceThreshold: 85,
       ultraPremiumThreshold: 92,
-      
+  
       // File Settings
       alertLogPath: './logs/alerts',
       maxLogFiles: 30,
-      maxLogSizeBytes: 10 * 1024 * 1024 // 10MB
+      maxLogSizeBytes: 10 * 1024 * 1024, // 10MB
+  
+      // Telegram Defaults
+      telegram: {
+        enabled: false,
+        botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+        chatId: process.env.TELEGRAM_CHAT_ID || '',
+        retryConfig: {
+          maxRetries: parseInt(process.env.TELEGRAM_MAX_RETRIES || '3'),
+          baseDelayMs: parseInt(process.env.TELEGRAM_RETRY_DELAY || '1000'),
+          exponentialBackoff: process.env.TELEGRAM_EXPONENTIAL_BACKOFF !== 'false'
+        }
+      }
     };
-
-    return { ...defaultConfig, ...userConfig };
+  
+    const mergedConfig = { ...defaultConfig, ...userConfig };
+  
+    // Override Telegram config from environment if present
+    if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
+      mergedConfig.telegram = createTelegramConfig({
+        enabled: process.env.TELEGRAM_ENABLED === 'true',
+        botToken: process.env.TELEGRAM_BOT_TOKEN,
+        chatId: process.env.TELEGRAM_CHAT_ID,
+      });
+    }
+    
+    return mergedConfig;
   }
 
   private initializeLogger(): winston.Logger {
@@ -496,8 +529,18 @@ export class AlertSystemService extends EventEmitter {
   }
 
   private async outputWebhookAlert(alert: TokenAlert): Promise<void> {
-    if (!this.config.webhookUrl) return;
+    // 1. Send to webhook (existing functionality)
+    if (this.config.webhookUrl) {
+      await this.sendWebhookAlert(alert);
+    }
+  
+    // 2. Send to Telegram (new functionality)
+    if (this.telegramBot?.isReady()) {
+      await this.sendTelegramAlert(alert);
+    }
+  }
 
+  private async sendWebhookAlert(alert: TokenAlert): Promise<void> {
     const payload = {
       text: `🚨 ${alert.alertType} Alert: ${alert.tokenSymbol}`,
       attachments: [{
@@ -510,8 +553,49 @@ export class AlertSystemService extends EventEmitter {
         ]
       }]
     };
-
+  
     await this.sendWebhookWithRetry(payload);
+  }
+  
+  private async sendTelegramAlert(alert: TokenAlert): Promise<void> {
+    try {
+      const success = await this.telegramBot!.sendAlert(alert);
+  
+      if (success) {
+        this.logger.debug('Telegram alert sent successfully', {
+          tokenSymbol: alert.tokenSymbol,
+          alertType: alert.alertType
+        });
+      } else {
+        this.logger.warn('Telegram alert failed to send', {
+          tokenSymbol: alert.tokenSymbol
+        });
+      }
+    } catch (error) {
+      this.logger.error('Error sending Telegram alert', {
+        error,
+        tokenSymbol: alert.tokenSymbol
+      });
+    }
+  }
+
+  // Public method to test if Telegram bot is working
+  public async testTelegramConnection(): Promise<boolean> {
+    if (!this.telegramBot?.isReady()) {
+      this.logger.warn('Telegram bot not ready for testing');
+      return false;
+    }
+
+    return await this.telegramBot.testConnection();
+  }
+
+  // Public method to return Telegram config status
+  public getTelegramStatus(): { enabled: boolean; ready: boolean; configured: boolean } {
+    return {
+      enabled: this.config.telegram?.enabled || false,
+      ready: this.telegramBot?.isReady() || false,
+      configured: !!(this.config.telegram?.botToken && this.config.telegram?.chatId)
+    };
   }
 
   private async sendWebhookWithRetry(payload: any, attempt: number = 1): Promise<void> {
@@ -757,6 +841,34 @@ export class AlertSystemService extends EventEmitter {
     this.config = { ...this.config, ...newConfig };
     this.logger.info('Alert system config updated', newConfig);
   }
+
+  /**
+ * Initializes the Telegram bot if enabled in config
+ */
+private initializeTelegramBot(): void {
+  if (this.config.telegram?.enabled && this.config.telegram.botToken) {
+    try {
+      this.telegramBot = new TelegramBotService(this.config.telegram, this.logger);
+
+      this.telegramBot.initialize().catch(error => {
+        this.logger.error('Failed to initialize Telegram bot', { error });
+        this.telegramBot = undefined;
+      });
+    } catch (error) {
+      this.logger.error('Error creating Telegram bot service', { error });
+    }
+  }
+}
+
+async shutdown(): Promise<void> {
+  if (this.telegramBot) {
+    await this.telegramBot.shutdown();
+    this.logger.info('✅ Telegram bot shut down');
+  }
+
+  this.logger.info('🔒 Alert system shutdown complete');
+}
+
 }
 
 export default AlertSystemService;

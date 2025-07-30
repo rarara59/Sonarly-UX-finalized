@@ -1,5 +1,8 @@
 // src/services/batch-token-processor.service.ts
-import winston from 'winston';
+//commenting out line 3 because we're having trouble testing out modular-cal
+//import winston from 'winston';
+//adding line 5
+import { logger } from '../utils/logger';
 import { ModularEdgeCalculator } from './modular-edge-calculator.service';
 interface TokenBatch {
   tokenAddress: string;
@@ -45,7 +48,10 @@ interface ProcessingResult {
 }
 
 export class BatchTokenProcessor {
-  private logger: winston.Logger;
+  //commenting out line 52 because we're having trouble with the modular-calc (7.14.2025)
+  //private logger: winston.Logger;
+  //adding line 54
+  private logger: any;
   private processingQueue: TokenBatch[];
   private processing: boolean;
   private config: BatchProcessingConfig;
@@ -54,7 +60,8 @@ export class BatchTokenProcessor {
   private processInterval?: NodeJS.Timeout;
   constructor(private edgeCalculator: ModularEdgeCalculator) {
 
-    this.logger = winston.createLogger({
+    //changing this because we're having trouble with the modular-calc (7.14.2025)
+    /*this.logger = winston.createLogger({
       level: 'info',
       format: winston.format.json(),
       defaultMeta: { service: 'batch-token-processor' },
@@ -66,7 +73,10 @@ export class BatchTokenProcessor {
           )
         })
       ]
-    });
+    });*/
+
+    //this is the new add which replaces lines 57-70 (7.14.2025)
+    this.logger = logger;
 
     this.edgeCalculator = edgeCalculator;
     this.processingQueue = [];
@@ -206,9 +216,14 @@ export class BatchTokenProcessor {
    * Process a batch of tokens with concurrency control
    */
   private async processBatch(): Promise<void> {
+
+    console.log(`🔍 [BATCH DEBUG] processBatch() called - queue size: ${this.processingQueue.length}, active: ${this.processingPromises.size}`);
+
     if (this.processingQueue.length === 0) {
       return; // Nothing to process
     }
+
+    console.log(`🔍 [BATCH DEBUG] Queue has tokens, checking concurrency...`);
 
     // Sort queue by priority and age
     this.sortQueueByPriority();
@@ -272,11 +287,18 @@ export class BatchTokenProcessor {
       try {
         this.logger.debug(`🔍 Processing token ${token.tokenAddress} (attempt ${attempt + 1}/${this.config.retryConfig.maxRetries + 1})`);
         
+        // ADD THESE 3 LINES:
+        this.logger.info(`🧮 [DEBUG] About to call evaluateToken for: ${token.tokenAddress.slice(0,8)}`);
+        this.logger.info(`🧮 [DEBUG] Token details - price: ${token.currentPrice}, age: ${token.tokenAgeMinutes}min`);
+        
         const result = await this.edgeCalculator.evaluateToken(
           token.tokenAddress,
           token.currentPrice,
           token.tokenAgeMinutes
         );
+
+        // ADD THIS LINE:
+        this.logger.info(`🧮 [DEBUG] evaluateToken result: ${JSON.stringify(result, null, 2)}`);
 
         const processingTime = Date.now() - startTime;
         this.updateProcessingStats(processingTime, true);

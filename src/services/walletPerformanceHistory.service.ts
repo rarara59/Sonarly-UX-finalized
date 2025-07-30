@@ -5,8 +5,8 @@ import {
   IWalletPerformanceHistory
 } from '../models/wallet-performance-history.model';
 import { MetricsService } from '../utils/metrics.service';
-import { Logger } from '../utils/logger';
-import { TransactionManager } from '../utils/transaction-manager';
+import { logger } from '../utils/logger';
+import TransactionManager from '../utils/transaction-manager';
 
 // ─── Zod Schemas ────────────────────────────────────────────────────────────
 const CreateSchema = z.object({

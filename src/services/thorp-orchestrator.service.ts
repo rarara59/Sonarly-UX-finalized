@@ -103,7 +103,7 @@ export class ThorpOrchestratorService extends EventEmitter {
   
   // Discovery Services
   private lpDetector: LiquidityPoolCreationDetector;
-  private lpEventCache: LPEventCache;
+  private lpEventCache: typeof LPEventCache;
   private tokenFilter: TieredTokenFilter;
   private smartMoneyValidator: SmartMoneyValidator;
   
@@ -126,7 +126,7 @@ export class ThorpOrchestratorService extends EventEmitter {
       performanceMonitoring: PerformanceMonitoringService;
       pricePolling: PricePollingService;
       lpDetector: LiquidityPoolCreationDetector;
-      lpEventCache: LPEventCache;
+      lpEventCache: typeof LPEventCache;
       tokenFilter: TieredTokenFilter;
       smartMoneyValidator: SmartMoneyValidator;
     },

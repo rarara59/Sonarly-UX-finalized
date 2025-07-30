@@ -1,332 +1,329 @@
-// src/services/classification-integration.service.ts
+// classification-integration.service.ts
 
-import { ClassificationHistoryService, TokenStatus } from './classification-history.service';
-import { ReclassificationSchedulerService, ReclassificationEvent } from './reclassification-scheduler.service';
+import { ClassificationHistoryService } from './classification-history.service';
+import { ReclassificationSchedulerService } from './reclassification-scheduler.service';
 import { AlertSystemService } from './alert-system.service';
-import { logger } from '../utils/logger';
+import { PerformanceMonitoringService } from './performance-monitoring.service';
+import { ClassificationHistory, IClassificationHistory } from '../models/classificationHistory';
+import { MongoClient, Db } from 'mongodb';
+import logger from '../utils/logger';
 
+// Fixed TokenStatus type to match model enum exactly
+type TokenStatus = 'fresh-gem' | 'established' | 'rejected' | 'under-review';
+
+// Export type for setup script
 export interface TokenProcessingResult {
-  token_address: string;
-  edge_score: number;
+  shouldAlert: boolean;
   classification: TokenStatus;
   reason: string;
-  metrics: {
-    age_minutes: number;
-    tx_count: number;
-    holder_count: number;
-    metadata_verified: boolean;
-    volume_24h?: number;
-    liquidity_usd?: number;
-    smart_wallet_entries?: number;
-  };
-  signals?: {
-    smart_wallet_activity: boolean;
-    volume_spike: boolean;
-    pattern_signal_spike: boolean;
-  };
+}
+
+interface ClassificationResult {
+  shouldAlert: boolean;
+  classification: TokenStatus;
+  reason: string;
+}
+
+// FIXED: Removed null from previous_status to match ClassificationHistoryService expectations
+interface ClassificationUpdate {
+  token_address: string;
+  current_status: TokenStatus;
+  previous_status?: TokenStatus; // FIXED: Removed | null
+  reason: string;
+  edge_score: number;
+  age_minutes: number; // FIXED: Add missing age_minutes field
+  tx_count: number;
+  holder_count: number;
+  metadata_verified: boolean;
+  reevaluation_count: number;
+  smart_wallet_entries: number;
+  volume_24h: number;
+  liquidity_usd: number;
+  reclassificationFlags: any;
+  source: 'manual' | 'batch_processor' | 'webhook' | 'scheduled_task';
+  updated_by: string;
+}
+
+interface TokenMetrics {
+  age_minutes: number;
+  tx_count: number;
+  holder_count: number;
+  metadata_verified: boolean;
+  smart_wallet_entries: number;
+  volume_24h: number;
+  liquidity_usd: number;
+  edge_score: number;
+}
+
+interface TokenData {
+  address: string;
+  metrics: TokenMetrics;
+  classification?: TokenStatus;
+}
+
+interface ClassificationStats {
+  classification: TokenStatus | null;
+  edgeScore: number | null;
+  ageMinutes: number | null;
+  alertSuppressed: boolean;
+  reclassificationFlags: string[];
 }
 
 export class ClassificationIntegrationService {
-  private classificationService: ClassificationHistoryService;
-  private schedulerService: ReclassificationSchedulerService;
-  private alertService: AlertSystemService;
+  private classificationService = new ClassificationHistoryService();
+  private schedulerService = new ReclassificationSchedulerService();
+  private performanceService?: PerformanceMonitoringService; // FIXED: Optional since we may not have DB
+  private alertService?: AlertSystemService; // FIXED: Optional since it depends on performance service
+  private isInitialized = false;
+  private db?: Db; // FIXED: Add database connection property
 
-  constructor() {
-    this.classificationService = new ClassificationHistoryService();
-    this.schedulerService = new ReclassificationSchedulerService();
-    this.alertService = new AlertSystemService();
+  // FIXED: Constructor accepts optional database connection
+  constructor(db?: Db) {
+    this.db = db;
+    
+    // FIXED: Only create performance service if database available
+    if (db) {
+      this.performanceService = new PerformanceMonitoringService(db);
+      this.alertService = new AlertSystemService(this.performanceService);
+    } else {
+      logger.warn('No database connection provided - Performance monitoring and alerts disabled');
+    }
   }
 
-  /**
-   * Initialize the classification system
-   */
   async initialize(): Promise<void> {
-    logger.info('Initializing classification integration system...');
-    
     try {
-      // Start the reclassification scheduler
+      logger.info('🔄 Initializing Classification Integration Service...');
+      
+      // FIXED: ClassificationHistoryService doesn't have initialize() method
+      // Just verify the service is working by testing database connection
+      
+      // FIXED: Use start() instead of initialize() for scheduler
       await this.schedulerService.start();
       
-      logger.info('Classification integration system initialized successfully');
-    } catch (error) {
-      logger.error('Failed to initialize classification integration system:', error);
-      throw error;
+      // FIXED: AlertSystemService doesn't have initialize() method
+      // The constructor already initializes it
+      
+      const count = await ClassificationHistory.countDocuments({});
+      logger.info(`📊 Classification DB check: ${count} records`);
+      
+      this.isInitialized = true;
+      logger.info('✅ Initialization complete');
+    } catch (err) {
+      logger.error('❌ Initialization failed:', err);
+      throw err;
     }
   }
 
-  /**
-   * Process a token through the classification system
-   * This is called from your existing BatchTokenProcessor
-   */
-  async processToken(result: TokenProcessingResult): Promise<{
-    shouldAlert: boolean;
-    classification: TokenStatus;
-    reason: string;
-  }> {
-    try {
-      // Check if token already exists in classification history
-      const existingClassification = await this.classificationService.getClassification(result.token_address);
-      
-      // Determine initial classification based on edge score and metrics
-      const classification = this.determineInitialClassification(result);
-      
-      // Update classification history
-      await this.classificationService.updateClassification({
-        token_address: result.token_address,
-        new_status: classification,
-        reason: result.reason,
-        edge_score: result.edge_score,
-        age_minutes: result.metrics.age_minutes,
-        tx_count: result.metrics.tx_count,
-        holder_count: result.metrics.holder_count,
-        metadata_verified: result.metrics.metadata_verified,
-        volume_24h: result.metrics.volume_24h,
-        liquidity_usd: result.metrics.liquidity_usd,
-        smart_wallet_entries: result.metrics.smart_wallet_entries
+  async processBatch(tokens: TokenData[]): Promise<void> {
+    if (!this.isInitialized) throw new Error('Service not initialized');
+    for (const token of tokens) {
+      try {
+        await this.processToken(token);
+      } catch (err) {
+        logger.error(`❌ Error processing token ${token.address}:`, err);
+      }
+    }
+  }
+
+  async processToken(tokenData: TokenData): Promise<ClassificationResult> {
+    const { address, metrics } = tokenData;
+    const existing = await this.classificationService.getByTokenAddress(address);
+    const result = this.determineInitialClassification(metrics, existing);
+
+    if (existing) {
+      await this.updateExistingClassification(existing, result, metrics);
+    } else {
+      await this.createNewClassification(address, result, metrics);
+    }
+
+    if (result.shouldAlert) {
+      // FIXED: Use addEvent() instead of scheduleReclassification()
+      this.schedulerService.addEvent({
+        type: 'smart_wallet_entry', // FIXED: Provide proper event type
+        token_address: address,
+        timestamp: new Date(),
+        data: { trigger: 'alert_triggered' }
       });
-
-      // Check if alerts should be suppressed
-      const alertSuppressed = await this.classificationService.isAlertSuppressed(result.token_address);
-      
-      // Determine if we should send an alert
-      const shouldAlert = this.shouldSendAlert(classification, result.edge_score, alertSuppressed);
-
-      // Generate reclassification events if needed
-      if (result.signals) {
-        this.generateReclassificationEvents(result);
-      }
-
-      logger.info(`Processed token ${result.token_address}: ${classification} (edge: ${result.edge_score}, alert: ${shouldAlert})`);
-
-      return {
-        shouldAlert,
-        classification,
-        reason: result.reason
-      };
-
-    } catch (error) {
-      logger.error(`Error processing token ${result.token_address}:`, error);
-      throw error;
     }
+
+    return result;
   }
 
-  /**
-   * Determine initial classification based on token metrics
-   */
-  private determineInitialClassification(result: TokenProcessingResult): TokenStatus {
-    const { edge_score, metrics } = result;
-    
-    // High confidence tokens (≥85 edge score)
-    if (edge_score >= 85) {
-      if (metrics.age_minutes <= 30) {
-        return 'fresh';
-      } else if (metrics.age_minutes <= 1440) { // 24 hours
-        return 'established';
-      } else {
-        return 'watchlist';
-      }
+  private determineInitialClassification(
+    metrics: TokenMetrics,
+    existing?: IClassificationHistory | null
+  ): ClassificationResult {
+    const { edge_score, age_minutes, tx_count, holder_count, metadata_verified } = metrics;
+
+    if (!metadata_verified) {
+      return { shouldAlert: false, classification: 'rejected', reason: 'Metadata not verified' };
     }
-    
-    // Medium confidence tokens (70-84 edge score)
-    if (edge_score >= 70) {
-      return 'watchlist';
-    }
-    
-    // Low confidence tokens (< 70 edge score)
+
     if (edge_score < 50) {
-      return 'rejected';
+      return { shouldAlert: false, classification: 'rejected', reason: `Low edge score: ${edge_score}` };
     }
-    
-    return 'unqualified';
+
+    if (age_minutes <= 60 && edge_score >= 75 && tx_count >= 10) {
+      return {
+        shouldAlert: edge_score >= 85,
+        classification: 'fresh-gem',
+        reason: `Fresh gem candidate: age=${age_minutes}, edge=${edge_score}, tx=${tx_count}`
+      };
+    }
+
+    if (age_minutes > 60 && edge_score >= 70 && holder_count >= 50) {
+      return {
+        shouldAlert: edge_score >= 90,
+        classification: 'established',
+        reason: `Established token: age=${age_minutes}, edge=${edge_score}, holders=${holder_count}`
+      };
+    }
+
+    if (edge_score >= 60) {
+      return { shouldAlert: false, classification: 'under-review', reason: `Manual review: edge=${edge_score}` };
+    }
+
+    return { shouldAlert: false, classification: 'rejected', reason: `Rejected: edge=${edge_score}` };
   }
 
-  /**
-   * Determine if an alert should be sent
-   */
-  private shouldSendAlert(classification: TokenStatus, edgeScore: number, alertSuppressed: boolean): boolean {
-    if (alertSuppressed) return false;
-    
-    // Ultra-Premium alerts (≥92 edge score)
-    if (edgeScore >= 92 && ['fresh', 'established'].includes(classification)) {
-      return true;
-    }
-    
-    // High-Confidence alerts (≥85 edge score)
-    if (edgeScore >= 85 && ['fresh', 'established'].includes(classification)) {
-      return true;
-    }
-    
-    // Smart-Money signals (watchlist with smart wallet activity)
-    if (classification === 'watchlist' && edgeScore >= 75) {
-      return true;
-    }
-    
-    return false;
+  private async createNewClassification(
+    tokenAddress: string,
+    result: ClassificationResult,
+    metrics: TokenMetrics
+  ): Promise<void> {
+    const classificationData: ClassificationUpdate = {
+      token_address: tokenAddress,
+      current_status: result.classification,
+      reason: result.reason,
+      edge_score: metrics.edge_score,
+      age_minutes: metrics.age_minutes, // FIXED: Add missing age_minutes field
+      tx_count: metrics.tx_count,
+      holder_count: metrics.holder_count,
+      metadata_verified: metrics.metadata_verified,
+      reevaluation_count: 0,
+      smart_wallet_entries: metrics.smart_wallet_entries,
+      volume_24h: metrics.volume_24h,
+      liquidity_usd: metrics.liquidity_usd,
+      reclassificationFlags: {},
+      source: 'batch_processor',
+      updated_by: 'classification_integration'
+    };
+    await this.classificationService.createClassification(classificationData);
+    logger.info(`📝 Created classification for ${tokenAddress}: ${result.classification}`);
   }
 
-  /**
-   * Generate reclassification events based on token signals
-   */
-  private generateReclassificationEvents(result: TokenProcessingResult): void {
-    if (!result.signals) return;
+  private async updateExistingClassification(
+    existing: IClassificationHistory,
+    result: ClassificationResult,
+    metrics: TokenMetrics
+  ): Promise<void> {
+    const hasStatusChanged = existing.current_status !== result.classification;
+    const scoreDelta = Math.abs(existing.edge_score - metrics.edge_score);
+    if (!hasStatusChanged && scoreDelta < 5) return;
 
-    const events: ReclassificationEvent[] = [];
-
-    if (result.signals.smart_wallet_activity) {
-      events.push({
-        type: 'smart_wallet_entry',
-        token_address: result.token_address,
-        timestamp: new Date(),
-        data: { 
-          edge_score: result.edge_score,
-          smart_wallet_entries: result.metrics.smart_wallet_entries 
-        }
-      });
-    }
-
-    if (result.signals.volume_spike) {
-      events.push({
-        type: 'volume_spike',
-        token_address: result.token_address,
-        timestamp: new Date(),
-        data: { 
-          volume_24h: result.metrics.volume_24h,
-          edge_score: result.edge_score 
-        }
-      });
-    }
-
-    if (result.signals.pattern_signal_spike) {
-      events.push({
-        type: 'tx_surge',
-        token_address: result.token_address,
-        timestamp: new Date(),
-        data: { 
-          tx_count: result.metrics.tx_count,
-          edge_score: result.edge_score 
-        }
-      });
-    }
-
-    // Add events to scheduler queue
-    events.forEach(event => this.schedulerService.addEvent(event));
-  }
-
-  /**
-   * Handle external events (webhook, API, etc.)
-   */
-  async handleExternalEvent(event: {
-    type: 'metadata_change' | 'lp_update' | 'honeypot_detected' | 'rug_detected';
-    token_address: string;
-    data: any;
-  }): Promise<void> {
-    const reclassificationEvent: ReclassificationEvent = {
-      type: event.type as any,
-      token_address: event.token_address,
-      timestamp: new Date(),
-      data: event.data
+    // FIXED: Ensure previous_status is TokenStatus type, not null
+    const update: Partial<ClassificationUpdate> = {
+      current_status: result.classification,
+      previous_status: existing.current_status, // FIXED: This is already TokenStatus type
+      reason: result.reason,
+      edge_score: metrics.edge_score,
+      age_minutes: metrics.age_minutes, // FIXED: Add missing age_minutes field
+      tx_count: metrics.tx_count,
+      holder_count: metrics.holder_count,
+      smart_wallet_entries: metrics.smart_wallet_entries,
+      volume_24h: metrics.volume_24h,
+      liquidity_usd: metrics.liquidity_usd,
+      source: 'batch_processor',
+      updated_by: 'classification_integration'
     };
 
-    this.schedulerService.addEvent(reclassificationEvent);
-
-    // Handle immediate suppression for honeypots/rugs
-    if (['honeypot_detected', 'rug_detected'].includes(event.type)) {
-      await this.classificationService.suppressAlerts(
-        event.token_address,
-        `${event.type.replace('_', ' ')} detected`,
-        new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
-      );
-    }
+    await this.classificationService.updateClassification(existing.token_address, update);
+    logger.info(`🔄 Updated classification for ${existing.token_address}: ${existing.current_status} → ${result.classification}`);
   }
 
-  /**
-   * Get classification status for a token
-   */
-  async getTokenStatus(token_address: string): Promise<{
-    classification: TokenStatus | null;
-    edgeScore: number | null;
-    ageMinutes: number | null;
-    alertSuppressed: boolean;
-    reclassificationFlags: string[];
-  }> {
-    const record = await this.classificationService.getClassification(token_address);
-    
-    if (!record) {
-      return {
-        classification: null,
-        edgeScore: null,
-        ageMinutes: null,
-        alertSuppressed: false,
-        reclassificationFlags: []
-      };
-    }
+  async getTokenClassification(tokenAddress: string): Promise<ClassificationStats> {
+    const record = await this.classificationService.getByTokenAddress(tokenAddress);
+    if (!record) return {
+      classification: null, edgeScore: null, ageMinutes: null, alertSuppressed: false, reclassificationFlags: []
+    };
 
-    const ageMinutes = Math.floor((Date.now() - record.first_detected_at.getTime()) / 60000);
-    const alertSuppressed = await this.classificationService.isAlertSuppressed(token_address);
-    
-    const flags = [];
-    if (record.is_late_blooming) flags.push('late_blooming');
-    if (record.is_early_established) flags.push('early_established');
-    if (record.is_delayed_hot) flags.push('delayed_hot');
-    if (record.is_false_positive) flags.push('false_positive');
-    if (record.is_reborn) flags.push('reborn');
-    if (record.is_edge_plateau) flags.push('edge_plateau');
-    if (record.is_echo) flags.push('echo');
-    if (record.is_sidecar) flags.push('sidecar');
-    if (record.is_reversal) flags.push('reversal');
+    const flags: string[] = [];
+    if (record.getIsLateBlooming()) flags.push('late_blooming');
+    if (record.getIsEarlyEstablished()) flags.push('early_established');
+    if (record.getIsDelayedHot()) flags.push('delayed_hot');
+    if (record.getIsFalsePositive()) flags.push('false_positive');
+    if (record.getIsReborn()) flags.push('reborn');
+    if (record.getIsEdgePlateau()) flags.push('edge_plateau');
+    if (record.getIsEcho()) flags.push('echo');
+    if (record.getIsSidecar()) flags.push('sidecar');
+    if (record.getIsReversal()) flags.push('reversal');
 
     return {
-      classification: record.current_status,
+      classification: record.current_status as TokenStatus,
       edgeScore: record.edge_score,
-      ageMinutes,
-      alertSuppressed,
+      ageMinutes: record.age_minutes,
+      alertSuppressed: record.alert_suppressed,
       reclassificationFlags: flags
     };
   }
 
-  /**
-   * Get system statistics
-   */
-  async getSystemStats(): Promise<{
-    totalTokens: number;
-    tokensByStatus: Record<TokenStatus, number>;
-    reclassificationStats: Record<string, number>;
-    schedulerStatus: any;
-  }> {
-    // This would query your classification history for stats
-    const schedulerStatus = this.schedulerService.getStatus();
-    
-    return {
-      totalTokens: 0, // Implement actual count
-      tokensByStatus: {
-        fresh: 0,
-        established: 0,
-        rejected: 0,
-        watchlist: 0,
-        dormant: 0,
-        unqualified: 0
-      },
-      reclassificationStats: {
-        late_blooming: 0,
-        early_established: 0,
-        delayed_hot: 0,
-        false_positive: 0,
-        reborn: 0,
-        edge_plateau: 0,
-        echo: 0,
-        sidecar: 0,
-        reversal: 0
-      },
-      schedulerStatus
-    };
+  // Alias method for setup script compatibility
+  async getTokenStatus(tokenAddress: string): Promise<ClassificationStats> {
+    return this.getTokenClassification(tokenAddress);
   }
 
-  /**
-   * Shutdown the classification system
-   */
+  // Add getSystemStats method for setup script
+  async getSystemStats(): Promise<any> {
+    try {
+      const [statusCounts, recentActivity, suppressedAlerts] = await Promise.all([
+        ClassificationHistory.getStatusCounts(),
+        this.classificationService.getRecentActivity ? this.classificationService.getRecentActivity(24) : [],
+        ClassificationHistory.findSuppressedAlerts()
+      ]);
+
+      // Convert statusCounts to the format expected by setup script
+      const tokensByStatus: { [key: string]: number } = {};
+      if (Array.isArray(statusCounts)) {
+        statusCounts.forEach((item: any) => {
+          tokensByStatus[item._id] = item.count;
+        });
+      }
+
+      return {
+        statusCounts,
+        tokensByStatus,
+        recentActivity: Array.isArray(recentActivity) ? recentActivity.length : 0,
+        suppressedAlerts: Array.isArray(suppressedAlerts) ? suppressedAlerts.length : 0,
+        isInitialized: this.isInitialized
+      };
+    } catch (error) {
+      logger.error('❌ Error getting system stats:', error);
+      throw error;
+    }
+  }
+
   async shutdown(): Promise<void> {
-    logger.info('Shutting down classification integration system...');
-    await this.schedulerService.stop();
-    logger.info('Classification integration system shutdown complete');
+    logger.info('🔻 Shutting down Classification Integration Service...');
+    
+    // FIXED: Use stop() instead of shutdown()
+    if (this.schedulerService) await this.schedulerService.stop();
+    
+    this.isInitialized = false;
+    logger.info('✅ Shutdown complete');
+  }
+
+  // FIXED: Add method to set database connection after construction
+  setDatabaseConnection(db: Db): void {
+    this.db = db;
+    this.performanceService = new PerformanceMonitoringService(db);
+    this.alertService = new AlertSystemService(this.performanceService);
+    logger.info('Database connection configured - Performance monitoring and alerts enabled');
+  }
+
+  // Helper method to check if full functionality is available
+  hasFullFunctionality(): boolean {
+    return !!(this.db && this.performanceService && this.alertService);
   }
 }
+
+export default ClassificationIntegrationService;

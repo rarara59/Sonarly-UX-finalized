@@ -5,7 +5,7 @@ import ExternalWallet, { IExternalWallet } from '../models/externalWallet';
 import { getRiskManagerModule } from './risk-manager-module';
 import riskManagementService from './risk-management-service';
 import EnhancedRiskManagementService from './enhanced-risk-management';
-import { getAlphaStreamScraper } from './alpha-stream-scraper';
+import { getAlphaStreamScraper } from '../legacy/alpha-stream-scraper';
 
 interface SmartMoneySignal {
   tokenAddress: string;

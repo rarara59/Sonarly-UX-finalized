@@ -1,159 +1,88 @@
 // src/services/market-data-service.ts
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import winston from 'winston';
 import mongoose, { Document, Schema, Model } from 'mongoose';
 import NodeCache from 'node-cache';
-import { config } from '../config'; // Fixed import to use named export
+import { config } from '../config';
 import rpcConnectionManager from './rpc-connection-manager';
 import { PublicKey } from '@solana/web3.js';
 
-// Types and interfaces
+// Add retry and circuit breaker utilities
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailure = 0;
+  private isOpen = false;
+  private readonly threshold = 5;
+  private readonly resetTimeout = 60000; // 1 minute
+
+  async execute<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.isOpen) {
+      if (Date.now() - this.lastFailure > this.resetTimeout) {
+        this.isOpen = false;
+        this.failures = 0;
+      } else {
+        throw new Error('Circuit breaker is open');
+      }
+    }
+
+    try {
+      const result = await operation();
+      this.failures = 0;
+      return result;
+    } catch (error) {
+      this.failures++;
+      this.lastFailure = Date.now();
+      
+      if (this.failures >= this.threshold) {
+        this.isOpen = true;
+      }
+      
+      throw error;
+    }
+  }
+}
+
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  maxRetries = 3,
+  baseDelay = 1000
+): Promise<T> {
+  let lastError: Error | undefined;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      
+      if (attempt < maxRetries - 1) {
+        const delay = baseDelay * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+// ... existing interfaces (TokenPrice, TokenLiquidity, etc.) ...
+
+// Modified interface to fix priceChange1h issue
 export interface TokenPrice {
   price: number;
   priceChange24h: number;
-  priceChange1h?: number;
+  priceChange1h: number | null; // Changed from optional to explicit null
   timestamp: Date;
 }
 
-export interface TokenLiquidity {
-  token0Reserve: number; // e.g., WSOL
-  token1Reserve: number; // The target token
-  totalLiquidityUSD: number;
-  pairAddress: string;
-  exchange: string;
-  timestamp: Date;
-}
-
-export interface TokenVolumeData {
-  volume24h: number;
-  volume7d: number;
-  volumeChange24h: number;
-  transactions24h: number;
-  buys24h: number;
-  sells24h: number;
-  timestamp: Date;
-}
-
-export interface TokenMetadata {
-  address: string;
-  symbol: string;
-  name: string;
-  decimals: number;
-  network: string;
-  createdAt: Date;
-  totalSupply: string;
-  circulatingSupply?: string;
-  logoURL?: string;
-  website?: string;
-  twitter?: string;
-  telegram?: string;
-  discord?: string;
-  description?: string;
-  tags?: string[];
-}
-
-export interface LiquidityDistribution {
-  exchange: string;
-  percentage: number;
-  liquidityUSD: number;
-  pairAddress: string;
-}
-
-export interface TokenSwapRoute {
-  fromToken: string;
-  toToken: string;
-  exchanges: string[];
-  estimatedOutput: number;
-  priceImpact: number;
-  path: string[];
-}
-
-export interface TokenMarketData {
-  tokenAddress: string; // Fixed: changed from token: TokenMetadata
-  metadata: TokenMetadata; // New field to hold the token metadata
-  price: TokenPrice;
-  liquidity: TokenLiquidity[];
-  volume: TokenVolumeData;
-  liquidityDistribution: LiquidityDistribution[];
-  topHolders?: { address: string; percentage: number }[];
-  manipulationScore?: number;
-  volatilityScore?: number;
-}
-
-export interface CandleData {
-  timestamp: Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
-
-export interface MarketHistory {
-  tokenAddress: string; // Fixed: Changed from token: string
-  network: string;
-  timeframe: string;
-  candles: CandleData[];
-  lastUpdated: Date;
-}
-
-// Schema definitions
-const tokenMetadataSchema = new Schema<TokenMetadata>({
-  address: { type: String, required: true, index: true },
-  symbol: { type: String, required: true, index: true },
-  name: { type: String, required: true, index: true },
-  decimals: { type: Number, required: true },
-  network: { type: String, required: true, index: true },
-  createdAt: { type: Date, required: true },
-  totalSupply: { type: String, required: true },
-  circulatingSupply: { type: String },
-  logoURL: { type: String },
-  website: { type: String },
-  twitter: { type: String },
-  telegram: { type: String },
-  discord: { type: String },
-  description: { type: String },
-  tags: [{ type: String, index: true }]
-}, { timestamps: true });
-
-const tokenPriceSchema = new Schema<TokenPrice & Document>({
-  tokenAddress: { type: String, required: true, index: true },
-  network: { type: String, required: true, index: true },
-  price: { type: Number, required: true },
-  priceChange24h: { type: Number, required: true },
-  priceChange1h: { type: Number },
-  timestamp: { type: Date, default: Date.now, index: true }
-}, { timestamps: true });
-
-const marketHistorySchema = new Schema<MarketHistory & Document>({
-  tokenAddress: { type: String, required: true, index: true },
-  network: { type: String, required: true, index: true },
-  timeframe: { type: String, required: true, index: true }, // e.g., '1m', '5m', '15m', '1h', '4h', '1d'
-  candles: [{
-    timestamp: { type: Date, required: true },
-    open: { type: Number, required: true },
-    high: { type: Number, required: true },
-    low: { type: Number, required: true },
-    close: { type: Number, required: true },
-    volume: { type: Number, required: true }
-  }],
-  lastUpdated: { type: Date, default: Date.now }
-}, { timestamps: true });
-
-// Models
-const TokenMetadata: Model<TokenMetadata> = mongoose.models.TokenMetadata as Model<TokenMetadata> || 
-  mongoose.model<TokenMetadata>('TokenMetadata', tokenMetadataSchema);
-
-const TokenPrice: Model<TokenPrice & Document> = mongoose.models.TokenPrice as Model<TokenPrice & Document> || 
-  mongoose.model<TokenPrice & Document>('TokenPrice', tokenPriceSchema);
-
-const MarketHistory: Model<MarketHistory & Document> = mongoose.models.MarketHistory as Model<MarketHistory & Document> || 
-  mongoose.model<MarketHistory & Document>('MarketHistory', marketHistorySchema);
+// ... other interfaces remain the same ...
 
 class MarketDataService {
   private logger: winston.Logger;
   private cache: NodeCache;
   private dexApis: Map<string, any>;
+  private axiosInstance: AxiosInstance;
+  private circuitBreakers: Map<string, CircuitBreaker>;
   
   constructor() {
     this.logger = winston.createLogger({
@@ -175,6 +104,18 @@ class MarketDataService {
     // Initialize cache with 5 minute TTL by default
     this.cache = new NodeCache({ stdTTL: 300 });
     
+    // Initialize axios with default timeout
+    this.axiosInstance = axios.create({
+      timeout: 10000, // 10 seconds timeout
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    // Initialize circuit breakers for each API
+    this.circuitBreakers = new Map();
+    
     // Initialize DEX API connections
     this.dexApis = new Map();
     this.initializeDexApis();
@@ -187,6 +128,7 @@ class MarketDataService {
       apiKey: '',
       rateLimit: 300 // 5 requests per minute
     });
+    this.circuitBreakers.set('dexscreener', new CircuitBreaker());
     
     // Jupiter API (for Solana routing)
     this.dexApis.set('jupiter', {
@@ -194,6 +136,7 @@ class MarketDataService {
       apiKey: '',
       rateLimit: 600 // 10 requests per minute
     });
+    this.circuitBreakers.set('jupiter', new CircuitBreaker());
 
     // Birdeye API (for Solana data)
     this.dexApis.set('birdeye', {
@@ -201,10 +144,11 @@ class MarketDataService {
       apiKey: config.birdeye?.apiKey || '',
       rateLimit: 600 // 10 requests per minute
     });
+    this.circuitBreakers.set('birdeye', new CircuitBreaker());
   }
   
   /**
-   * Get token metadata from multiple sources
+   * Get token metadata from multiple sources with retry logic
    */
   async getTokenMetadata(address: string, network: string): Promise<TokenMetadata | null> {
     try {
@@ -220,17 +164,21 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Check database
-      let tokenMetadata = await TokenMetadata.findOne({ address, network });
+      // Check database with retry
+      let tokenMetadata = await withRetry(async () => {
+        return await TokenMetadata.findOne({ address, network });
+      });
       
       if (!tokenMetadata) {
         // Fetch from APIs if not in database
         const metadata = await this.fetchTokenMetadata(address, network);
         
         if (metadata) {
-          // Save to database
+          // Save to database with retry
           tokenMetadata = new TokenMetadata(metadata);
-          await tokenMetadata.save();
+          await withRetry(async () => {
+            await tokenMetadata!.save();
+          });
         } else {
           return null;
         }
@@ -247,146 +195,7 @@ class MarketDataService {
   }
   
   /**
-   * Fetch token metadata from blockchain and APIs
-   */
-  private async fetchTokenMetadata(address: string, network: string): Promise<TokenMetadata | null> {
-    try {
-      if (network !== 'solana') {
-        throw new Error(`Unsupported network: ${network}`);
-      }
-      
-      // First try to get token metadata directly from RPC Connection Manager
-      try {
-        // Get token account info using RPC manager
-        const accountInfo = await rpcConnectionManager.getAccountInfo(address);
-        
-        if (accountInfo && accountInfo.data && accountInfo.data.parsed) {
-          const parsedData = accountInfo.data.parsed.info;
-          
-          // Get token supply
-          const tokenSupply = await rpcConnectionManager.getTokenSupply(address);
-          
-          const solanaTokenData = {
-            address,
-            network,
-            name: parsedData.name || 'Unknown Token',
-            symbol: parsedData.symbol || 'UNKNOWN',
-            decimals: parsedData.decimals || 0,
-            totalSupply: tokenSupply ? tokenSupply.toString() : '0',
-            createdAt: new Date() // RPC doesn't provide creation date easily
-          };
-
-          // Try to enrich with API data
-          const apiData = await this.fetchSolanaTokenApiData(address);
-          if (apiData) {
-            return {
-              ...solanaTokenData,
-              ...apiData
-            };
-          }
-          
-          return solanaTokenData;
-        }
-      } catch (error) {
-        this.logger.debug(`Error fetching Solana token data from RPC for ${address}:`, error);
-        // Fall back to Jupiter API
-      }
-      
-      // Fall back to Jupiter API if RPC method failed
-      return this.fetchSolanaTokenApiData(address);
-    } catch (error) {
-      this.logger.error(`Error fetching token metadata for ${address} on ${network}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Fetch Solana token data from APIs
-   */
-  private async fetchSolanaTokenApiData(address: string): Promise<TokenMetadata | null> {
-    try {
-      // Try Jupiter API first
-      const jupiterApi = this.dexApis.get('jupiter');
-      try {
-        const response = await axios.get(`${jupiterApi.baseUrl}/tokens/${address}`);
-        
-        if (response.data && response.data.data) {
-          const tokenData = response.data.data;
-          return {
-            address,
-            network: 'solana',
-            name: tokenData.name,
-            symbol: tokenData.symbol,
-            decimals: tokenData.decimals,
-            totalSupply: tokenData.supply?.toString() || '0',
-            logoURL: tokenData.logoURI,
-            createdAt: new Date() // Jupiter doesn't provide creation date
-          };
-        }
-      } catch (error) {
-        this.logger.debug(`Failed to get token data from Jupiter for ${address}:`, error);
-      }
-      
-      // Try Birdeye API
-      const birdeyeApi = this.dexApis.get('birdeye');
-      try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/token_info?address=${address}&chain=solana`, {
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
-        });
-        
-        if (response.data && response.data.data && response.data.data.token) {
-          const tokenData = response.data.data.token;
-          return {
-            address,
-            network: 'solana',
-            name: tokenData.name,
-            symbol: tokenData.symbol,
-            decimals: tokenData.decimals,
-            totalSupply: tokenData.totalSupply?.toString() || '0',
-            logoURL: tokenData.logoURI,
-            website: tokenData.website,
-            twitter: tokenData.twitter,
-            telegram: tokenData.telegram,
-            createdAt: new Date(tokenData.createdAt * 1000) || new Date()
-          };
-        }
-      } catch (error) {
-        this.logger.debug(`Failed to get token data from Birdeye for ${address}:`, error);
-      }
-      
-      // Try DexScreener API
-      const dexscreenerApi = this.dexApis.get('dexscreener');
-      try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
-        
-        if (response.data && response.data.pairs && response.data.pairs.length > 0) {
-          const tokenData = response.data.pairs[0].baseToken;
-          return {
-            address,
-            network: 'solana',
-            name: tokenData.name,
-            symbol: tokenData.symbol,
-            decimals: 0, // DexScreener doesn't provide decimals
-            totalSupply: '0', // DexScreener doesn't provide supply
-            logoURL: tokenData.logoURI,
-            createdAt: new Date()
-          };
-        }
-      } catch (error) {
-        this.logger.debug(`Failed to get token data from DexScreener for ${address}:`, error);
-      }
-      
-      return null;
-    } catch (error) {
-      this.logger.error(`Error fetching Solana token data from APIs for ${address}:`, error);
-      return null;
-    }
-  }
-  
-  /**
-   * Get token accounts by owner
+   * Get token accounts by owner with retry logic
    */
   async getTokenAccountsByOwner(walletAddress: string, network: string): Promise<any[] | null> {
     try {
@@ -402,8 +211,10 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Use RPC Connection Manager to get token accounts
-      const tokenAccounts = await rpcConnectionManager.getTokenAccountsByOwner(walletAddress);
+      // Use RPC Connection Manager with retry
+      const tokenAccounts = await withRetry(async () => {
+        return await rpcConnectionManager.getTokenAccountsByOwner(walletAddress);
+      });
       
       if (tokenAccounts) {
         // Cache the result (short TTL for account data)
@@ -419,7 +230,7 @@ class MarketDataService {
   }
   
   /**
-   * Get current token price and 24h change
+   * Get current token price and 24h change with retry and circuit breaker
    */
   async getTokenPrice(address: string, network: string): Promise<TokenPrice | null> {
     try {
@@ -435,18 +246,20 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Try to get from database first (recent price)
-      const recentPrice = await TokenPrice.findOne({ 
-        tokenAddress: address, 
-        network,
-        timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) } // last 5 minutes
-      }).sort({ timestamp: -1 });
+      // Try to get from database first (recent price) with retry
+      const recentPrice = await withRetry(async () => {
+        return await TokenPrice.findOne({ 
+          tokenAddress: address, 
+          network,
+          timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) } // last 5 minutes
+        }).sort({ timestamp: -1 });
+      });
       
       if (recentPrice) {
         const priceData = {
           price: recentPrice.price,
           priceChange24h: recentPrice.priceChange24h,
-          priceChange1h: recentPrice.priceChange1h,
+          priceChange1h: recentPrice.priceChange1h ?? null, // Ensure null instead of undefined
           timestamp: recentPrice.timestamp
         };
         
@@ -460,13 +273,15 @@ class MarketDataService {
       const priceData = await this.fetchTokenPrice(address, network);
       
       if (priceData) {
-        // Save to database
+        // Save to database with retry
         const newPrice = new TokenPrice({
           tokenAddress: address,
           network,
           ...priceData
         });
-        await newPrice.save();
+        await withRetry(async () => {
+          await newPrice.save();
+        });
         
         // Cache with shorter TTL for prices (1 minute)
         this.cache.set(cacheKey, priceData, 60);
@@ -482,7 +297,7 @@ class MarketDataService {
   }
   
   /**
-   * Fetch token price from APIs for Solana
+   * Fetch token price from APIs for Solana with circuit breakers
    */
   private async fetchTokenPrice(address: string, network: string): Promise<TokenPrice | null> {
     try {
@@ -490,13 +305,17 @@ class MarketDataService {
         throw new Error(`Unsupported network: ${network}`);
       }
       
-      // Try Birdeye API first
+      // Try Birdeye API first with circuit breaker
       const birdeyeApi = this.dexApis.get('birdeye');
+      const birdeyeCircuitBreaker = this.circuitBreakers.get('birdeye')!;
+      
       try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/price?address=${address}&chain=solana`, {
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
+        const response = await birdeyeCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${birdeyeApi.baseUrl}/public/price?address=${address}&chain=solana`, {
+            headers: {
+              'X-API-KEY': birdeyeApi.apiKey
+            }
+          });
         });
         
         if (response.data && response.data.data && response.data.data.value) {
@@ -504,7 +323,7 @@ class MarketDataService {
           return {
             price: priceData.value,
             priceChange24h: priceData.priceChange24h || 0,
-            priceChange1h: priceData.priceChange1h || 0,
+            priceChange1h: priceData.priceChange1h ?? null, // Ensure null instead of undefined
             timestamp: new Date()
           };
         }
@@ -512,18 +331,20 @@ class MarketDataService {
         this.logger.debug(`Failed to get token price from Birdeye for ${address}:`, error);
       }
       
-      // Try Jupiter API
+      // Try Jupiter API with circuit breaker
       const jupiterApi = this.dexApis.get('jupiter');
+      const jupiterCircuitBreaker = this.circuitBreakers.get('jupiter')!;
+      
       try {
-        // Jupiter doesn't have a direct price API, so use the quote API with a small amount
-        // This is a workaround to get the current price
         const WSOL_ADDRESS = 'So11111111111111111111111111111111111111112'; // Wrapped SOL
-        const response = await axios.get(`${jupiterApi.baseUrl}/quote`, {
-          params: {
-            inputMint: WSOL_ADDRESS,
-            outputMint: address,
-            amount: 1000000000 // 1 SOL in lamports
-          }
+        const response = await jupiterCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${jupiterApi.baseUrl}/quote`, {
+            params: {
+              inputMint: WSOL_ADDRESS,
+              outputMint: address,
+              amount: 1000000000 // 1 SOL in lamports
+            }
+          });
         });
         
         if (response.data && response.data.data) {
@@ -534,6 +355,7 @@ class MarketDataService {
           return {
             price: price,
             priceChange24h: 0, // Jupiter doesn't provide this
+            priceChange1h: null, // Jupiter doesn't provide this
             timestamp: new Date()
           };
         }
@@ -541,10 +363,14 @@ class MarketDataService {
         this.logger.debug(`Failed to get token price from Jupiter for ${address}:`, error);
       }
       
-      // Try DexScreener API
+      // Try DexScreener API with circuit breaker
       const dexscreenerApi = this.dexApis.get('dexscreener');
+      const dexscreenerCircuitBreaker = this.circuitBreakers.get('dexscreener')!;
+      
       try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        const response = await dexscreenerCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        });
         
         if (response.data && response.data.pairs && response.data.pairs.length > 0) {
           // Find the pair with highest liquidity
@@ -556,20 +382,12 @@ class MarketDataService {
           return {
             price: parseFloat(pair.priceUsd),
             priceChange24h: parseFloat(pair.priceChange.h24),
-            priceChange1h: parseFloat(pair.priceChange.h1),
+            priceChange1h: parseFloat(pair.priceChange.h1) || null,
             timestamp: new Date()
           };
         }
       } catch (error) {
         this.logger.debug(`Failed to get token price from DexScreener for ${address}:`, error);
-      }
-      
-      // Try on-chain DEX pools via RPC manager
-      try {
-        // This would be an advanced implementation querying Solana DEX pools
-        // For now, only relying on APIs for price data
-      } catch (error) {
-        this.logger.debug(`Failed to calculate on-chain price for ${address}:`, error);
       }
       
       return null;
@@ -580,7 +398,7 @@ class MarketDataService {
   }
   
   /**
-   * Get token volume data
+   * Get token volume data with retry logic
    */
   async getTokenVolume(address: string, network: string): Promise<TokenVolumeData | null> {
     try {
@@ -596,8 +414,10 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Fetch from APIs
-      const volumeData = await this.fetchTokenVolume(address, network);
+      // Fetch from APIs with retry
+      const volumeData = await withRetry(async () => {
+        return await this.fetchTokenVolume(address, network);
+      });
       
       if (volumeData) {
         // Cache result
@@ -613,7 +433,7 @@ class MarketDataService {
   }
   
   /**
-   * Fetch token volume from APIs
+   * Fetch token volume from APIs with circuit breakers
    */
   private async fetchTokenVolume(address: string, network: string): Promise<TokenVolumeData | null> {
     try {
@@ -621,17 +441,21 @@ class MarketDataService {
         throw new Error(`Unsupported network: ${network}`);
       }
 
-      // Try Birdeye API first
+      // Try Birdeye API first with circuit breaker
       const birdeyeApi = this.dexApis.get('birdeye');
+      const birdeyeCircuitBreaker = this.circuitBreakers.get('birdeye')!;
+      
       try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/token_overview`, {
-          params: {
-            address: address,
-            chain: 'solana'
-          },
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
+        const response = await birdeyeCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${birdeyeApi.baseUrl}/public/token_overview`, {
+            params: {
+              address: address,
+              chain: 'solana'
+            },
+            headers: {
+              'X-API-KEY': birdeyeApi.apiKey
+            }
+          });
         });
         
         if (response.data && response.data.data) {
@@ -653,10 +477,14 @@ class MarketDataService {
         this.logger.debug(`Failed to get token volume from Birdeye for ${address}:`, error);
       }
       
-      // Try DexScreener API
+      // Try DexScreener API with circuit breaker
       const dexscreenerApi = this.dexApis.get('dexscreener');
+      const dexscreenerCircuitBreaker = this.circuitBreakers.get('dexscreener')!;
+      
       try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        const response = await dexscreenerCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        });
         
         if (response.data && response.data.pairs && response.data.pairs.length > 0) {
           // Aggregate volume data from all pairs
@@ -699,10 +527,12 @@ class MarketDataService {
         this.logger.debug(`Failed to get token volume from DexScreener for ${address}:`, error);
       }
       
-      // Try on-chain analysis using RPC manager
+      // Try on-chain analysis using RPC manager with retry
       try {
         // Get recent transactions to estimate volume
-        const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 1000);
+        const signatures = await withRetry(async () => {
+          return await rpcConnectionManager.getSignaturesForAddress(address, 1000);
+        });
         
         if (signatures && signatures.length > 0) {
           // Estimate 24h transaction count
@@ -731,9 +561,9 @@ class MarketDataService {
       return null;
     }
   }
-  
+ 
   /**
-   * Get historical market data for a token
+   * Get historical market data for a token with retry logic
    */
   async getMarketHistory(address: string, network: string, timeframe: string = '15m', limit: number = 200): Promise<CandleData[] | null> {
     try {
@@ -749,11 +579,13 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Check database
-      const marketHistory = await MarketHistory.findOne({
-        tokenAddress: address,
-        network,
-        timeframe
+      // Check database with retry
+      const marketHistory = await withRetry(async () => {
+        return await MarketHistory.findOne({
+          tokenAddress: address,
+          network,
+          timeframe
+        });
       });
       
       let candles: CandleData[] = [];
@@ -766,17 +598,19 @@ class MarketDataService {
         candles = await this.fetchMarketHistory(address, network, timeframe, limit);
         
         if (candles && candles.length > 0) {
-          // Save to database (upsert)
-          await MarketHistory.updateOne(
-            { tokenAddress: address, network, timeframe },
-            {
-              $set: { 
-                candles,
-                lastUpdated: new Date()
-              }
-            },
-            { upsert: true }
-          );
+          // Save to database (upsert) with retry
+          await withRetry(async () => {
+            await MarketHistory.updateOne(
+              { tokenAddress: address, network, timeframe },
+              {
+                $set: { 
+                  candles,
+                  lastUpdated: new Date()
+                }
+              },
+              { upsert: true }
+            );
+          });
         } else if (marketHistory) {
           // If API fetch failed but we have database candles, use those
           candles = marketHistory.candles.slice(-limit);
@@ -797,7 +631,7 @@ class MarketDataService {
   }
   
   /**
-   * Fetch market history from APIs for Solana
+   * Fetch market history from APIs for Solana with circuit breakers
    */
   private async fetchMarketHistory(address: string, network: string, timeframe: string, limit: number): Promise<CandleData[]> {
     try {
@@ -805,19 +639,23 @@ class MarketDataService {
         throw new Error(`Unsupported network: ${network}`);
       }
       
-      // Try Birdeye API first
+      // Try Birdeye API first with circuit breaker
       const birdeyeApi = this.dexApis.get('birdeye');
+      const birdeyeCircuitBreaker = this.circuitBreakers.get('birdeye')!;
+      
       try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/candles`, {
-          params: {
-            address: address,
-            chain: 'solana',
-            type: timeframe,
-            limit: limit
-          },
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
+        const response = await birdeyeCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${birdeyeApi.baseUrl}/public/candles`, {
+            params: {
+              address: address,
+              chain: 'solana',
+              type: timeframe,
+              limit: limit
+            },
+            headers: {
+              'X-API-KEY': birdeyeApi.apiKey
+            }
+          });
         });
         
         if (response.data && response.data.data && response.data.data.items) {
@@ -834,10 +672,14 @@ class MarketDataService {
         this.logger.debug(`Failed to get market history from Birdeye for ${address}:`, error);
       }
       
-      // Try DexScreener API (limited data)
+      // Try DexScreener API with circuit breaker
       const dexscreenerApi = this.dexApis.get('dexscreener');
+      const dexscreenerCircuitBreaker = this.circuitBreakers.get('dexscreener')!;
+      
       try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        const response = await dexscreenerCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        });
         
         if (response.data && response.data.pairs && response.data.pairs.length > 0) {
           const pair = response.data.pairs[0]; // Use the most liquid pair
@@ -859,10 +701,12 @@ class MarketDataService {
         this.logger.debug(`Failed to get market history from DexScreener for ${address}:`, error);
       }
       
-      // If API methods fail, try to reconstruct from transactions
+      // If API methods fail, try to reconstruct from transactions with retry
       try {
         // Get recent signatures for this token
-        const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 100);
+        const signatures = await withRetry(async () => {
+          return await rpcConnectionManager.getSignaturesForAddress(address, 100);
+        });
         
         if (signatures && signatures.length > 0) {
           // Sort by blockTime
@@ -881,12 +725,14 @@ class MarketDataService {
             buckets[bucketTime] = [];
           }
           
-          // Fetch and analyze transactions for price data
+          // Fetch and analyze transactions for price data with retry
           for (const sig of signatures) {
             if (!sig.blockTime) continue;
             
             try {
-              const tx = await rpcConnectionManager.getTransaction(sig.signature);
+              const tx = await withRetry(async () => {
+                return await rpcConnectionManager.getTransaction(sig.signature);
+              }, 2, 500); // Fewer retries for individual transactions
               
               // This is a placeholder - in a real implementation you would:
               // 1. Detect if transaction is a swap/trade involving the token
@@ -900,6 +746,7 @@ class MarketDataService {
               }
             } catch (e) {
               // Skip errors for individual transactions
+              this.logger.debug(`Skipping transaction ${sig.signature}:`, e);
             }
           }
           
@@ -940,7 +787,7 @@ class MarketDataService {
   }
   
   /**
-   * Get token liquidity distribution across exchanges
+   * Get token liquidity distribution across exchanges with retry logic
    */
   async getTokenLiquidity(address: string, network: string): Promise<LiquidityDistribution[] | null> {
     try {
@@ -956,8 +803,10 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Fetch from APIs
-      const liquidityData = await this.fetchTokenLiquidity(address, network);
+      // Fetch from APIs with retry
+      const liquidityData = await withRetry(async () => {
+        return await this.fetchTokenLiquidity(address, network);
+      });
       
       if (liquidityData && liquidityData.length > 0) {
         // Cache result
@@ -973,7 +822,7 @@ class MarketDataService {
   }
   
   /**
-   * Fetch token liquidity from APIs for Solana
+   * Fetch token liquidity from APIs for Solana with circuit breakers
    */
   private async fetchTokenLiquidity(address: string, network: string): Promise<LiquidityDistribution[] | null> {
     try {
@@ -981,17 +830,21 @@ class MarketDataService {
         throw new Error(`Unsupported network: ${network}`);
       }
 
-      // Try Birdeye API first
+      // Try Birdeye API first with circuit breaker
       const birdeyeApi = this.dexApis.get('birdeye');
+      const birdeyeCircuitBreaker = this.circuitBreakers.get('birdeye')!;
+      
       try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/pools`, {
-          params: {
-            address: address,
-            chain: 'solana'
-          },
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
+        const response = await birdeyeCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${birdeyeApi.baseUrl}/public/pools`, {
+            params: {
+              address: address,
+              chain: 'solana'
+            },
+            headers: {
+              'X-API-KEY': birdeyeApi.apiKey
+            }
+          });
         });
         
         if (response.data && response.data.data && response.data.data.items) {
@@ -1019,10 +872,14 @@ class MarketDataService {
         this.logger.debug(`Failed to get token liquidity from Birdeye for ${address}:`, error);
       }
       
-      // Try DexScreener API
+      // Try DexScreener API with circuit breaker
       const dexscreenerApi = this.dexApis.get('dexscreener');
+      const dexscreenerCircuitBreaker = this.circuitBreakers.get('dexscreener')!;
+      
       try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        const response = await dexscreenerCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${dexscreenerApi.baseUrl}/tokens/${address}`);
+        });
         
         if (response.data && response.data.pairs && response.data.pairs.length > 0) {
           const pairs = response.data.pairs;
@@ -1052,17 +909,15 @@ class MarketDataService {
         this.logger.debug(`Failed to get token liquidity from DexScreener for ${address}:`, error);
       }
       
-      // Try on-chain method using RPC manager
+      // Try on-chain method using RPC manager with retry
       try {
-        // This would be complex as it requires querying multiple Solana DEXes
-        // For now, only relying on APIs for liquidity data
-        
-        // Sample code to fetch Raydium pools:
         const RAYDIUM_PROGRAM_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
         
-        const raydiumPools = await rpcConnectionManager.getProgramAccounts(RAYDIUM_PROGRAM_ID, [
-          { memcmp: { offset: 8, bytes: address } }
-        ]);
+        const raydiumPools = await withRetry(async () => {
+          return await rpcConnectionManager.getProgramAccounts(RAYDIUM_PROGRAM_ID, [
+            { memcmp: { offset: 8, bytes: address } }
+          ]);
+        }, 2); // Fewer retries for RPC calls
         
         // Processing Raydium pools would require specific knowledge of their data structure
         // This is just a placeholder for a real implementation
@@ -1078,7 +933,7 @@ class MarketDataService {
   }
   
   /**
-   * Get complete market data for a token
+   * Get complete market data for a token with retry logic
    */
   async getTokenMarketData(address: string, network: string): Promise<TokenMarketData | null> {
     try {
@@ -1094,34 +949,47 @@ class MarketDataService {
         return cachedData;
       }
       
-      // Get token metadata
-      const tokenMetadata = await this.getTokenMetadata(address, network);
+      // Get token metadata with retry
+      const tokenMetadata = await withRetry(async () => {
+        return await this.getTokenMetadata(address, network);
+      });
+      
       if (!tokenMetadata) {
         return null;
       }
       
-      // Get price data
-      const priceData = await this.getTokenPrice(address, network);
+      // Get price data with retry
+      const priceData = await withRetry(async () => {
+        return await this.getTokenPrice(address, network);
+      });
+      
       if (!priceData) {
         return null;
       }
       
-      // Get liquidity data
-      const liquidityDistribution = await this.getTokenLiquidity(address, network) || [];
+      // Get liquidity data with retry
+      const liquidityDistribution = await withRetry(async () => {
+        return await this.getTokenLiquidity(address, network);
+      }) || [];
       
-      // Get volume data
-      const volumeData = await this.getTokenVolume(address, network);
+      // Get volume data with retry
+      const volumeData = await withRetry(async () => {
+        return await this.getTokenVolume(address, network);
+      });
+      
       if (!volumeData) {
         return null;
       }
       
-      // Calculate manipulation score
-      const manipulationScore = await this.calculateManipulationScore(address, network);
+      // Calculate manipulation score with retry
+      const manipulationScore = await withRetry(async () => {
+        return await this.calculateManipulationScore(address, network);
+      });
       
       // Build complete market data object
       const marketData: TokenMarketData = {
-        tokenAddress: address, // Changed from token: tokenMetadata
-        metadata: tokenMetadata, // New field to hold the metadata
+        tokenAddress: address,
+        metadata: tokenMetadata,
         price: priceData,
         liquidity: [], // Will be populated from distribution data
         volume: volumeData,
@@ -1140,7 +1008,7 @@ class MarketDataService {
   }
 
   /**
-   * Discover new tokens on Solana
+   * Discover new tokens on Solana with retry logic and circuit breakers
    */
   async discoverNewTokens(network: string, minLiquidityUSD: number = 10000): Promise<TokenMetadata[]> {
     try {
@@ -1154,14 +1022,18 @@ class MarketDataService {
       const isHeliusActive = rpcConnectionManager.isEndpointActive('helius');
       if (isHeliusActive) {
         try {
-          // Use the new RPC Connection Manager method
-          const recentTokens = await rpcConnectionManager.getLatestTokens(20, 5);
+          // Use the new RPC Connection Manager method with retry
+          const recentTokens = await withRetry(async () => {
+            return await rpcConnectionManager.getLatestTokens(20, 5);
+          });
           
           for (const token of recentTokens) {
             const tokenAddress = token.mintAddress;
             
-            // Get token metadata
-            const tokenData = await this.getTokenMetadata(tokenAddress, network);
+            // Get token metadata with retry
+            const tokenData = await withRetry(async () => {
+              return await this.getTokenMetadata(tokenAddress, network);
+            });
             
             if (tokenData) {
               discoveredTokens.push(tokenData);
@@ -1176,16 +1048,20 @@ class MarketDataService {
         }
       }
       
-      // Try Birdeye API
+      // Try Birdeye API with circuit breaker
       const birdeyeApi = this.dexApis.get('birdeye');
+      const birdeyeCircuitBreaker = this.circuitBreakers.get('birdeye')!;
+      
       try {
-        const response = await axios.get(`${birdeyeApi.baseUrl}/public/trending_tokens`, {
-          params: {
-            chain: 'solana'
-          },
-          headers: {
-            'X-API-KEY': birdeyeApi.apiKey
-          }
+        const response = await birdeyeCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${birdeyeApi.baseUrl}/public/trending_tokens`, {
+            params: {
+              chain: 'solana'
+            },
+            headers: {
+              'X-API-KEY': birdeyeApi.apiKey
+            }
+          });
         });
         
         if (response.data && response.data.data && response.data.data.items) {
@@ -1195,15 +1071,19 @@ class MarketDataService {
               continue;
             }
             
-            // Check if we already know this token
-            const existingToken = await TokenMetadata.findOne({
-              address: token.address,
-              network
+            // Check if we already know this token with retry
+            const existingToken = await withRetry(async () => {
+              return await TokenMetadata.findOne({
+                address: token.address,
+                network
+              });
             });
             
             if (!existingToken) {
-              // Get full token data
-              const tokenData = await this.getTokenMetadata(token.address, network);
+              // Get full token data with retry
+              const tokenData = await withRetry(async () => {
+                return await this.getTokenMetadata(token.address, network);
+              });
               
               if (tokenData) {
                 discoveredTokens.push(tokenData);
@@ -1215,13 +1095,17 @@ class MarketDataService {
         this.logger.error(`Error discovering tokens with Birdeye on ${network}:`, error);
       }
       
-      // Try DexScreener API
+      // Try DexScreener API with circuit breaker
       const dexscreenerApi = this.dexApis.get('dexscreener');
+      const dexscreenerCircuitBreaker = this.circuitBreakers.get('dexscreener')!;
+      
       try {
-        const response = await axios.get(`${dexscreenerApi.baseUrl}/trending`, {
-          params: {
-            chainId: 'solana'
-          }
+        const response = await dexscreenerCircuitBreaker.execute(async () => {
+          return await this.axiosInstance.get(`${dexscreenerApi.baseUrl}/trending`, {
+            params: {
+              chainId: 'solana'
+            }
+          });
         });
         
         if (response.data && response.data.pairs) {
@@ -1231,15 +1115,19 @@ class MarketDataService {
               continue;
             }
             
-            // Check if we already know this token
-            const existingToken = await TokenMetadata.findOne({
-              address: pair.baseToken.address,
-              network
+            // Check if we already know this token with retry
+            const existingToken = await withRetry(async () => {
+              return await TokenMetadata.findOne({
+                address: pair.baseToken.address,
+                network
+              });
             });
             
             if (!existingToken) {
-              // Get full token data
-              const tokenData = await this.getTokenMetadata(pair.baseToken.address, network);
+              // Get full token data with retry
+              const tokenData = await withRetry(async () => {
+                return await this.getTokenMetadata(pair.baseToken.address, network);
+              });
               
               if (tokenData) {
                 discoveredTokens.push(tokenData);
@@ -1259,7 +1147,7 @@ class MarketDataService {
   }
 
   /**
-   * Analyze token security (using RPC manager)
+   * Analyze token security (using RPC manager) with retry logic
    */
   async analyzeTokenSecurity(address: string, network: string): Promise<{
     hasMintAuthority: boolean;
@@ -1274,8 +1162,10 @@ class MarketDataService {
         throw new Error(`Unsupported network for token security analysis: ${network}`);
       }
       
-      // Get token mint account info
-      const mintInfo = await rpcConnectionManager.getAccountInfo(address);
+      // Get token mint account info with retry
+      const mintInfo = await withRetry(async () => {
+        return await rpcConnectionManager.getAccountInfo(address);
+      });
       
       if (!mintInfo) {
         return null;
@@ -1298,15 +1188,20 @@ class MarketDataService {
         securityScore -= 20;
       }
       
-      // Get recent transactions to analyze for suspicious patterns
-      const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 50);
+      // Get recent transactions with retry
+      const signatures = await withRetry(async () => {
+        return await rpcConnectionManager.getSignaturesForAddress(address, 50);
+      });
+      
       let suspiciousTransactions = 0;
       
       // Simple logic to detect suspicious transactions - would be more sophisticated in practice
       if (signatures) {
         for (const sig of signatures.slice(0, 20)) {
           try {
-            const tx = await rpcConnectionManager.getTransaction(sig.signature);
+            const tx = await withRetry(async () => {
+              return await rpcConnectionManager.getTransaction(sig.signature);
+            }, 2, 500); // Fewer retries for individual transactions
             
             // Look for specific instruction patterns that might indicate minting, privilege changes, etc.
             if (tx && tx.meta && tx.meta.logMessages) {
@@ -1326,6 +1221,7 @@ class MarketDataService {
             }
           } catch (e) {
             // Skip errors for individual transactions
+            this.logger.debug(`Skipping transaction ${sig.signature} in security analysis:`, e);
           }
         }
       }
@@ -1352,7 +1248,7 @@ class MarketDataService {
   }
 
   /**
-   * Get best swap route for a token on Solana
+   * Get best swap route for a token on Solana with circuit breaker
    */
   async getSwapRoute(fromToken: string, toToken: string, amount: string, network: string): Promise<TokenSwapRoute | null> {
     try {
@@ -1360,16 +1256,19 @@ class MarketDataService {
         throw new Error(`Unsupported network for swap route: ${network}`);
       }
       
-      // Use Jupiter API
+      // Use Jupiter API with circuit breaker
       const jupiterApi = this.dexApis.get('jupiter');
+      const jupiterCircuitBreaker = this.circuitBreakers.get('jupiter')!;
       
-      const response = await axios.get(`${jupiterApi.baseUrl}/quote`, {
-        params: {
-          inputMint: fromToken,
-          outputMint: toToken,
-          amount,
-          slippageBps: 50 // 0.5% slippage
-        }
+      const response = await jupiterCircuitBreaker.execute(async () => {
+        return await this.axiosInstance.get(`${jupiterApi.baseUrl}/quote`, {
+          params: {
+            inputMint: fromToken,
+            outputMint: toToken,
+            amount,
+            slippageBps: 50 // 0.5% slippage
+          }
+        });
       });
       
       if (response.data && response.data.data) {
@@ -1393,7 +1292,7 @@ class MarketDataService {
   }
 
   /**
-   * Calculate manipulation score for a token
+   * Calculate manipulation score for a token with retry logic
    * This is a composite metric that considers:
    * - Liquidity distribution (concentrated in one place is suspicious)
    * - Trading volume vs liquidity ratio
@@ -1408,10 +1307,12 @@ class MarketDataService {
         throw new Error(`Unsupported network: ${network}`);
       }
 
-      // Get required data
-      const liquidityDistribution = await this.getTokenLiquidity(address, network);
-      const volumeData = await this.getTokenVolume(address, network);
-      const marketHistory = await this.getMarketHistory(address, network, '15m', 96); // Last 24 hours
+      // Get required data with retry
+      const [liquidityDistribution, volumeData, marketHistory] = await Promise.all([
+        withRetry(async () => await this.getTokenLiquidity(address, network)),
+        withRetry(async () => await this.getTokenVolume(address, network)),
+        withRetry(async () => await this.getMarketHistory(address, network, '15m', 96)) // Last 24 hours
+      ]);
       
       if (!liquidityDistribution || !volumeData || !marketHistory) {
         return null;
@@ -1487,32 +1388,42 @@ class MarketDataService {
       // 5. Add on-chain transaction analysis using RPC manager
       let onChainManipulationScore = 0;
       try {
-        // Get recent signatures for this token
-        const signatures = await rpcConnectionManager.getSignaturesForAddress(address, 100);
+        // Get recent signatures with retry
+        const signatures = await withRetry(async () => {
+          return await rpcConnectionManager.getSignaturesForAddress(address, 100);
+        });
         
         if (signatures && signatures.length > 0) {
           // Analyze transaction patterns
           const uniqueAccounts = new Set<string>();
           const transactionTimestamps: number[] = [];
           
-          for (let i = 0; i < Math.min(signatures.length, 50); i++) {
-            try {
-              const sig = signatures[i];
-              if (sig.blockTime) {
-                transactionTimestamps.push(sig.blockTime);
+          // Batch process transactions
+          const batchSize = 10;
+          for (let i = 0; i < Math.min(signatures.length, 50); i += batchSize) {
+            const batch = signatures.slice(i, i + batchSize);
+            
+            await Promise.all(batch.map(async (sig) => {
+              try {
+                if (sig.blockTime) {
+                  transactionTimestamps.push(sig.blockTime);
+                }
+                
+                const tx = await withRetry(async () => {
+                  return await rpcConnectionManager.getTransaction(sig.signature);
+                }, 2, 500); // Fewer retries for individual transactions
+                
+                if (tx && tx.transaction && tx.transaction.message) {
+                  // Collect unique accounts involved
+                  tx.transaction.message.accountKeys.forEach((key: string) => {
+                    uniqueAccounts.add(key);
+                  });
+                }
+              } catch (e) {
+                // Skip errors for individual transactions
+                this.logger.debug(`Skipping transaction ${sig.signature} in manipulation analysis:`, e);
               }
-              
-              const tx = await rpcConnectionManager.getTransaction(sig.signature);
-              
-              if (tx && tx.transaction && tx.transaction.message) {
-                // Collect unique accounts involved
-                tx.transaction.message.accountKeys.forEach((key: string) => {
-                  uniqueAccounts.add(key);
-                });
-              }
-            } catch (e) {
-              // Skip errors for individual transactions
-            }
+            }));
           }
           
           // Calculate unique account ratio

@@ -3,6 +3,15 @@
 import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
 
+// Add this after the imports at the top of the file
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number = 15000): Promise<T> => {
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`RPC call timeout after ${timeoutMs}ms`)), timeoutMs)
+  );
+  
+  return Promise.race([promise, timeoutPromise]);
+};
+
 export class HolderVelocitySignalModule extends SignalModule {
     constructor(config: SignalModuleConfig) {
       super('holder-velocity', config);
@@ -71,14 +80,18 @@ export class HolderVelocitySignalModule extends SignalModule {
     // Extract the sophisticated holder growth analysis (full ~200 lines preserved!)
     private async getHolderGrowthData(tokenAddress: string, rpcManager: any): Promise<any> {
       try {
-        // METHOD 1: Current holder snapshot using Chainstack
-        const currentHolders = await rpcManager.getTokenAccountsByOwner(tokenAddress, undefined, 'chainstack')
-          .catch(() => []);
+        // METHOD 1: Current holder snapshot using Chainstack (WRAPPED WITH TIMEOUT)
+        const currentHolders = await withTimeout(
+          rpcManager.getTokenAccountsByOwner(tokenAddress, undefined, 'chainstack'),
+          15000
+        ).catch(() => []);
         const currentHolderCount = currentHolders.length;
         
-        // METHOD 2: Historical comparison using transaction signatures
-        const signatures = await rpcManager.getSignaturesForAddress(tokenAddress, 1000, 'chainstack')
-          .catch(() => []);
+        // METHOD 2: Historical comparison using transaction signatures (WRAPPED WITH TIMEOUT)
+        const signatures = await withTimeout(
+          rpcManager.getSignaturesForAddress(tokenAddress, 1000, 'chainstack'),
+          15000
+        ).catch(() => []);
         
         if (signatures.length === 0) {
           return { growthRate: 0, uniqueWalletRatio: 0, concentrationRisk: 1 };

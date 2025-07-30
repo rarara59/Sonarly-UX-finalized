@@ -1,6 +1,6 @@
 // src/services/file-parser.ts
-import fs from 'fs';
-import path from 'path';
+import * as fs from 'fs';
+import * as path from 'path';
 import XLSX from 'xlsx';
 import { logger } from '../utils/logger';
 

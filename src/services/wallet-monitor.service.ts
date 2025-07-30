@@ -84,7 +84,7 @@ export class WalletMonitorService {
     this.connection = new Connection(
       process.env.HELIUS_API_KEY
         ? `https://rpc.helius.xyz/?api-key=${process.env.HELIUS_API_KEY}`
-        : process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com'
+        : process.env.SOLANA_RPC_ENDPOINT || 'https://mainnet.helius-rpc.com'
     );
 
     this.alertService = new AlertService();

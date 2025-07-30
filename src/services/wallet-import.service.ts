@@ -1,5 +1,5 @@
 // src/services/wallet-import.service.ts
-import path from 'path';
+import * as path from 'path';
 import { ExternalWallet, WalletPerformanceHistory } from '../models';
 import { logger } from '../utils/logger';
 import { walletMetrics } from './wallet-metrics';

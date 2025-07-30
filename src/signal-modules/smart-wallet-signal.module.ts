@@ -1,9 +1,11 @@
 // src/signal-modules/smart-wallet-signal.module.ts
+// EXACT FIX: Replace await connectToDatabase() with mongoose connection check
 
 import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
-import SmartWallet from '../models/smartWallet'; // ← FIXED: Default import for the model
-import { connectToDatabase } from '../config/database'; 
+import SmartWallet from '../models/smartWallet';
+import mongoose from 'mongoose'; // ← ADD: Import mongoose for connection check
+// REMOVE: import { connectToDatabase } from '../config/database'; 
 import { PublicKey } from '@solana/web3.js';
 
 export class SmartWalletSignalModule extends SignalModule {
@@ -12,7 +14,7 @@ export class SmartWalletSignalModule extends SignalModule {
   }
 
   getRequiredTrack(): 'FAST' | 'SLOW' | 'BOTH' {
-    return 'BOTH'; // Smart wallet signals work for both tracks
+    return 'BOTH';
   }
 
   getSignalType(): keyof DetectionSignals {
@@ -23,13 +25,33 @@ export class SmartWalletSignalModule extends SignalModule {
     const startTime = performance.now();
     
     try {
-      await connectToDatabase(); // Ensure DB connection with timeout settings
-      const smartWallets = await SmartWallet.find({ isActive: true }); // ← FIXED: Use SmartWallet model
+      // ✅ REPLACE: await connectToDatabase(); 
+      // ✅ WITH: Connection state check
+      if (mongoose.connection.readyState !== 1) {
+        context.logger.warn('[SmartWallet] MongoDB not connected, skipping analysis');
+        return {
+          confidence: 0,
+          data: {
+            detected: false,
+            confidence: 0,
+            tier1Count: 0,
+            tier2Count: 0,
+            tier3Count: 0,
+            overlapCount: 0,
+            totalWeight: 0,
+            walletAddresses: []
+          },
+          processingTime: performance.now() - startTime,
+          source: 'smart-wallet-module',
+          version: this.config.version
+        };
+      }
+
+      const smartWallets = await SmartWallet.find({ isActive: true });
       const detectedWallets = [];
       let tier1Count = 0, tier2Count = 0, tier3Count = 0;
       
       for (const wallet of smartWallets) {
-        // Use the same sophisticated logic from the original method
         const hasActivity = await this.checkWalletTokenActivity(
           wallet.address, 
           context.tokenAddress, 
@@ -45,7 +67,6 @@ export class SmartWalletSignalModule extends SignalModule {
         }
       }
       
-      // Calculate tier-weighted confidence (same algorithm)
       const totalWeight = tier1Count * 5.0 + tier2Count * 3.0 + tier3Count * 1.0;
       const maxPossibleWeight = smartWallets.length * 5.0;
       const confidence = maxPossibleWeight > 0 ? (totalWeight / maxPossibleWeight) * 100 : 0;
@@ -90,31 +111,26 @@ export class SmartWalletSignalModule extends SignalModule {
     }
   }
 
-  // Extract the sophisticated wallet activity checking logic
   private async checkWalletTokenActivity(walletAddress: string, tokenAddress: string, rpcManager: any): Promise<boolean> {
-    // Copy the exact sophisticated logic from the original method
     try {
-      // Method 1: Check if wallet currently holds the token
       const tokenAccounts = await rpcManager.getTokenAccountsByOwner(
         new PublicKey(walletAddress),
-        { mint: new PublicKey(tokenAddress) }, // ← FIX: Proper filter instead of undefined
+        { mint: new PublicKey(tokenAddress) },
         'chainstack'
       );
-      const holdsToken = tokenAccounts.some((account: any) => // ← FIX #2: Added type annotation
+      const holdsToken = tokenAccounts.some((account: any) =>
         account.account?.data?.parsed?.info?.mint === tokenAddress
       );
       
       if (holdsToken) return true;
       
-      // Method 2: Check for recent transactions (last 24 hours)
       const signatures = await rpcManager.getSignaturesForAddress(walletAddress, 10);
-      const recent24h = signatures.filter((sig: any) => { // ← FIX #3: Added type annotation
+      const recent24h = signatures.filter((sig: any) => {
         const sigTime = sig.blockTime || 0;
         const hours24Ago = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
         return sigTime >= hours24Ago;
       });
       
-      // Check if any recent transactions involved this token
       for (const sig of recent24h.slice(0, 20)) {
         try {
           const tx = await rpcManager.getTransaction(sig.signature);

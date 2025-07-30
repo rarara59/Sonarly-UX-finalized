@@ -3,6 +3,15 @@
 import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
 
+// Add this after the imports at the top of the file
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number = 15000): Promise<T> => {
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`RPC call timeout after ${timeoutMs}ms`)), timeoutMs)
+  );
+  
+  return Promise.race([promise, timeoutPromise]);
+};
+
 export class LPAnalysisSignalModule extends SignalModule {
   constructor(config: SignalModuleConfig) {
     super('lp-analysis', config);
@@ -20,8 +29,8 @@ export class LPAnalysisSignalModule extends SignalModule {
     const startTime = performance.now();
     
     try {
-      // Get basic token data (preserve the sophisticated multi-method approach)
-      const tokenData = await this.getTokenFundamentals(context.tokenAddress, context.rpcManager);
+      // Get optimized token data based on age (UPDATED TO PASS CONTEXT)
+      const tokenData = await this.getTokenFundamentals(context.tokenAddress, context.rpcManager, context);
       
       let confidence = 0;
       
@@ -74,13 +83,188 @@ export class LPAnalysisSignalModule extends SignalModule {
     }
   }
 
-  // Extract the sophisticated token fundamentals logic (4 methods!)
-  private async getTokenFundamentals(tokenAddress: string, rpcManager: any): Promise<any> {
+  // OPTIMIZED: Age-based analysis routing
+  private async getTokenFundamentals(tokenAddress: string, rpcManager: any, context: SignalContext): Promise<any> {
     try {
-      // Get basic token data
+      // Get token age from context
+      const tokenAge = context.tokenAgeMinutes;
+      
+      if (tokenAge < 2) {
+        // TOO FRESH: Skip heavy analysis, minimal data only
+        return await this.getMinimalTokenAnalysis(tokenAddress, rpcManager);
+      } else if (tokenAge <= 15) {
+        // SWEET SPOT: Fast path for meme coin trading window
+        return await this.getFastTokenAnalysis(tokenAddress, rpcManager);
+      } else {
+        // ESTABLISHED: Deep analysis for older tokens
+        return await this.getDeepTokenAnalysis(tokenAddress, rpcManager);
+      }
+      
+    } catch (error) {
+      // Conservative fallback
+      return {
+        lpValueUSD: 0,
+        holderCount: 0,
+        mintDisabled: false,
+        freezeAuthority: true,
+        contractVerified: false,
+        topWalletPercent: 1.0,
+        dexCount: 1
+      };
+    }
+  }
+
+  // MINIMAL PATH: For very fresh tokens (< 2 minutes) 
+  private async getMinimalTokenAnalysis(tokenAddress: string, rpcManager: any): Promise<any> {
+    try {
+      // Only the most basic info for very fresh tokens
+      const tokenSupply = await withTimeout(rpcManager.getTokenSupply(tokenAddress), 5000).catch(() => null);
+      
+      // Conservative fallback for very fresh tokens
+      return {
+        lpValueUSD: 1000, // Conservative baseline
+        holderCount: 0,
+        mintDisabled: false,
+        freezeAuthority: true,
+        contractVerified: tokenSupply !== null,
+        topWalletPercent: 1.0, // Assume high concentration
+        dexCount: 1
+      };
+      
+    } catch (error) {
+      return {
+        lpValueUSD: 500, // Very conservative
+        holderCount: 0,
+        mintDisabled: false,
+        freezeAuthority: true,
+        contractVerified: false,
+        topWalletPercent: 1.0,
+        dexCount: 1
+      };
+    }
+  }
+
+  // FAST PATH: Optimized analysis for meme coin sweet spot (2-15 minutes)
+  private async getFastTokenAnalysis(tokenAddress: string, rpcManager: any): Promise<any> {
+    try {
+      // Only get essential data with small requests
+      const [tokenSupply, smallAccountSample] = await Promise.all([
+        withTimeout(rpcManager.getTokenSupply(tokenAddress), 10000).catch(() => null),
+        withTimeout(rpcManager.getTokenAccountsByOwner(tokenAddress, { limit: 20 }), 10000).catch(() => [])
+      ]);
+
+      const holderCount = smallAccountSample?.length || 0;
+      
+      // Quick authority check
+      let mintDisabled = false;
+      let freezeAuthority = false;
+      try {
+        const accountInfo = await withTimeout(rpcManager.getAccountInfo(tokenAddress), 5000);
+        if (accountInfo?.data) {
+          mintDisabled = !accountInfo.data.mintAuthority || 
+                        accountInfo.data.mintAuthority === '11111111111111111111111111111111';
+          freezeAuthority = accountInfo.data.freezeAuthority && 
+                           accountInfo.data.freezeAuthority !== '11111111111111111111111111111111';
+        }
+      } catch (authorityError) {
+        // Silent fail for authority check
+      }
+
+      // Simple concentration check (top 3 wallets only)
+      let topWalletPercent = 0;
+      if (smallAccountSample.length > 0 && tokenSupply?.amount) {
+        try {
+          const sortedAccounts = smallAccountSample
+            .map((acc: any) => ({
+              balance: parseFloat(acc.account?.data?.parsed?.info?.tokenAmount?.amount || 0)
+            }))
+            .sort((a: any, b: any) => b.balance - a.balance);
+
+          if (sortedAccounts.length > 0) {
+            const totalSupply = parseFloat(tokenSupply.amount);
+            const topWalletBalance = sortedAccounts[0].balance;
+            topWalletPercent = totalSupply > 0 ? topWalletBalance / totalSupply : 0;
+          }
+        } catch (concentrationError) {
+          // Silent fail
+        }
+      }
+
+      // Fast LP estimation based on basic metrics
+      let lpValueUSD = 0;
+      
+      // Only try ONE quick method for new tokens
+      try {
+        // Quick signature sample (much smaller - REDUCED FROM 500 to 20!)
+        const signatures = await withTimeout(
+          rpcManager.getSignaturesForAddress(tokenAddress, 20), // Only 20 instead of 500!
+          5000
+        );
+
+        if (signatures.length > 0) {
+          // Simple estimation based on activity
+          const recentSigs = signatures.filter((sig: any) => {
+            const sigTime = sig.blockTime || 0;
+            const minutes10Ago = Math.floor(Date.now() / 1000) - (10 * 60); // Last 10 minutes
+            return sigTime >= minutes10Ago;
+          });
+
+          if (recentSigs.length > 0) {
+            // Conservative estimation for new tokens
+            lpValueUSD = Math.min(10000, recentSigs.length * 250 + holderCount * 100);
+          }
+        }
+      } catch (quickSigError) {
+        // Use fallback
+      }
+
+      // Fallback estimation for new tokens
+      if (lpValueUSD === 0) {
+        let baseValue = 2000; // Conservative for 2-15 minute tokens
+        
+        if (holderCount > 10) baseValue = 4000;
+        if (holderCount > 5) baseValue = 3000;
+        
+        if (topWalletPercent < 0.5) baseValue *= 1.2;
+        if (mintDisabled) baseValue *= 1.1;
+        
+        lpValueUSD = baseValue;
+      }
+
+      // Conservative bounds for new tokens
+      lpValueUSD = Math.min(25000, Math.max(1000, lpValueUSD));
+      
+      return {
+        lpValueUSD,
+        holderCount,
+        mintDisabled,
+        freezeAuthority,
+        contractVerified: tokenSupply !== null,
+        topWalletPercent: Math.min(1, Math.max(0, topWalletPercent)),
+        dexCount: 1
+      };
+      
+    } catch (error) {
+      // Fast fallback
+      return {
+        lpValueUSD: 2000,
+        holderCount: 0,
+        mintDisabled: false,
+        freezeAuthority: true,
+        contractVerified: false,
+        topWalletPercent: 1.0,
+        dexCount: 1
+      };
+    }
+  }
+
+  // DEEP PATH: Full sophisticated analysis for established tokens (15+ minutes)
+  private async getDeepTokenAnalysis(tokenAddress: string, rpcManager: any): Promise<any> {
+    try {
+      // Get basic token data with larger limits for established tokens
       const [tokenSupply, tokenAccounts] = await Promise.all([
-        rpcManager.getTokenSupply(tokenAddress).catch(() => null),
-        rpcManager.getTokenAccountsByOwner(tokenAddress).catch(() => [])
+        withTimeout(rpcManager.getTokenSupply(tokenAddress), 15000).catch(() => null),
+        withTimeout(rpcManager.getTokenAccountsByOwner(tokenAddress), 15000).catch(() => [])
       ]);
 
       const holderCount = tokenAccounts?.length || 0;
@@ -89,7 +273,7 @@ export class LPAnalysisSignalModule extends SignalModule {
 
       // Check authorities
       try {
-        const accountInfo = await rpcManager.getAccountInfo(tokenAddress);
+        const accountInfo = await withTimeout(rpcManager.getAccountInfo(tokenAddress), 15000);
         if (accountInfo?.data) {
           mintDisabled = !accountInfo.data.mintAuthority || 
                         accountInfo.data.mintAuthority === '11111111111111111111111111111111';
@@ -127,23 +311,26 @@ export class LPAnalysisSignalModule extends SignalModule {
         // Silent fail
       }
 
-      // LP Value: All 4 sophisticated methods preserved!
+      // LP Value: All 4 sophisticated methods preserved for established tokens!
       let lpValueUSD = 0;
 
       // METHOD 1: Helius Enhanced APIs
       try {
         const heliusApiKey = process.env.HELIUS_API_KEY;
         if (heliusApiKey) {
-          const dasResponse = await fetch(`https://devnet.helius-rpc.com/?api-key=${heliusApiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: '2.0',
-              id: 'get-asset',
-              method: 'getAsset',
-              params: { id: tokenAddress }
-            })
-          });
+          const dasResponse = await withTimeout(
+            fetch(`https://devnet.helius-rpc.com/?api-key=${heliusApiKey}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 'get-asset',
+                method: 'getAsset',
+                params: { id: tokenAddress }
+              })
+            }),
+            15000
+          );
           
           if (dasResponse.ok) {
             const dasData = await dasResponse.json();
@@ -160,8 +347,11 @@ export class LPAnalysisSignalModule extends SignalModule {
       // METHOD 2: Enhanced Transaction Analysis
       if (lpValueUSD === 0 && process.env.HELIUS_API_KEY) {
         try {
-          const txResponse = await fetch(`https://api.helius.xyz/v0/addresses/${tokenAddress}/transactions?api-key=${process.env.HELIUS_API_KEY}&limit=50`);
-          
+          const txResponse = await withTimeout(
+            fetch(`https://api.helius.xyz/v0/addresses/${tokenAddress}/transactions?api-key=${process.env.HELIUS_API_KEY}&limit=50`),
+            15000
+          );
+
           if (txResponse.ok) {
             const transactions = await txResponse.json();
             const recent24h = transactions.filter((tx: any) => {
@@ -184,12 +374,12 @@ export class LPAnalysisSignalModule extends SignalModule {
         }
       }
 
-      // METHOD 3: Chainstack high-performance analysis  
+      // METHOD 3: Chainstack high-performance analysis (REDUCED from 500 to 100 signatures)
       if (lpValueUSD === 0) {
         try {
           const [signatures, supply] = await Promise.all([
-            rpcManager.getSignaturesForAddress(tokenAddress, 500, 'chainstack'),
-            rpcManager.getTokenSupply(tokenAddress, 'chainstack')
+            withTimeout(rpcManager.getSignaturesForAddress(tokenAddress, 100, 'chainstack'), 15000), // REDUCED from 500
+            withTimeout(rpcManager.getTokenSupply(tokenAddress, 'chainstack'), 15000)
           ]);
 
           if (signatures.length > 0) {
@@ -212,18 +402,18 @@ export class LPAnalysisSignalModule extends SignalModule {
         }
       }
 
-      // METHOD 4: Direct Orca/Meteora pool scanning
+      // METHOD 4: Direct Orca/Meteora pool scanning (REDUCED scope)
       if (lpValueUSD === 0) {
         try {
           const orcaProgram = 'whirLb6rbeCMEbVPDcZhY4bgCkhSoJtvb9ahGR8hj';
           const meteoraProgram = 'LBUZKhRxPF3XUpBCjp4YzTKqLccjZhTSDM9YuVaPwxo';
           
           const [orcaPools, meteoraPools] = await Promise.all([
-            rpcManager.getProgramAccounts(orcaProgram, [], 'chainstack').catch(() => []),
-            rpcManager.getProgramAccounts(meteoraProgram, [], 'chainstack').catch(() => [])
+            withTimeout(rpcManager.getProgramAccounts(orcaProgram, [], 'chainstack'), 10000).catch(() => []), // REDUCED timeout
+            withTimeout(rpcManager.getProgramAccounts(meteoraProgram, [], 'chainstack'), 10000).catch(() => [])
           ]);
           
-          const allPools = [...orcaPools.slice(0, 25), ...meteoraPools.slice(0, 25)];
+          const allPools = [...orcaPools.slice(0, 10), ...meteoraPools.slice(0, 10)]; // REDUCED from 25 to 10
           
           for (const pool of allPools) {
             try {
@@ -250,12 +440,12 @@ export class LPAnalysisSignalModule extends SignalModule {
 
       // METHOD 5: Enhanced fallback estimation
       if (lpValueUSD === 0) {
-        let baseValue = 500;
+        let baseValue = 5000; // Higher baseline for established tokens
         
-        if (holderCount > 100) baseValue = 25000;
-        else if (holderCount > 50) baseValue = 12000;
-        else if (holderCount > 25) baseValue = 6000;
-        else if (holderCount > 10) baseValue = 2500;
+        if (holderCount > 100) baseValue = 50000;
+        else if (holderCount > 50) baseValue = 25000;
+        else if (holderCount > 25) baseValue = 12000;
+        else if (holderCount > 10) baseValue = 8000;
         
         if (topWalletPercent < 0.15) baseValue *= 1.5;
         else if (topWalletPercent < 0.3) baseValue *= 1.2;
@@ -266,8 +456,8 @@ export class LPAnalysisSignalModule extends SignalModule {
         lpValueUSD = baseValue;
       }
 
-      // Sanity bounds
-      lpValueUSD = Math.min(750000, Math.max(100, lpValueUSD));
+      // Sanity bounds for established tokens
+      lpValueUSD = Math.min(750000, Math.max(1000, lpValueUSD));
       
       return {
         lpValueUSD,
@@ -280,9 +470,9 @@ export class LPAnalysisSignalModule extends SignalModule {
       };
       
     } catch (error) {
-      // Conservative fallback
+      // Conservative fallback for established tokens
       return {
-        lpValueUSD: 0,
+        lpValueUSD: 5000,
         holderCount: 0,
         mintDisabled: false,
         freezeAuthority: true,

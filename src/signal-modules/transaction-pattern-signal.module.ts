@@ -3,6 +3,15 @@
 import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
 
+// Add this after the imports at the top of the file
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number = 15000): Promise<T> => {
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`RPC call timeout after ${timeoutMs}ms`)), timeoutMs)
+  );
+  
+  return Promise.race([promise, timeoutPromise]);
+};
+
 export class TransactionPatternSignalModule extends SignalModule {
     constructor(config: SignalModuleConfig) {
       super('transaction-pattern', config);
@@ -73,9 +82,11 @@ export class TransactionPatternSignalModule extends SignalModule {
     // Extract the sophisticated transaction pattern analysis (~300 lines preserved!)
     private async getTransactionPatternData(tokenAddress: string, rpcManager: any): Promise<any> {
       try {
-        // Get recent transaction signatures (last 3 hours for FAST track analysis)
-        const signatures = await rpcManager.getSignaturesForAddress(tokenAddress, 500, 'chainstack')
-          .catch(() => []);
+        // Get recent transaction signatures (WRAPPED WITH TIMEOUT)
+        const signatures = await withTimeout(
+          rpcManager.getSignaturesForAddress(tokenAddress, 500, 'chainstack'),
+          15000
+        ).catch(() => []);
         
         if (signatures.length === 0) {
           return { buyPressure: 0.5, uniqueBuyers: 0, avgTransactionSize: 0, botDetectionScore: 1 };
@@ -102,52 +113,61 @@ export class TransactionPatternSignalModule extends SignalModule {
           walletFrequency: new Map<string, number>()
         };
         
-        // Process transactions in parallel batches (5 at a time)
+        // Process transactions in parallel batches (5 at a time) with overall timeout
         const batchSize = 5;
-        for (let i = 0; i < Math.min(50, recentSignatures.length); i += batchSize) {
-          const batch = recentSignatures.slice(i, i + batchSize);
-          
-          const batchPromises = batch.map(async (sig: any) => {
-            try {
-              const transaction = await rpcManager.getTransaction(sig.signature);
-              if (!transaction) return null;
-              
-              return this.analyzeTransactionForPatterns(transaction, tokenAddress, sig);
-            } catch (txError) {
-              return null;
-            }
-          });
-          
-          const batchResults = await Promise.allSettled(batchPromises);
-          
-          batchResults.forEach(result => {
-            if (result.status === 'fulfilled' && result.value) {
-              const analysis = result.value;
-              
-              if (analysis.isBuy) {
-                transactionAnalysis.buyTransactions++;
-                transactionAnalysis.uniqueBuyerWallets.add(analysis.walletAddress);
-              } else if (analysis.isSell) {
-                transactionAnalysis.sellTransactions++;
-                transactionAnalysis.uniqueSellerWallets.add(analysis.walletAddress);
+        const processBatches = async () => {
+          for (let i = 0; i < Math.min(20, recentSignatures.length); i += batchSize) {
+            const batch = recentSignatures.slice(i, i + batchSize);
+            
+            const batchPromises = batch.map(async (sig: any) => {
+              try {
+                // WRAPPED getTransaction WITH TIMEOUT
+                const transaction = await withTimeout(
+                  rpcManager.getTransaction(sig.signature),
+                  10000  // Reduced from 15000 to 10000
+                );
+                if (!transaction) return null;
+                
+                return this.analyzeTransactionForPatterns(transaction, tokenAddress, sig);
+              } catch (txError) {
+                return null;
               }
-              
-              if (analysis.transactionValue > 0) {
-                transactionAnalysis.transactionSizes.push(analysis.transactionValue);
+            });
+            
+            const batchResults = await Promise.allSettled(batchPromises);
+            
+            batchResults.forEach(result => {
+              if (result.status === 'fulfilled' && result.value) {
+                const analysis = result.value;
+                
+                if (analysis.isBuy) {
+                  transactionAnalysis.buyTransactions++;
+                  transactionAnalysis.uniqueBuyerWallets.add(analysis.walletAddress);
+                } else if (analysis.isSell) {
+                  transactionAnalysis.sellTransactions++;
+                  transactionAnalysis.uniqueSellerWallets.add(analysis.walletAddress);
+                }
+                
+                if (analysis.transactionValue > 0) {
+                  transactionAnalysis.transactionSizes.push(analysis.transactionValue);
+                }
+                
+                if (analysis.blockTime > 0) {
+                  transactionAnalysis.transactionTimings.push(analysis.blockTime);
+                }
+                
+                const wallet = analysis.walletAddress;
+                transactionAnalysis.walletFrequency.set(
+                  wallet, 
+                  (transactionAnalysis.walletFrequency.get(wallet) || 0) + 1
+                );
               }
-              
-              if (analysis.blockTime > 0) {
-                transactionAnalysis.transactionTimings.push(analysis.blockTime);
-              }
-              
-              const wallet = analysis.walletAddress;
-              transactionAnalysis.walletFrequency.set(
-                wallet, 
-                (transactionAnalysis.walletFrequency.get(wallet) || 0) + 1
-              );
-            }
-          });
-        }
+            });
+          }
+        };
+
+        // Wrap the entire batch processing with timeout
+        await withTimeout(processBatches(), 8000);  // 8 second max for all batches
         
         // Calculate buy pressure (buy/sell ratio)
         const totalDirectionalTx = transactionAnalysis.buyTransactions + transactionAnalysis.sellTransactions;

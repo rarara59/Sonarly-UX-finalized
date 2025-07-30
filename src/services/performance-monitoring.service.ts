@@ -1,0 +1,633 @@
+// src/services/performance-monitoring.service.ts
+import { MongoClient, Db, Collection, OptionalId } from 'mongodb';
+import winston from 'winston';
+
+// MongoDB Schemas
+interface TradeOutcome {
+  _id?: string;
+  tokenAddress: string;
+  tokenSymbol: string;
+  detectionTimestamp: Date;
+  initialPrice: number;
+  currentPrice: number;
+  maxPrice: number;
+  minPrice: number;
+  percentGain: number;
+  status: 'active' | 'target_hit' | 'stopped_out' | 'timeout';
+  targetHitTimestamp?: Date;
+  timeToTarget?: number; // seconds
+  signalScores: {
+    [signalName: string]: number;
+  };
+  overallScore: number;
+  lpValueUSD: number;
+  quoteToken: string;
+  marketContext: {
+    solPrice: number;
+    marketCap?: number;
+    volume24h?: number;
+  };
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface SignalPerformance {
+  _id?: string;
+  signalName: string;
+  date: Date;
+  totalPredictions: number;
+  correctPredictions: number;
+  accuracy: number;
+  averageScore: number;
+  correlationWithSuccess: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface SystemMetrics {
+  _id?: string;
+  date: Date;
+  timeframe: '1h' | '24h' | '7d' | '30d';
+  
+  // Core Performance
+  totalTrades: number;
+  successfulTrades: number;
+  successRate: number;
+  averageReturn: number;
+  medianReturn: number;
+  
+  // Risk Metrics
+  maxDrawdown: number;
+  currentStreak: number;
+  maxWinStreak: number;
+  maxLossStreak: number;
+  sharpeRatio: number;
+  
+  // Timing Metrics
+  averageTimeToTarget: number;
+  averageDetectionLatency: number;
+  
+  // Volume Metrics
+  totalVolumeProcessed: number;
+  tokensEvaluated: number;
+  tokensSelected: number;
+  selectionRate: number;
+  
+  createdAt: Date;
+}
+
+// Helper types for aggregation results
+interface AggregationResult {
+  _id: null;
+  averageReturn?: number;
+  count: number;
+}
+
+interface TodayStatsResult {
+  _id: null;
+  trades: number;
+  winners: number;
+  avgReturn?: number;
+}
+
+export class PerformanceMonitoringService {
+  private db: Db;
+  private logger: winston.Logger;
+  private tradeOutcomes: Collection<TradeOutcome>;
+  private signalPerformance: Collection<SignalPerformance>;
+  private systemMetrics: Collection<SystemMetrics>;
+  
+  // Cache for real-time metrics
+  private metricsCache: Map<string, any> = new Map();
+  private cacheExpiry: number = 60000; // 1 minute
+
+  constructor(db: Db) {
+    this.db = db;
+    this.logger = this.initializeLogger();
+    this.tradeOutcomes = db.collection<TradeOutcome>('trade_outcomes');
+    this.signalPerformance = db.collection<SignalPerformance>('signal_performance');
+    this.systemMetrics = db.collection<SystemMetrics>('system_metrics');
+    
+    this.initializeIndexes();
+    this.startMetricsCalculation();
+  }
+
+  private initializeLogger(): winston.Logger {
+    return winston.createLogger({
+      level: 'info',
+      format: winston.format.json(),
+      defaultMeta: { service: 'performance-monitoring' },
+      transports: [
+        new winston.transports.File({ filename: 'performance.log' }),
+        new winston.transports.Console({
+          format: winston.format.combine(
+            winston.format.colorize(),
+            winston.format.simple()
+          )
+        })
+      ]
+    });
+  }
+
+  private async initializeIndexes(): Promise<void> {
+    try {
+      // Trade outcomes indexes
+      await this.tradeOutcomes.createIndex({ tokenAddress: 1 });
+      await this.tradeOutcomes.createIndex({ detectionTimestamp: -1 });
+      await this.tradeOutcomes.createIndex({ status: 1 });
+      await this.tradeOutcomes.createIndex({ percentGain: -1 });
+      
+      // Signal performance indexes
+      await this.signalPerformance.createIndex({ signalName: 1, date: -1 });
+      
+      // System metrics indexes
+      await this.systemMetrics.createIndex({ date: -1, timeframe: 1 });
+      
+      this.logger.info('Performance monitoring indexes created');
+    } catch (error) {
+      this.logger.error('Failed to create indexes:', error);
+    }
+  }
+
+  // === TRADE OUTCOME TRACKING ===
+
+  async recordNewTrade(tradeData: {
+    tokenAddress: string;
+    tokenSymbol: string;
+    initialPrice: number;
+    signalScores: { [signalName: string]: number };
+    overallScore: number;
+    lpValueUSD: number;
+    quoteToken: string;
+    marketContext: {
+      solPrice: number;
+      marketCap?: number;
+      volume24h?: number;
+    };
+  }): Promise<string> {
+    const trade: OptionalId<TradeOutcome> = {
+      ...tradeData,
+      detectionTimestamp: new Date(),
+      currentPrice: tradeData.initialPrice,
+      maxPrice: tradeData.initialPrice,
+      minPrice: tradeData.initialPrice,
+      percentGain: 0,
+      status: 'active',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await this.tradeOutcomes.insertOne(trade);
+    this.logger.info(`New trade recorded: ${tradeData.tokenSymbol} (${tradeData.tokenAddress})`);
+    
+    // Clear cache to force recalculation
+    this.clearMetricsCache();
+    
+    return result.insertedId.toString();
+  }
+
+  async updateTradePrice(tokenAddress: string, newPrice: number): Promise<void> {
+    const trade = await this.tradeOutcomes.findOne({ 
+      tokenAddress, 
+      status: 'active' 
+    });
+    
+    if (!trade) return;
+
+    const percentGain = ((newPrice - trade.initialPrice) / trade.initialPrice) * 100;
+    const maxPrice = Math.max(trade.maxPrice, newPrice);
+    const minPrice = Math.min(trade.minPrice, newPrice);
+    
+    let status = trade.status;
+    let targetHitTimestamp = trade.targetHitTimestamp;
+    let timeToTarget = trade.timeToTarget;
+
+    // Check if target hit (4x = 400% gain)
+    if (percentGain >= 400 && status === 'active') {
+      status = 'target_hit';
+      targetHitTimestamp = new Date();
+      timeToTarget = (targetHitTimestamp.getTime() - trade.detectionTimestamp.getTime()) / 1000;
+    }
+
+    await this.tradeOutcomes.updateOne(
+      { tokenAddress, status: 'active' },
+      {
+        $set: {
+          currentPrice: newPrice,
+          maxPrice,
+          minPrice,
+          percentGain,
+          status,
+          targetHitTimestamp,
+          timeToTarget,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    // If trade completed, clear cache
+    if (status !== 'active') {
+      this.clearMetricsCache();
+      this.logger.info(`Trade completed: ${trade.tokenSymbol} - ${percentGain.toFixed(2)}% gain`);
+    }
+  }
+
+  // === REAL-TIME METRICS CALCULATION ===
+
+  async getCurrentSuccessRate(timeframe: '1h' | '24h' | '7d' | '30d' = '24h'): Promise<number> {
+    const cacheKey = `success_rate_${timeframe}`;
+    const cached = this.getFromCache(cacheKey);
+    if (cached !== null) return cached;
+
+    const timeFilter = this.getTimeFilter(timeframe);
+    
+    const totalTrades = await this.tradeOutcomes.countDocuments({
+      detectionTimestamp: { $gte: timeFilter },
+      status: { $ne: 'active' }
+    });
+
+    const successfulTrades = await this.tradeOutcomes.countDocuments({
+      detectionTimestamp: { $gte: timeFilter },
+      status: 'target_hit'
+    });
+
+    const successRate = totalTrades > 0 ? (successfulTrades / totalTrades) * 100 : 0;
+    
+    this.setCache(cacheKey, successRate);
+    return successRate;
+  }
+
+  async getAverageReturn(timeframe: '1h' | '24h' | '7d' | '30d' = '24h'): Promise<number> {
+    const cacheKey = `avg_return_${timeframe}`;
+    const cached = this.getFromCache(cacheKey);
+    if (cached !== null) return cached;
+
+    const timeFilter = this.getTimeFilter(timeframe);
+    
+    const pipeline = [
+      {
+        $match: {
+          detectionTimestamp: { $gte: timeFilter },
+          status: { $ne: 'active' }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          averageReturn: { $avg: '$percentGain' },
+          count: { $sum: 1 }
+        }
+      }
+    ];
+
+    const result = await this.tradeOutcomes.aggregate<AggregationResult>(pipeline).toArray();
+    const avgReturn = result[0]?.averageReturn ?? 0;
+    
+    this.setCache(cacheKey, avgReturn);
+    return avgReturn;
+  }
+
+  async getSignalAccuracy(signalName: string, timeframe: '1h' | '24h' | '7d' | '30d' = '24h'): Promise<number> {
+    const cacheKey = `signal_accuracy_${signalName}_${timeframe}`;
+    const cached = this.getFromCache(cacheKey);
+    if (cached !== null) return cached;
+
+    const timeFilter = this.getTimeFilter(timeframe);
+    
+    // Get all completed trades in timeframe
+    const trades = await this.tradeOutcomes.find({
+      detectionTimestamp: { $gte: timeFilter },
+      status: { $ne: 'active' },
+      [`signalScores.${signalName}`]: { $exists: true }
+    }).toArray();
+
+    if (trades.length === 0) return 0;
+
+    // Calculate signal accuracy based on correlation with success
+    let correctPredictions = 0;
+    
+    trades.forEach(trade => {
+      const signalScore = trade.signalScores[signalName];
+      const wasSuccessful = trade.status === 'target_hit';
+      
+      // High signal score should correlate with success
+      if ((signalScore > 0.5 && wasSuccessful) || (signalScore <= 0.5 && !wasSuccessful)) {
+        correctPredictions++;
+      }
+    });
+
+    const accuracy = (correctPredictions / trades.length) * 100;
+    this.setCache(cacheKey, accuracy);
+    return accuracy;
+  }
+
+  async getLiveMetricsDashboard(): Promise<{
+    currentSuccessRate: number;
+    averageReturn: number;
+    activeTrades: number;
+    todayStats: {
+      trades: number;
+      winners: number;
+      avgReturn: number;
+    };
+    signalPerformance: Array<{
+      name: string;
+      accuracy: number;
+      correlation: number;
+    }>;
+    recentTrades: TradeOutcome[];
+  }> {
+    const [
+      currentSuccessRate,
+      averageReturn,
+      activeTrades,
+      todayTrades,
+      recentTrades
+    ] = await Promise.all([
+      this.getCurrentSuccessRate('24h'),
+      this.getAverageReturn('24h'),
+      this.tradeOutcomes.countDocuments({ status: 'active' }),
+      this.getTodayStats(),
+      this.getRecentTrades(10)
+    ]);
+
+    // Get signal performance for all signals
+    const signalNames = ['smartWallet', 'lpAnalysis', 'deepHolderAnalysis', 'transactionPattern', 
+                        'socialSignals', 'technicalPattern', 'marketContext', 'riskAssessment'];
+    
+    const signalPerformance = await Promise.all(
+      signalNames.map(async (name) => ({
+        name,
+        accuracy: await this.getSignalAccuracy(name, '24h'),
+        correlation: await this.getSignalCorrelation(name, '24h')
+      }))
+    );
+
+    return {
+      currentSuccessRate,
+      averageReturn,
+      activeTrades,
+      todayStats: todayTrades,
+      signalPerformance,
+      recentTrades
+    };
+  }
+
+  // === HELPER METHODS ===
+
+  private async getTodayStats(): Promise<{ trades: number; winners: number; avgReturn: number }> {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const pipeline = [
+      {
+        $match: {
+          detectionTimestamp: { $gte: today },
+          status: { $ne: 'active' }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          trades: { $sum: 1 },
+          winners: {
+            $sum: { $cond: [{ $eq: ['$status', 'target_hit'] }, 1, 0] }
+          },
+          avgReturn: { $avg: '$percentGain' }
+        }
+      }
+    ];
+
+    const result = await this.tradeOutcomes.aggregate<TodayStatsResult>(pipeline).toArray();
+    return result[0] ? {
+      trades: result[0].trades,
+      winners: result[0].winners,
+      avgReturn: result[0].avgReturn ?? 0
+    } : { trades: 0, winners: 0, avgReturn: 0 };
+  }
+
+  private async getRecentTrades(limit: number): Promise<TradeOutcome[]> {
+    return await this.tradeOutcomes
+      .find({})
+      .sort({ detectionTimestamp: -1 })
+      .limit(limit)
+      .toArray();
+  }
+
+  private async getSignalCorrelation(signalName: string, timeframe: string): Promise<number> {
+    // Calculate Pearson correlation between signal score and trade success
+    const timeFilter = this.getTimeFilter(timeframe);
+    
+    const trades = await this.tradeOutcomes.find({
+      detectionTimestamp: { $gte: timeFilter },
+      status: { $ne: 'active' },
+      [`signalScores.${signalName}`]: { $exists: true }
+    }).toArray();
+
+    if (trades.length < 2) return 0;
+
+    const signalScores = trades.map(t => t.signalScores[signalName]);
+    const outcomes = trades.map(t => t.status === 'target_hit' ? 1 : 0);
+
+    return this.calculateCorrelation(signalScores, outcomes);
+  }
+
+  private calculateCorrelation(x: number[], y: number[]): number {
+    const n = x.length;
+    if (n === 0) return 0;
+
+    const sumX = x.reduce((a, b) => a + b, 0);
+    const sumY = y.reduce((a, b) => a + b, 0);
+    const sumXY = x.reduce((sum, xi, i) => sum + xi * y[i], 0);
+    const sumX2 = x.reduce((sum, xi) => sum + xi * xi, 0);
+    const sumY2 = y.reduce((sum, yi) => sum + yi * yi, 0);
+
+    const numerator = n * sumXY - sumX * sumY;
+    const denominator = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
+
+    return denominator === 0 ? 0 : numerator / denominator;
+  }
+
+  private getTimeFilter(timeframe: string): Date {
+    const now = new Date();
+    switch (timeframe) {
+      case '1h': return new Date(now.getTime() - 60 * 60 * 1000);
+      case '24h': return new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      case '7d': return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      case '30d': return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      default: return new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    }
+  }
+
+  // === CACHE MANAGEMENT ===
+
+  private getFromCache(key: string): any {
+    const cached = this.metricsCache.get(key);
+    if (!cached) return null;
+    
+    if (Date.now() - cached.timestamp > this.cacheExpiry) {
+      this.metricsCache.delete(key);
+      return null;
+    }
+    
+    return cached.value;
+  }
+
+  private setCache(key: string, value: any): void {
+    this.metricsCache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+
+  private clearMetricsCache(): void {
+    this.metricsCache.clear();
+  }
+
+  // === BACKGROUND METRICS CALCULATION ===
+
+  private startMetricsCalculation(): void {
+    // Calculate and store aggregated metrics every 5 minutes
+    setInterval(async () => {
+      await this.calculateAndStoreMetrics();
+    }, 5 * 60 * 1000);
+    
+    // Calculate signal performance every hour
+    setInterval(async () => {
+      await this.calculateSignalPerformance();
+    }, 60 * 60 * 1000);
+  }
+
+  private async calculateAndStoreMetrics(): Promise<void> {
+    try {
+      const timeframes: Array<'1h' | '24h' | '7d' | '30d'> = ['1h', '24h', '7d', '30d'];
+      
+      for (const timeframe of timeframes) {
+        const metrics = await this.calculateSystemMetrics(timeframe);
+        
+        await this.systemMetrics.replaceOne(
+          { date: new Date(), timeframe },
+          { ...metrics, date: new Date(), timeframe, createdAt: new Date() } as OptionalId<SystemMetrics>,
+          { upsert: true }
+        );
+      }
+      
+      this.logger.debug('System metrics calculated and stored');
+    } catch (error) {
+      this.logger.error('Failed to calculate system metrics:', error);
+    }
+  }
+
+  private async calculateSystemMetrics(timeframe: '1h' | '24h' | '7d' | '30d'): Promise<Partial<SystemMetrics>> {
+    const timeFilter = this.getTimeFilter(timeframe);
+    
+    const [
+      totalTrades,
+      successfulTrades,
+      averageReturn,
+      allTrades
+    ] = await Promise.all([
+      this.tradeOutcomes.countDocuments({
+        detectionTimestamp: { $gte: timeFilter },
+        status: { $ne: 'active' }
+      }),
+      this.tradeOutcomes.countDocuments({
+        detectionTimestamp: { $gte: timeFilter },
+        status: 'target_hit'
+      }),
+      this.getAverageReturn(timeframe),
+      this.tradeOutcomes.find({
+        detectionTimestamp: { $gte: timeFilter }
+      }).toArray()
+    ]);
+
+    const successRate = totalTrades > 0 ? (successfulTrades / totalTrades) * 100 : 0;
+    
+    // Calculate additional metrics
+    const returns = allTrades.map(t => t.percentGain);
+    const medianReturn = this.calculateMedian(returns);
+    const averageTimeToTarget = this.calculateAverageTimeToTarget(allTrades);
+    
+    return {
+      totalTrades,
+      successfulTrades,
+      successRate,
+      averageReturn,
+      medianReturn,
+      averageTimeToTarget,
+      tokensEvaluated: allTrades.length,
+      tokensSelected: totalTrades,
+      selectionRate: allTrades.length > 0 ? (totalTrades / allTrades.length) * 100 : 0,
+      // Provide default values for required fields
+      maxDrawdown: 0,
+      currentStreak: 0,
+      maxWinStreak: 0,
+      maxLossStreak: 0,
+      sharpeRatio: 0,
+      averageDetectionLatency: 0,
+      totalVolumeProcessed: 0
+    };
+  }
+
+  private async calculateSignalPerformance(): Promise<void> {
+    const signalNames = ['smartWallet', 'lpAnalysis', 'deepHolderAnalysis', 'transactionPattern', 
+                        'socialSignals', 'technicalPattern', 'marketContext', 'riskAssessment'];
+    
+    for (const signalName of signalNames) {
+      const [accuracy, correlation] = await Promise.all([
+        this.getSignalAccuracy(signalName, '24h'),
+        this.getSignalCorrelation(signalName, '24h')
+      ]);
+
+      // Calculate additional required fields
+      const timeFilter = this.getTimeFilter('24h');
+      const trades = await this.tradeOutcomes.find({
+        detectionTimestamp: { $gte: timeFilter },
+        status: { $ne: 'active' },
+        [`signalScores.${signalName}`]: { $exists: true }
+      }).toArray();
+
+      const totalPredictions = trades.length;
+      const correctPredictions = Math.round((accuracy / 100) * totalPredictions);
+      const averageScore = trades.length > 0 ? 
+        trades.reduce((sum, trade) => sum + trade.signalScores[signalName], 0) / trades.length : 0;
+      
+      await this.signalPerformance.replaceOne(
+        { signalName, date: new Date() },
+        {
+          signalName,
+          date: new Date(),
+          totalPredictions,
+          correctPredictions,
+          accuracy,
+          averageScore,
+          correlationWithSuccess: correlation,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        } as OptionalId<SignalPerformance>,
+        { upsert: true }
+      );
+    }
+  }
+
+  private calculateMedian(numbers: number[]): number {
+    if (numbers.length === 0) return 0;
+    
+    const sorted = [...numbers].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    
+    return sorted.length % 2 === 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2
+      : sorted[middle];
+  }
+
+  private calculateAverageTimeToTarget(trades: TradeOutcome[]): number {
+    const completedTrades = trades.filter(t => t.timeToTarget);
+    if (completedTrades.length === 0) return 0;
+    
+    const totalTime = completedTrades.reduce((sum, t) => sum + (t.timeToTarget || 0), 0);
+    return totalTime / completedTrades.length;
+  }
+}
+
+export default PerformanceMonitoringService;
