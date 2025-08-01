@@ -1,7 +1,7 @@
 // src/services/apis/birdeye/birdeye-monitor.ts
 
 import axios from 'axios';
-import { config } from '../../../config';
+import { config } from '../../../legacy';
 
 export class BirdEyeMonitor {
     private readonly baseUrl = 'https://public-api.birdeye.so';

@@ -4,7 +4,7 @@
 import winston from 'winston';
 import mongoose, { Document, Schema, Model } from 'mongoose';
 import { EventEmitter } from 'events';
-import { config } from '../config';
+import { config } from '../legacy';
 
 // Define priority tier type
 type PriorityTier = 'high' | 'medium' | 'low';

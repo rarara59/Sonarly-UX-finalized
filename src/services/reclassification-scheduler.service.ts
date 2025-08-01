@@ -2,7 +2,7 @@
 
 import { ClassificationHistoryService } from './classification-history.service';
 import SmartMoneyValidatorService from './smart-money-validator.service'; // FIXED: Default import
-import { IClassificationHistory } from '../models/classificationHistory';
+import { IClassificationHistory } from '../legacy/classificationHistory';
 import logger from '../utils/logger';
 import cron from 'node-cron';
 

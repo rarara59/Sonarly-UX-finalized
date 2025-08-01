@@ -590,18 +590,41 @@ class HTTPConnectionTracker extends EventEmitter {
   trackConnection(socket, metadata = {}) {
     if (!this.options.trackingEnabled || !socket) return;
 
-    // FIXED: Prevent listener accumulation
-    socket.setMaxListeners(20);
+    // COMPREHENSIVE FIX: Check if we're already tracking this socket
+    const socketIdentifier = socket._socketId || `${socket.remoteAddress}:${socket.remotePort || socket.localPort}`;
     
-    const connectionId = `${socket.remoteAddress}:${socket.remotePort}_${Date.now()}`;
+    // Look for existing active connection with same socket
+    for (const [connId, conn] of this.connections) {
+      if (conn.socket === socket && conn.state === 'active') {
+        // Socket already tracked, just update activity
+        conn.lastActivity = Date.now();
+        this.logger.debug(`♻️ Reusing tracked socket ${socketIdentifier}`);
+        return;
+      }
+    }
+    
+    // Check if socket already has our listeners (defensive check)
+    if (socket._connectionTrackerListenersAdded) {
+      this.logger.debug(`⚠️ Socket ${socketIdentifier} already has listeners, skipping`);
+      return;
+    }
+
+    // FIXED: Set higher max listeners and mark socket
+    socket.setMaxListeners(50);
+    socket._connectionTrackerListenersAdded = true;
+    socket._socketId = socketIdentifier;
+    
+    const connectionId = `${socketIdentifier}_${Date.now()}`;
     
     const connectionInfo = {
       id: connectionId,
       socket: socket,
+      socketIdentifier: socketIdentifier,
       createdAt: Date.now(),
       lastActivity: Date.now(),
       metadata: metadata,
-      state: 'active'
+      state: 'active',
+      listenerCount: 0
     };
     
     this.connections.set(connectionId, connectionInfo);
@@ -609,26 +632,67 @@ class HTTPConnectionTracker extends EventEmitter {
     this.connectionStats.active++;
     this.connectionStats.peak = Math.max(this.connectionStats.peak, this.connectionStats.active);
     
-    // Setup socket event listeners
-    socket.on('close', () => {
+    // Create bound listener functions so we can remove them later
+    const closeHandler = () => {
       this.handleConnectionClose(connectionId);
-    });
+      this.cleanupSocketListeners(socket);
+    };
     
-    socket.on('error', (error) => {
+    const errorHandler = (error) => {
       this.handleConnectionError(connectionId, error);
-    });
+    };
     
-    socket.on('data', () => {
+    const dataHandler = () => {
       this.updateLastActivity(connectionId);
-    });
+    };
     
-    this.logger.debug(`🔗 Tracking connection ${connectionId} (${this.connectionStats.active} active)`);
+    // Store handlers on socket for cleanup
+    socket._connectionTrackerHandlers = {
+      close: closeHandler,
+      error: errorHandler,
+      data: dataHandler
+    };
+    
+    // Setup socket event listeners
+    socket.on('close', closeHandler);
+    socket.on('error', errorHandler);
+    socket.on('data', dataHandler);
+    
+    // Track listener count
+    connectionInfo.listenerCount = socket.listenerCount('close') + 
+                                  socket.listenerCount('error') + 
+                                  socket.listenerCount('data');
+    
+    this.logger.debug(`🔗 Tracking connection ${connectionId} (${this.connectionStats.active} active, ${connectionInfo.listenerCount} listeners)`);
     
     // Check if we're approaching connection limits
     if (this.connectionStats.active > this.options.maxConnections * 0.8) {
       this.logger.warn(`⚠️ High connection count: ${this.connectionStats.active}/${this.options.maxConnections}`);
       this.emit('highConnectionCount', this.connectionStats.active);
     }
+    
+    // Warn if listener count is high
+    if (connectionInfo.listenerCount > 15) {
+      this.logger.warn(`⚠️ High listener count on socket: ${connectionInfo.listenerCount} listeners`);
+    }
+  }
+  
+  cleanupSocketListeners(socket) {
+    if (!socket || !socket._connectionTrackerHandlers) return;
+    
+    const handlers = socket._connectionTrackerHandlers;
+    
+    // Remove our specific handlers
+    if (handlers.close) socket.removeListener('close', handlers.close);
+    if (handlers.error) socket.removeListener('error', handlers.error);
+    if (handlers.data) socket.removeListener('data', handlers.data);
+    
+    // Clean up our markers
+    delete socket._connectionTrackerHandlers;
+    delete socket._connectionTrackerListenersAdded;
+    delete socket._socketId;
+    
+    this.logger.debug(`🧹 Cleaned up listeners from socket`);
   }
   
   handleConnectionClose(connectionId) {
@@ -679,6 +743,8 @@ class HTTPConnectionTracker extends EventEmitter {
         if (now - connection.lastActivity > this.options.maxIdleTime) {
           try {
             if (connection.socket && !connection.socket.destroyed) {
+              // Clean up listeners before destroying
+              this.cleanupSocketListeners(connection.socket);
               connection.socket.destroy();
               this.logger.debug(`🧹 Cleaned up idle connection ${connectionId}`);
               cleanedUp++;
@@ -690,6 +756,10 @@ class HTTPConnectionTracker extends EventEmitter {
       }
       // Remove old closed/error connections
       else if (connection.closedAt && now - connection.closedAt > 60000) {
+        // Clean up listeners if socket still exists
+        if (connection.socket) {
+          this.cleanupSocketListeners(connection.socket);
+        }
         this.connections.delete(connectionId);
       }
     }
@@ -706,9 +776,13 @@ class HTTPConnectionTracker extends EventEmitter {
     let cleaned = 0;
     for (const [connectionId, connection] of this.connections) {
       try {
-        if (connection.socket && !connection.socket.destroyed) {
-          connection.socket.destroy();
-          cleaned++;
+        if (connection.socket) {
+          // Clean up listeners before destroying
+          this.cleanupSocketListeners(connection.socket);
+          if (!connection.socket.destroyed) {
+            connection.socket.destroy();
+            cleaned++;
+          }
         }
       } catch (error) {
         this.logger.warn(`⚠️ Error force cleaning connection ${connectionId}:`, error.message);

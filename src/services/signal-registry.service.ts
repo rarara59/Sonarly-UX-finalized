@@ -1,6 +1,6 @@
 // src/services/signal-registry.service.ts
 
-import { SignalModule, SignalModuleConfig } from '../interfaces/signal-module.interface';
+import { SignalModule, SignalModuleConfig } from '../signal-modules/signal-module.interface';
 
 export class SignalRegistry {
   private modules: Map<string, SignalModule> = new Map();

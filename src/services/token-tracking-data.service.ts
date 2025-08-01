@@ -3,11 +3,11 @@ import { FilterQuery, Model, UpdateQuery, ClientSession, PipelineStage } from 'm
 import axios from 'axios';
 import CircuitBreaker from 'opossum';
 import { z } from 'zod';
-import TokenTrackingData, { ITokenTrackingData } from '../models/tokenTrackingData';
+import TokenTrackingData, { ITokenTrackingData } from '../legacy/tokenTrackingData';
 import { logger } from '../utils/logger';
 import { config } from '../config/app-config';
 import { StatsD } from 'hot-shots';
-import SmartWallet from '../models/smartWallet';
+import SmartWallet from '../legacy/smartWallet';
 
 // --- Metrics client (StatsD) ---------------------------------------------
 const statsd = new StatsD({ host: config.metrics.host, port: config.metrics.port });

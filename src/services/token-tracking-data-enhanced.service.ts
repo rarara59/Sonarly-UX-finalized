@@ -5,8 +5,8 @@ import { FilterQuery, Model, UpdateQuery, ClientSession, PipelineStage } from 'm
 import axios from 'axios';
 import CircuitBreaker from 'opossum';
 import { z } from 'zod';
-import TokenTrackingData, { ITokenTrackingData } from '../models/tokenTrackingData';
-import SmartWallet from '../models/smartWallet'; // Our tier system
+import TokenTrackingData, { ITokenTrackingData } from '../legacy/tokenTrackingData';
+import SmartWallet from '../legacy/smartWallet'; // Our tier system
 import { logger } from '../utils/logger';
 import { config } from '../config/app-config';
 import { StatsD } from 'hot-shots';

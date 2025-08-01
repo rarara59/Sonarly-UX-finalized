@@ -1054,4 +1054,179 @@ async* streamOrcaWhirlpools(rpcManager, programId, limit = 100) {
     }
   }
 }
+
+  /**
+   * Enhanced RPC call with Renaissance mathematical algorithms
+   */
+  async retryRPCCall(method, params, options = {}) {
+    if (!this.isInitialized) await this.initialize();
+    
+    const endpoint = options.endpoint || 'default';
+    const startTime = Date.now();
+    
+    try {
+      // Get current endpoint health using EWMA
+      const currentHealth = this.getEndpointHealthScore(endpoint);
+      
+      // Apply TCP-style congestion control
+      const congestionState = this.renaissanceState.congestionStates.get(endpoint) || 
+        initializeCongestionControl();
+      
+      // Note: tcpCongestionControl not available, using basic congestion control
+      const rateLimitDelay = congestionState.cwnd < 1 ? 1000 : 0; // Simple rate limiting
+      // TODO: Implement tcpCongestionControl in renaissance-math.js
+      
+      if (rateLimitDelay > 0) {
+        await new Promise(resolve => setTimeout(resolve, rateLimitDelay));
+      }
+      
+      // Make RPC call through existing manager
+      const result = await this.rpcManager.call(method, params, options);
+      const responseTime = Date.now() - startTime;
+      
+      // Update Renaissance mathematical state
+      this.updateRenaissanceMetrics(endpoint, responseTime, true);
+      
+      return result;
+      
+    } catch (error) {
+      const responseTime = Date.now() - startTime;
+      
+      // Update Renaissance mathematical state for failure
+      this.updateRenaissanceMetrics(endpoint, responseTime, false);
+      
+      throw error;
+    }
+  }
+
+  /**
+ * Update Renaissance mathematical state after RPC calls
+ * MEMORY-OPTIMIZED: Bounded Maps and Arrays with automatic cleanup
+ */
+  updateRenaissanceMetrics(endpoint, responseTime, success) {
+    // ENDPOINT LIMIT ENFORCEMENT - Prevent unlimited Map growth
+    const MAX_ENDPOINTS = 10; // Should never exceed 3-5 in practice
+    
+    // Clean old endpoints if we exceed limit
+    if (this.renaissanceState.endpointKalmanStates.size >= MAX_ENDPOINTS) {
+      const oldestEndpoint = this.renaissanceState.endpointKalmanStates.keys().next().value;
+      this.renaissanceState.endpointKalmanStates.delete(oldestEndpoint);
+      this.renaissanceState.endpointHealthScores.delete(oldestEndpoint);
+      this.renaissanceState.congestionStates.delete(oldestEndpoint);
+    }
+    
+    // Update Kalman filter for response time prediction
+    const kalmanState = this.renaissanceState.endpointKalmanStates.get(endpoint) || 
+      initializeKalmanFilter(responseTime, 100);
+    
+    const updatedKalman = updateKalmanFilter(kalmanState, responseTime);
+    this.renaissanceState.endpointKalmanStates.set(endpoint, updatedKalman);
+    
+    // Update EWMA health scoring
+    const currentScore = this.renaissanceState.endpointHealthScores.get(endpoint) || 100;
+    const healthFactor = success ? 1.0 : 0.1; // Success vs failure weight
+    const responseTimeFactor = Math.exp(-responseTime / 1000); // Exponential decay for latency
+    const newHealthScore = calculateEWMA(currentScore, healthFactor * responseTimeFactor * 100, 0.3);
+    
+    this.renaissanceState.endpointHealthScores.set(endpoint, newHealthScore);
+    
+    // Update TCP congestion control state
+    const congestionState = this.renaissanceState.congestionStates.get(endpoint) || 
+      initializeCongestionControl();
+    
+    const updatedCongestion = success ? 
+      congestionControlOnAck(congestionState) : 
+      congestionControlOnLoss(congestionState, 'timeout');
+    
+    this.renaissanceState.congestionStates.set(endpoint, updatedCongestion);
+    
+    // PERFORMANCE METRICS - STRICT MEMORY BOUNDS
+    const MAX_METRICS = 500; // Reduced from 1000 for tighter memory control
+    
+    // Add new metric
+    this.renaissanceState.performanceMetrics.push({
+      timestamp: Date.now(),
+      endpoint,
+      responseTime,
+      success,
+      healthScore: newHealthScore,
+      predictedResponseTime: updatedKalman.estimate
+    });
+    
+    // AGGRESSIVE CLEANUP - Remove excess metrics immediately
+    if (this.renaissanceState.performanceMetrics.length > MAX_METRICS) {
+      // Remove oldest 50% when limit exceeded
+      const keepCount = Math.floor(MAX_METRICS * 0.5);
+      const removed = this.renaissanceState.performanceMetrics.splice(0, 
+        this.renaissanceState.performanceMetrics.length - keepCount);
+      
+      // Explicit cleanup of removed objects
+      removed.forEach(metric => {
+        Object.keys(metric).forEach(key => delete metric[key]);
+      });
+      removed.length = 0;
+    }
+    
+    // PERIODIC DEEP CLEANUP - Every 100 calls
+    if (this.renaissanceState.performanceMetrics.length % 100 === 0 && global.gc) {
+      global.gc();
+    }
+  }
+
+  /**
+   * Get enhanced endpoint health score using EWMA
+   */
+  getEndpointHealthScore(endpoint) {
+    return this.renaissanceState.endpointHealthScores.get(endpoint) || 100;
+  }
+
+  /**
+   * Apply multi-criteria decision analysis for endpoint selection
+   */
+  selectOptimalEndpoint(availableEndpoints) {
+    if (!availableEndpoints || availableEndpoints.length === 0) {
+      return null;
+    }
+    
+    if (availableEndpoints.length === 1) {
+      return availableEndpoints[0];
+    }
+    
+    // Prepare criteria matrix for MCDA
+    const criteria = availableEndpoints.map(endpoint => {
+      const healthScore = this.getEndpointHealthScore(endpoint);
+      const kalmanState = this.renaissanceState.endpointKalmanStates.get(endpoint);
+      const predictedLatency = kalmanState ? kalmanState.estimate : 1000;
+      const congestionState = this.renaissanceState.congestionStates.get(endpoint);
+      const congestionLevel = congestionState ? congestionState.windowSize : 1;
+      
+      return {
+        endpoint,
+        health: healthScore, // Higher is better
+        latency: 1000 / Math.max(predictedLatency, 1), // Inverted - higher is better
+        congestion: 100 / Math.max(congestionLevel, 1), // Inverted - higher is better
+        reliability: healthScore * 0.01 // Normalized health score
+      };
+    });
+    
+    // Apply MCDA with trading-optimized weights
+    const weights = {
+      health: 0.4, // High importance for endpoint health
+      latency: 0.3, // High importance for speed
+      congestion: 0.2, // Medium importance for load
+      reliability: 0.1 // Lower weight as it's correlated with health
+    };
+    
+    // Note: multiCriteriaDecisionAnalysis not available, using calculateWeightedScores instead
+    const scoredCriteria = calculateWeightedScores(criteria, weights, Object.keys(weights));
+    const mcdaResult = {
+      bestOption: scoredCriteria.length > 0 ? 
+        scoredCriteria.reduce((best, current) => 
+          current.weightedScore > best.weightedScore ? current : best
+        ) : null
+    };
+    // TODO: Implement multiCriteriaDecisionAnalysis in renaissance-math.js
+    
+    return mcdaResult.bestOption ? mcdaResult.bestOption.endpoint : availableEndpoints[0];
+  }
 }

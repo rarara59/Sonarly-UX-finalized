@@ -14,6 +14,9 @@ export class HeliusWebSocketClient extends EventEmitter {
   constructor(apiKey, options = {}) {
     super();
     
+    // Set max listeners to prevent warnings
+    this.setMaxListeners(50);
+    
     this.apiKey = apiKey;
     this.options = {
       endpoint: 'wss://atlas-mainnet.helius-rpc.com',
@@ -27,6 +30,9 @@ export class HeliusWebSocketClient extends EventEmitter {
     
     // Worker pool integration for message processing (Day 5 requirement)  
     this.workerPool = options.workerPool || null;
+    
+    // LP detector integration for live transaction processing
+    this.lpDetector = options.lpDetector || null;
     
     // Connection retry with circuit breaker protection
     this.connectionRetries = 0;
@@ -159,6 +165,13 @@ export class HeliusWebSocketClient extends EventEmitter {
   async connectWithRetry() {
     const wsUrl = `${this.options.endpoint}/?api-key=${this.apiKey}`;
     
+    // Clean up existing client before creating new one
+    if (this.wsClient) {
+      this.wsClient.removeAllListeners();
+      this.wsClient.close();
+      this.wsClient = null;
+    }
+    
     this.wsClient = new NativeWebSocketClient(wsUrl, {
       reconnectInterval: this.options.reconnectInterval,
       maxReconnects: this.options.maxReconnects
@@ -236,7 +249,8 @@ export class HeliusWebSocketClient extends EventEmitter {
     const dexPrograms = [
       '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium
       'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',  // Orca
-      'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo'   // Meteora
+      'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',  // Meteora
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'   // Pump.fun
     ];
 
     dexPrograms.forEach(programId => {
@@ -248,27 +262,32 @@ export class HeliusWebSocketClient extends EventEmitter {
   }
 
   subscribeToAccountChanges(programId) {
+    // Replace the entire method with this:
     const subscriptionRequest = {
       jsonrpc: '2.0',
       id: ++this.subscriptionId,
-      method: 'accountSubscribe',
+      method: 'transactionSubscribe',
       params: [
-        programId,
         {
-          encoding: 'base64',
-          commitment: 'confirmed'
+          mentions: [programId]  // Monitor transactions involving this program
+        },
+        {
+          commitment: 'confirmed',
+          encoding: 'jsonParsed',
+          transactionDetails: 'full',
+          showRewards: false
         }
       ]
     };
-
+    
     this.subscriptions.set(this.subscriptionId, {
-      type: 'accountChanges',
+      type: 'transactionChanges',  // Changed from 'accountChanges'
       programId,
       timestamp: Date.now()
     });
-
+    
     this.wsClient.send(JSON.stringify(subscriptionRequest));
-    console.log(`📊 Subscribed to account changes for ${programId}`);
+    console.log(`📊 Subscribed to transactions for ${programId}`);
   }
 
   subscribeToTokenCreation() {
@@ -352,6 +371,10 @@ export class HeliusWebSocketClient extends EventEmitter {
         this.handleLogsNotification(params);
         break;
       
+      case 'transactionNotification':
+        this.handleTransactionNotification(params);
+        break;
+      
       default:
         console.log(`📥 Unknown notification method: ${method}`);
     }
@@ -397,6 +420,45 @@ export class HeliusWebSocketClient extends EventEmitter {
   }
 
   /**
+   * Handle transaction notifications from WebSocket
+   */
+  async handleTransactionNotification(params) {
+    try {
+      const { result, subscription } = params;
+      const subscriptionInfo = this.subscriptions.get(subscription);
+      
+      if (!subscriptionInfo) {
+        console.log(`⚠️ Unknown subscription: ${subscription}`);
+        return;
+      }
+
+      console.log(`🔴 LIVE: Received transaction for ${subscriptionInfo.programId.substring(0, 8)}...`);
+      
+      // Check if LP detector is available
+      if (this.lpDetector) {
+        // Pass the transaction data to the LP detector for live processing
+        this.lpDetector.processLiveTransaction(result);
+        
+        // Track metrics
+        this.metrics.lpEventsDetected++;
+        this.metrics.lastEventTime = Date.now();
+      } else {
+        console.log(`⚠️ LP detector not available for live processing`);
+        
+        // Fallback: emit the transaction for other consumers
+        this.emit('liveTransaction', {
+          transaction: result,
+          programId: subscriptionInfo.programId,
+          timestamp: Date.now()
+        });
+      }
+
+    } catch (error) {
+      console.error('📛 Error handling transaction notification:', error);
+    }
+  }
+
+  /**
    * Parse real Solana account data for LP creation events
    */
   async parseAccountDataForLP(accountData, subscriptionInfo) {
@@ -414,6 +476,8 @@ export class HeliusWebSocketClient extends EventEmitter {
         return await this.parseRaydiumLPCreation(data, value.pubkey);
       } else if (dex === 'Orca') {
         return await this.parseOrcaLPCreation(data, value.pubkey);
+      } else if (dex === 'Pump.fun') {
+        return await this.parsePumpFunLPCreation(data, value.pubkey);
       }
     } catch (error) {
       console.warn(`Failed to parse ${dex} LP data:`, error.message);
@@ -517,6 +581,43 @@ export class HeliusWebSocketClient extends EventEmitter {
     };
   }
 
+  /**
+   * Parse Pump.fun LP creation from binary data
+   */
+  async parsePumpFunLPCreation(data, poolAddress) {
+    // Pump.fun uses a simpler structure than Raydium/Orca
+    // TODO: Need to reverse engineer the exact layout
+    // For now, we'll detect based on transaction patterns
+    
+    if (data.length < 200) return null; // Too small for pool data
+    
+    try {
+      // Basic pump.fun pool detection
+      // Pump.fun typically has smaller initial liquidity
+      const hasValidSize = data.length >= 200 && data.length <= 500;
+      
+      if (!hasValidSize) return null;
+      
+      // Extract basic token information
+      // This is a placeholder - needs proper layout constants
+      const tokenMint = data.slice(0, 32);
+      const lpMint = data.slice(32, 64);
+      
+      return {
+        tokenAddress: new PublicKey(tokenMint).toString(),
+        poolAddress: poolAddress,
+        lpMint: new PublicKey(lpMint).toString(),
+        dex: 'Pump.fun',
+        timestamp: Date.now(),
+        hasInitialBuys: true,
+        isPumpFun: true // Special flag for pump.fun pools
+      };
+    } catch (error) {
+      console.warn('Failed to parse pump.fun data:', error.message);
+      return null;
+    }
+  }
+
   parseLogsForTokenCreation(logData) {
     const { value } = logData;
     
@@ -564,7 +665,8 @@ export class HeliusWebSocketClient extends EventEmitter {
     const dexMap = {
       '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': 'Raydium',
       'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': 'Orca',
-      'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo': 'Meteora'
+      'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo': 'Meteora',
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P': 'Pump.fun'
     };
     
     return dexMap[programId] || 'Unknown';
@@ -588,6 +690,12 @@ export class HeliusWebSocketClient extends EventEmitter {
 
   async disconnect() {
     if (this.wsClient) {
+      // Remove event listeners before closing to prevent memory leaks
+      this.wsClient.removeAllListeners('open');
+      this.wsClient.removeAllListeners('message');
+      this.wsClient.removeAllListeners('error');
+      this.wsClient.removeAllListeners('close');
+      
       this.wsClient.close();
       this.wsClient = null;
     }

@@ -13,6 +13,9 @@ export class HeliusWebSocketClient extends EventEmitter {
   constructor(apiKey, rpcManager, options = {}) {
     super();
     
+    // COMPREHENSIVE FIX: Set max listeners to prevent warnings
+    this.setMaxListeners(50);
+    
     this.apiKey = apiKey;
     this.rpcManager = rpcManager;
     this.options = {
@@ -74,6 +77,14 @@ export class HeliusWebSocketClient extends EventEmitter {
   async connect() {
     const wsUrl = `${this.options.endpoint}/?api-key=${encodeURIComponent(this.apiKey)}`;
 
+    // COMPREHENSIVE FIX: Clean up existing client before creating new one
+    if (this.wsClient) {
+      console.log('🧹 Cleaning up existing WebSocket client before reconnection');
+      this.wsClient.removeAllListeners();
+      this.wsClient.close();
+      this.wsClient = null;
+    }
+
     if (this._hasSubscribed) return;  // NEW — stops duplicates
     this._hasSubscribed = true;
 
@@ -87,28 +98,43 @@ export class HeliusWebSocketClient extends EventEmitter {
       }
     });
 
-    this.wsClient.on('open', () => {
+    // COMPREHENSIVE FIX: Store handlers for cleanup
+    const openHandler = () => {
       console.log('🔗 Production Helius WebSocket connected');
       this.emit('connected');
       
       this.initializeSOLPriceTracking();
       this.subscribeToProductionEvents();
-    });
+    };
 
-    this.wsClient.on('message', (message) => {
+    const messageHandler = (message) => {
       this.handleMessage(message);
-    });
+    };
 
-    this.wsClient.on('error', (error) => {
+    const errorHandler = (error) => {
       console.error('🚨 WebSocket error:', error);
       this.emit('error', error);
-    });
+    };
 
-    this.wsClient.on('close', () => {
+    const closeHandler = () => {
       console.log('📡 WebSocket disconnected');
       this._hasSubscribed = false;  // NEW — allow reconnect to subscribe
       this.emit('disconnected');
-    });
+    };
+
+    // Store handlers for potential cleanup
+    this._wsHandlers = {
+      open: openHandler,
+      message: messageHandler,
+      error: errorHandler,
+      close: closeHandler
+    };
+
+    // Add event listeners
+    this.wsClient.on('open', openHandler);
+    this.wsClient.on('message', messageHandler);
+    this.wsClient.on('error', errorHandler);
+    this.wsClient.on('close', closeHandler);
 
     this.wsClient.connect();
   }
@@ -857,12 +883,26 @@ export class HeliusWebSocketClient extends EventEmitter {
 
   async disconnect() {
     if (this.wsClient) {
+      // COMPREHENSIVE FIX: Remove all event listeners before closing
+      this.wsClient.removeAllListeners('open');
+      this.wsClient.removeAllListeners('message');
+      this.wsClient.removeAllListeners('error');
+      this.wsClient.removeAllListeners('close');
+      
+      // Close the connection
       this.wsClient.close();
       this.wsClient = null;
     }
     
+    // Clear all internal state
     this.subscriptions.clear();
     this.priceCache.clear();
+    this._hasSubscribed = false;
+    
+    // Remove any lingering event listeners on this instance
+    this.removeAllListeners();
+    
+    // Emit final disconnected event
     this.emit('disconnected');
   }
 

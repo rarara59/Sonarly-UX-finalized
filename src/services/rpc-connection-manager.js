@@ -2211,6 +2211,7 @@ const METHOD_CATEGORIES = {
   'getProgramAccounts': MethodCategory.LP_DISCOVERY,
   'getAccountInfo': MethodCategory.ACCOUNT,
   'getTokenSupply': MethodCategory.TOKEN_INFO,
+  'getTokenLargestAccounts': MethodCategory.TOKEN_INFO,
   'getTransaction': MethodCategory.TRANSACTION,
   'getSignaturesForAddress': MethodCategory.TRANSACTION,
   'getTokenAccountsByOwner': MethodCategory.TOKEN_INFO,
@@ -2405,7 +2406,8 @@ class RPCConnectionManager extends EventEmitter {
         'getProgramAccounts',
         'getTokenAccountsByOwner',
         'getMultipleAccounts',
-        'getTokenSupply'
+        'getTokenSupply',
+        'getTokenLargestAccounts'
       ]);
       
       if (endpoint.connection && solanaMethods.has(method)) {
@@ -2505,6 +2507,11 @@ class RPCConnectionManager extends EventEmitter {
       'getTokenSupply': (params) => {
         if (!params[0] || !this.validatePublicKey(params[0])) {
           throw new Error(`Invalid mint address for getTokenSupply: ${params[0]}`);
+        }
+      },
+      'getTokenLargestAccounts': (params) => {
+        if (!params[0] || !this.validatePublicKey(params[0])) {
+          throw new Error(`Invalid mint address for getTokenLargestAccounts: ${params[0]}`);
         }
       }
     };
@@ -2828,6 +2835,11 @@ class RPCConnectionManager extends EventEmitter {
         if (!params[0] || !this.validatePublicKey(params[0])) {
           throw new Error(`Invalid mint address for getTokenSupply: ${params[0]}`);
         }
+      },
+      'getTokenLargestAccounts': (params) => {
+        if (!params[0] || !this.validatePublicKey(params[0])) {
+          throw new Error(`Invalid mint address for getTokenLargestAccounts: ${params[0]}`);
+        }
       }
     };
     
@@ -2889,6 +2901,9 @@ class RPCConnectionManager extends EventEmitter {
         
       case 'getTokenSupply':
         return await connection.getTokenSupply(new PublicKey(params[0]));
+        
+      case 'getTokenLargestAccounts':
+        return await connection.getTokenLargestAccounts(new PublicKey(params[0]), params[1]);
         
       default:
         throw new Error(`Unsupported Solana method: ${method}`);

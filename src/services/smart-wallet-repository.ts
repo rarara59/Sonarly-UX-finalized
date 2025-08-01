@@ -1,6 +1,6 @@
 // src/repositories/smart-wallet-repository.ts
-import SmartWallet from '../models/smartWallet';
-import { ISmartWallet } from '../models/smartWallet';
+import SmartWallet from '../legacy/smartWallet';
+import { ISmartWallet } from '../legacy/smartWallet';
 import { logger } from '../utils/logger';
 
 export interface SmartWalletQueryOptions {

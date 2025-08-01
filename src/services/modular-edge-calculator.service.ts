@@ -1,7 +1,7 @@
 // src/services/modular-edge-calculator.service.ts
 // COMPLETE, SELF-CONTAINED VERSION — LAZY-LOADING + ALL FIXES
 
-import { SignalContext } from "../interfaces/signal-module.interface";
+import { SignalContext } from "../signal-modules/signal-module.interface";
 import { DetectionSignals } from "../interfaces/detection-signals.interface";
 
 /* -------------------------------------------------------------------------- */

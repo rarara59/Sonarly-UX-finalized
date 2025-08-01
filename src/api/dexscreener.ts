@@ -1,5 +1,5 @@
 import axios, { AxiosResponse } from 'axios';
-import config from '../config/config';
+import config from '../legacy/config';
 
 interface DexscreenerResponse {
     pairs: any[];  // We'll define specific types as we use them

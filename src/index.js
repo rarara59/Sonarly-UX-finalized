@@ -37,9 +37,12 @@ async function startThorpSystem() {
     
     // Create and initialize system orchestrator
     console.log('🏗️  Initializing system orchestrator...');
-    // DEBUG: Creating thorpSystem...
-    thorpSystem = createThorpSystem(config.system);
-    // DEBUG: thorpSystem created successfully
+    // Include lpScanner config with system config
+    const systemConfigWithLpScanner = {
+      ...config.system,
+      lpScanner: config.lpScanner
+    };
+    thorpSystem = createThorpSystem(systemConfigWithLpScanner);
     
     // Initialize all services in dependency order
     // DEBUG: Starting thorpSystem.initialize()...

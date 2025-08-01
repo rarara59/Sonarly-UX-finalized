@@ -1,6 +1,6 @@
 // src/signal-modules/lp-analysis-signal.module.ts
 
-import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
+import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from './signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
 
 // Add this after the imports at the top of the file

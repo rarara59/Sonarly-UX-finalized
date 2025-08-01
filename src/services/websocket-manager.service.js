@@ -13,6 +13,9 @@ export class WebSocketManagerService extends EventEmitter {
   constructor(options = {}) {
     super();
     
+    // Set max listeners to prevent warnings
+    this.setMaxListeners(50);
+    
     this.options = {
       heliusApiKey: options.heliusApiKey,
       endpoint: options.endpoint || 'wss://atlas-mainnet.helius-rpc.com',
@@ -24,6 +27,7 @@ export class WebSocketManagerService extends EventEmitter {
     // Service dependencies
     this.circuitBreaker = options.circuitBreaker || null;
     this.workerPool = options.workerPool || null;
+    this.lpDetector = options.lpDetector || null;
     
     // HeliusWebSocketClient instance
     this.heliusClient = null;
@@ -58,6 +62,7 @@ export class WebSocketManagerService extends EventEmitter {
     console.log(`  - Endpoint: ${this.options.endpoint}`);
     console.log(`  - Circuit Breaker: ${this.circuitBreaker ? 'Enabled' : 'Disabled'}`);
     console.log(`  - Worker Pool: ${this.workerPool ? 'Enabled' : 'Disabled'}`);
+    console.log(`  - LP Detector: ${this.lpDetector ? 'Enabled' : 'Disabled'}`);
     
     if (!this.options.heliusApiKey) {
       throw new Error('Helius API key is required for WebSocket Manager');
@@ -69,7 +74,8 @@ export class WebSocketManagerService extends EventEmitter {
       reconnectInterval: this.options.reconnectInterval,
       maxReconnects: this.options.maxReconnects,
       circuitBreaker: this.circuitBreaker,
-      workerPool: this.workerPool
+      workerPool: this.workerPool,
+      lpDetector: this.lpDetector
     });
     
     // Setup event forwarding

@@ -4,7 +4,7 @@ import { ClassificationHistoryService } from './classification-history.service';
 import { ReclassificationSchedulerService } from './reclassification-scheduler.service';
 import { AlertSystemService } from './alert-system.service';
 import { PerformanceMonitoringService } from './performance-monitoring.service';
-import { ClassificationHistory, IClassificationHistory } from '../models/classificationHistory';
+import { ClassificationHistory, IClassificationHistory } from '../legacy/classificationHistory';
 import { MongoClient, Db } from 'mongodb';
 import logger from '../utils/logger';
 

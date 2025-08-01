@@ -116,7 +116,7 @@ export class ThorpSystemService extends EventEmitter {
                     db: parseInt(process.env.REDIS_DB) || 0
                 }
             });
-            await this.registerService('featureStore', featureStore, 4);
+            //await this.registerService('featureStore', featureStore, 4);
             console.log('[THORP] Service \'featureStore\' registered at order 4');
             
             // 6. Solana Pool Parser (application layer)
@@ -166,9 +166,10 @@ export class ThorpSystemService extends EventEmitter {
                 reconnectInterval: 3000,
                 maxReconnects: 50,
                 circuitBreaker: circuitBreaker,
-                workerPool: workerPool
+                workerPool: workerPool,
+                lpDetector: lpDetector  // Add LP detector for live transaction processing
             });
-            // await this.registerService('webSocketManager', webSocketManager, 7); // Disabled - using HTTP polling instead
+            //await this.registerService('webSocketManager', webSocketManager, 8); // Enabled for live LP detection
             
             // Connect LP detector to receive pool data from pool parser
             this.setupLPDetectorEventHandlers(poolParser, lpDetector);
@@ -181,7 +182,7 @@ export class ThorpSystemService extends EventEmitter {
                     // Apply tiered filtering
                     const filteredResult = await tieredTokenFilter.processToken(lpCandidate);
                     
-                    if (filteredResult) {
+                    if (filteredResult && filteredResult.approved) {
                         // Token passed filtering - emit for signal generation
                         console.log(`✅ Token passed Renaissance filter: ${filteredResult.renaissanceClassification.tier} (score: ${filteredResult.renaissanceClassification.overallScore.toFixed(3)})`);
                         

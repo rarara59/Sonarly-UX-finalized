@@ -1,5 +1,5 @@
 import dexscreener from './api/dexscreener';
-import config from './config/config';
+import config from './legacy/config';
 import axios, { AxiosError } from 'axios';
 
 async function testAPI(): Promise<void> {

@@ -4,7 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import * as dotenv from 'dotenv';
 
-import { connectToDatabase, isDatabaseConnected, getDatabaseConnectionStatus } from './config/database';
+import { connectToDatabase, isDatabaseConnected, getDatabaseConnectionStatus } from './legacy/database';
 import heliusWebhookHandler from './services/webhooks/helius-handler'; // ✅ Correct path
 import './scripts/token-discovery-loop'; // Side effect import to start discovery loop
 

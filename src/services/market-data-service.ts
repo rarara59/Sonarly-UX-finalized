@@ -3,7 +3,7 @@ import axios, { AxiosInstance } from 'axios';
 import winston from 'winston';
 import mongoose, { Document, Schema, Model } from 'mongoose';
 import NodeCache from 'node-cache';
-import { config } from '../config';
+import { config } from '../legacy';
 import rpcConnectionManager from './rpc-connection-manager';
 import { PublicKey } from '@solana/web3.js';
 

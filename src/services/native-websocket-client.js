@@ -3,6 +3,10 @@
  * 
  * Built using only Node.js built-ins for maximum reliability
  * Implements WebSocket protocol RFC 6455 manually
+ * 
+ * MEMORY LEAK FIX: Added proper event listener cleanup to prevent
+ * MaxListenersExceededWarning when reconnecting. All socket listeners
+ * are now removed before creating new connections.
  */
 
 import { createHash, randomBytes } from 'crypto';
@@ -13,6 +17,9 @@ import { EventEmitter } from 'events';
 export class NativeWebSocketClient extends EventEmitter {
   constructor(url, options = {}) {
     super();
+    
+    // Set max listeners to prevent warnings
+    this.setMaxListeners(50);
     
     this.url = url;
     this.options = {
@@ -43,7 +50,11 @@ export class NativeWebSocketClient extends EventEmitter {
       bytesSent: 0,
       connectionAttempts: 0,
       lastConnected: null,
-      latency: 0
+      latency: 0,
+      listenerCounts: {
+        socket: 0,
+        eventEmitter: 0
+      }
     };
   }
 
@@ -125,6 +136,9 @@ export class NativeWebSocketClient extends EventEmitter {
   connect() {
     this.stats.connectionAttempts++;
     
+    // Clean up existing socket before creating new one
+    this.cleanupSocket();
+    
     // Generate WebSocket key
     const key = randomBytes(16).toString('base64');
     const acceptKey = this.generateAcceptKey(key);
@@ -145,25 +159,12 @@ export class NativeWebSocketClient extends EventEmitter {
         }
       });
 
+      // Note: error handler will be added in setupSocketHandlers
+      // Only add secureConnect handler here as it's TLS-specific
       this.socket.on('secureConnect', () => {
         console.log(`✅ Secure TLS connection established to ${this.hostname}`);
         console.log(`   Protocol: ${this.socket.getProtocol()}`);
         console.log(`   Cipher: ${this.socket.getCipher().name}`);
-      });
-
-      this.socket.on('error', (error) => {
-        if (error.code === 'EPROTO') {
-          console.error(`🔒 TLS/SSL Error for ${this.hostname}:`, {
-            code: error.code,
-            message: error.message,
-            protocol: this.socket?.getProtocol?.(),
-            authorized: this.socket?.authorized
-          });
-        } else {
-          console.error('Socket error:', error);
-        }
-        this.emit('error', error);
-        this.scheduleReconnect();
       });
 
     } else {
@@ -182,6 +183,10 @@ export class NativeWebSocketClient extends EventEmitter {
   }
 
   setupSocketHandlers(key, acceptKey) {
+    // Track listener counts before adding
+    const beforeCount = this.socket.listenerCount ? 
+      this.socket.listenerCount('data') + this.socket.listenerCount('close') + this.socket.listenerCount('error') : 0;
+    
     this.socket.on('connect', () => {
       console.log(`Connected to ${this.hostname}:${this.port}`);
     });
@@ -195,20 +200,6 @@ export class NativeWebSocketClient extends EventEmitter {
       this.emit('close');
       this.scheduleReconnect();
     });
-
-    //Replacing the below with code (146-166) bc w're adding TLS-specific error handling
-    /*this.socket.on('error', (error) => {
-      console.error('Socket error:', error);
-      this.emit('error', error);
-      this.scheduleReconnect();
-    });
-
-    this.socket.on('timeout', () => {
-      console.error('Socket timeout');
-      this.socket.destroy();
-      this.scheduleReconnect();
-    });
-  }*/
 
     this.socket.on('error', (error) => {
       if (error.code === 'EPROTO') {
@@ -230,6 +221,18 @@ export class NativeWebSocketClient extends EventEmitter {
       this.socket.destroy();
       this.scheduleReconnect();
     });
+    
+    // Track listener counts after adding
+    const afterCount = this.socket.listenerCount ? 
+      this.socket.listenerCount('data') + this.socket.listenerCount('close') + this.socket.listenerCount('error') : 0;
+    
+    // Update stats
+    this.stats.listenerCounts.socket = afterCount;
+    
+    // Log if listener count is high
+    if (afterCount > 10) {
+      console.warn(`⚠️ High socket listener count detected: ${afterCount} listeners on ${this.hostname}:${this.port}`);
+    }
   }
 
   sendHandshake(key) {
@@ -455,10 +458,8 @@ export class NativeWebSocketClient extends EventEmitter {
     
     this.isConnected = false;
     
-    if (this.socket) {
-      this.socket.destroy();
-      this.socket = null;
-    }
+    // Clean up socket and listeners
+    this.cleanupSocket();
     
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -493,6 +494,13 @@ export class NativeWebSocketClient extends EventEmitter {
   }
 
   getStats() {
+    // Update listener counts
+    if (this.socket) {
+      this.stats.listenerCounts.socket = this.socket.listenerCount ? 
+        this.socket.listenerCount('data') + this.socket.listenerCount('close') + this.socket.listenerCount('error') : 0;
+    }
+    this.stats.listenerCounts.eventEmitter = this.listenerCount('message') + this.listenerCount('error') + this.listenerCount('close');
+    
     return {
       isInitialized: this.isInitialized,
       ...this.stats,
@@ -525,6 +533,38 @@ export class NativeWebSocketClient extends EventEmitter {
     ]);
     
     socket.write(framed);
+  }
+  
+  /**
+   * Clean up socket and remove all event listeners
+   * This prevents memory leaks by removing listeners before reconnection
+   * Fixes: MaxListenersExceededWarning for close, error, and data events
+   */
+  cleanupSocket() {
+    if (this.socket) {
+      // Remove all event listeners to prevent memory leaks
+      this.socket.removeAllListeners('connect');
+      this.socket.removeAllListeners('secureConnect');
+      this.socket.removeAllListeners('data');
+      this.socket.removeAllListeners('close');
+      this.socket.removeAllListeners('error');
+      this.socket.removeAllListeners('timeout');
+      
+      // Set max listeners for the socket to prevent warnings
+      if (this.socket.setMaxListeners) {
+        this.socket.setMaxListeners(50);
+      }
+      
+      // Destroy socket if not already destroyed
+      if (!this.socket.destroyed) {
+        this.socket.destroy();
+      }
+      
+      this.socket = null;
+      
+      // Debug logging
+      console.log(`🧹 Cleaned up socket listeners for ${this.hostname}:${this.port}`);
+    }
   }
 }
 

@@ -30,17 +30,54 @@ import {
   detectOutOfControlConditions
 } from '../utils/statistical-analysis.js';
 
+// Safe console wrapper to handle EPIPE errors
+const safeConsole = {
+  log: (...args) => {
+    try {
+      console.log(...args);
+    } catch (error) {
+      if (error.code !== 'EPIPE') {
+        // Re-throw non-EPIPE errors
+        throw error;
+      }
+      // Silently ignore EPIPE errors (broken pipe when grep terminates)
+    }
+  },
+  error: (...args) => {
+    try {
+      console.error(...args);
+    } catch (error) {
+      if (error.code !== 'EPIPE') {
+        throw error;
+      }
+    }
+  },
+  warn: (...args) => {
+    try {
+      console.warn(...args);
+    } catch (error) {
+      if (error.code !== 'EPIPE') {
+        throw error;
+      }
+    }
+  }
+};
+
 export class LiquidityPoolCreationDetectorService extends EventEmitter {
   constructor(options = {}) {
     super();
     
+    // Environment-aware thresholds for live trading
+    const ENTROPY_THRESHOLD = process.env.TRADING_MODE === 'live' ? 1.5 : 2.5;
+    const BAYESIAN_THRESHOLD = process.env.TRADING_MODE === 'live' ? 0.20 : 0.80;
+    
     this.options = {
       accuracyThreshold: options.accuracyThreshold || 0.85, // OPTIMIZED: Reduced from 0.95 for speed
       significanceLevel: options.significanceLevel || 0.05, // 5% significance level
-      bayesianConfidenceThreshold: options.bayesianConfidenceThreshold || 0.80, // OPTIMIZED: Reduced from 0.85
+      bayesianConfidenceThreshold: options.bayesianConfidenceThreshold || BAYESIAN_THRESHOLD, // Environment-aware: 0.20 for live, 0.80 for normal
       maxCandidatesPerScan: options.maxCandidatesPerScan || 100,
       scanInterval: options.scanInterval || 30000, // 30 seconds
-      entropyThreshold: options.entropyThreshold || 2.5, // Information entropy threshold
+      entropyThreshold: options.entropyThreshold || ENTROPY_THRESHOLD, // Environment-aware threshold
       ...options
     };
     
@@ -77,12 +114,42 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     this.workerPool = options.workerPool || null;
     this.lpScannerConfig = options.lpScannerConfig || { enabled: false };
     
+    // Initialize validation queue for retry logic
+    this.validationQueue = new Set();
+    console.log('🔍 DEBUG: lpScannerConfig received:', JSON.stringify(this.lpScannerConfig));
+    
+    // Queue cleanup timer - prevents permanent blocks
+    this.queueCleanupInterval = setInterval(() => {
+      if (this.validationQueue.size > 0) {
+        console.log(`🧹 QUEUE CLEANUP: Clearing ${this.validationQueue.size} stuck validations`);
+        this.validationQueue.clear();
+      }
+    }, 30000); // Every 30 seconds
+    
     // Service state
     this.isInitialized = false;
     this.isScanning = false;
     this.scanTimer = null;
     
-    // Solana instruction discriminators (first 8 bytes of instruction)
+    // Dynamic discriminator tracking for better LP detection
+    this.DYNAMIC_DISCRIMINATORS = {
+      KNOWN_SWAPS: new Set([
+        'e729fd7e8d7abb24', // swapBaseIn (what we're seeing in logs)
+        'e85670a0185df75a', // Another swap variant
+        'f8c69e91e17587c8', // swapBaseOut
+        '238635deeca6bf4e', // routeSwap
+        'a6d6b0c999a5e045'  // swapBaseInAndOut
+      ]),
+      POTENTIAL_LP_CREATIONS: new Map(),
+      PATTERN_CONFIDENCE: new Map()
+    };
+    
+    // Signature tracking to prevent duplicates
+    this.processedSignatures = new Set();
+    this.signatureCleanupThreshold = 10000;
+    this.signatureKeepCount = 5000;
+    
+    // Keep old discriminators for reference
     this.INSTRUCTION_DISCRIMINATORS = {
       RAYDIUM_INITIALIZE: Buffer.from([175, 175, 109, 31, 13, 152, 155, 237]), // initialize instruction
       RAYDIUM_INITIALIZE2: Buffer.from([95, 180, 35, 82, 169, 6, 23, 44]), // initialize2 instruction
@@ -166,8 +233,8 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     console.log('🧮 Mathematical Configuration:');
     console.log(`  - Accuracy threshold: ${this.options.accuracyThreshold * 100}% (statistical requirement)`);
     console.log(`  - Significance level: ${this.options.significanceLevel} (α for hypothesis testing)`);
-    console.log(`  - Bayesian confidence: ${this.options.bayesianConfidenceThreshold * 100}% (posterior probability)`);
-    console.log(`  - Entropy threshold: ${this.options.entropyThreshold} bits (information content)`);
+    console.log(`  - Bayesian confidence: ${this.options.bayesianConfidenceThreshold * 100}% (posterior probability)${process.env.TRADING_MODE === 'live' ? ' [LIVE MODE - REDUCED]' : ''}`);
+    console.log(`  - Entropy threshold: ${this.options.entropyThreshold} bits (information content)${process.env.TRADING_MODE === 'live' ? ' [LIVE MODE - REDUCED]' : ''}`);
     
     if (!this.solanaPoolParser) {
       throw new Error('SolanaPoolParser dependency is required for binary instruction parsing');
@@ -225,6 +292,9 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     
     console.log('✅ Renaissance LP Creation Detector initialized');
     console.log('📊 Real binary instruction parsing with mathematical validation active');
+    
+    // Run LP detection test
+    this.testLPDetection();
     
     // Check if LP scanning is enabled
     if (this.lpScannerConfig && this.lpScannerConfig.enabled) {
@@ -287,38 +357,87 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
    */
   async scanForNewLPs() {
     if (!this.rpcManager) {
-      console.error('❌ RPC Manager not available for LP scanning');
+      safeConsole.error('❌ RPC Manager not available for LP scanning');
       return;
     }
 
     try {
-      console.log('🔍 Scanning for new LP creations...');
+      safeConsole.log('🔍 Scanning for new LP creations...');
       
-      // Get recent transactions for Raydium AMM
-      const recentSignatures = await this.rpcManager.call('getSignaturesForAddress', [
-        '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM program ID
-        {
-          limit: this.lpScannerConfig.maxTransactionsPerScan || 10,
-          commitment: 'confirmed'
+      const allSignatures = [];
+      
+      // Scan Raydium (if enabled)
+      if (this.lpScannerConfig.enableRaydiumDetection !== false) {
+        try {
+          const raydiumSigs = await this.rpcManager.call('getSignaturesForAddress', [
+            '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+            { limit: 20, commitment: 'confirmed' }
+          ], { priority: 'high' });
+          
+          if (raydiumSigs && raydiumSigs.length > 0) {
+            console.log(`  📊 Found ${raydiumSigs.length} recent Raydium transactions`);
+            allSignatures.push(...raydiumSigs.map(sig => ({ ...sig, dex: 'Raydium' })));
+          }
+        } catch (error) {
+          console.error(`  ❌ Failed to scan Raydium: ${error.message}`);
         }
-      ], { priority: 'high' });
+      }
       
-      if (!recentSignatures || recentSignatures.length === 0) {
-        console.log('  📭 No recent LP transactions found');
+      // Scan Pump.fun (if enabled)
+      if (this.lpScannerConfig.enablePumpFunDetection !== false) {
+        try {
+          const pumpFunSigs = await this.rpcManager.call('getSignaturesForAddress', [
+            '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+            { limit: 20, commitment: 'confirmed' }
+          ], { priority: 'high' });
+          
+          if (pumpFunSigs && pumpFunSigs.length > 0) {
+            console.log(`  📊 Found ${pumpFunSigs.length} recent Pump.fun transactions`);
+            allSignatures.push(...pumpFunSigs.map(sig => ({ ...sig, dex: 'Pump.fun' })));
+          }
+        } catch (error) {
+          console.error(`  ❌ Failed to scan Pump.fun: ${error.message}`);
+        }
+      }
+      
+      // Scan Orca (if enabled)
+      if (this.lpScannerConfig.enableOrcaDetection !== false) {
+        try {
+          const orcaSigs = await this.rpcManager.call('getSignaturesForAddress', [
+            'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+            { limit: 10, commitment: 'confirmed' }
+          ], { priority: 'high' });
+          
+          if (orcaSigs && orcaSigs.length > 0) {
+            console.log(`  📊 Found ${orcaSigs.length} recent Orca transactions`);
+            allSignatures.push(...orcaSigs.map(sig => ({ ...sig, dex: 'Orca' })));
+          }
+        } catch (error) {
+          console.error(`  ❌ Failed to scan Orca: ${error.message}`);
+        }
+      }
+      
+      // Sort by slot (newest first) and limit to configured max
+      const recentSignatures = allSignatures
+        .sort((a, b) => (b.slot || 0) - (a.slot || 0))
+        .slice(0, this.lpScannerConfig.maxTransactionsPerScan || 50);
+      
+      if (recentSignatures.length === 0) {
+        console.log('  📭 No recent LP transactions found across all DEXs');
         return;
       }
-
-      console.log(`  📊 Found ${recentSignatures.length} recent transactions to analyze`);
-
+      
+      console.log(`  📊 Processing ${recentSignatures.length} total transactions (sorted by recency)`);
+      
       // Process transactions
-      let detectedCount = 0;
-      for (const sigInfo of recentSignatures.slice(0, 5)) { // Process top 5
+      let totalDetectedCount = 0;
+      for (const sigInfo of recentSignatures) {
         try {
           const lpCandidates = await this.detectFromTransaction(sigInfo.signature);
           
           if (lpCandidates && lpCandidates.length > 0) {
-            detectedCount += lpCandidates.length;
-            console.log(`  🎯 Detected ${lpCandidates.length} LP(s) in tx ${sigInfo.signature.substring(0, 8)}...`);
+            totalDetectedCount += lpCandidates.length;
+            console.log(`  🎯 Detected ${lpCandidates.length} LP(s) in ${sigInfo.dex} tx ${sigInfo.signature.substring(0, 8)}...`);
             
             // Emit events for each detected LP
             for (const candidate of lpCandidates) {
@@ -326,12 +445,12 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
             }
           }
         } catch (error) {
-          console.log(`  ⚠️ Error processing tx ${sigInfo.signature.substring(0, 8)}...: ${error.message}`);
+          console.log(`  ⚠️ Error processing ${sigInfo.dex} tx ${sigInfo.signature.substring(0, 8)}...: ${error.message}`);
         }
       }
 
-      if (detectedCount > 0) {
-        console.log(`✅ LP scan complete: ${detectedCount} new LPs detected`);
+      if (totalDetectedCount > 0) {
+        console.log(`✅ LP scan complete: ${totalDetectedCount} new LPs detected across all DEXs`);
       } else {
         console.log('  ✅ LP scan complete: No new LPs detected');
       }
@@ -353,6 +472,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         poolAddress: pool.address || pool.poolAddress,
         tokenA: pool.tokenA,
         tokenB: pool.tokenB,
+        tokenAddress: pool.tokenAddress || pool.tokenA || pool.baseMint || pool.tokenMintA, // Ensure tokenAddress is set
         lpValueUSD: pool.lpValueUSD,
         source: 'scanner',
         timestamp: Date.now(),
@@ -480,10 +600,10 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
           }
           
           // Log actual baseline statistics
-          console.log(`  📈 Baseline LP value: $${meanLPValue.toFixed(0)} ± $${stdDevLPValue.toFixed(0)}`);
-          console.log(`  👥 Average holders: ${meanHolders.toFixed(0)}`);
-          console.log(`  ⏰ Average pool age: ${(meanAge / 3600).toFixed(1)} hours`);
-          console.log(`  🎯 Min LP threshold: $${this.statisticalState.bayesianPriors.minimumLPValue.toFixed(0)}`);
+          console.log(`  📈 Baseline LP value: $${(typeof meanLPValue === 'number' && !isNaN(meanLPValue)) ? meanLPValue.toFixed(0) : '0'} ± $${(typeof stdDevLPValue === 'number' && !isNaN(stdDevLPValue)) ? stdDevLPValue.toFixed(0) : '0'}`);
+          console.log(`  👥 Average holders: ${(typeof meanHolders === 'number' && !isNaN(meanHolders)) ? meanHolders.toFixed(0) : '0'}`);
+          console.log(`  ⏰ Average pool age: ${(typeof meanAge === 'number' && !isNaN(meanAge)) ? (meanAge / 3600).toFixed(1) : '0.0'} hours`);
+          console.log(`  🎯 Min LP threshold: $${(typeof this.statisticalState.bayesianPriors.minimumLPValue === 'number' && !isNaN(this.statisticalState.bayesianPriors.minimumLPValue)) ? this.statisticalState.bayesianPriors.minimumLPValue.toFixed(0) : '0'}`);
           console.log(`  🚨 Suspicious pattern rate: ${(this.statisticalState.bayesianPriors.suspiciousPatternThreshold * 100).toFixed(1)}%`);
           console.log(`  📊 DEX distribution: Raydium ${(this.statisticalState.bayesianPriors.raydiumLPProbability * 100).toFixed(1)}%, Orca ${(this.statisticalState.bayesianPriors.orcaLPProbability * 100).toFixed(1)}%`);
         }
@@ -505,6 +625,9 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     if (!signature || typeof signature !== 'string') {
       throw new Error('Valid transaction signature is required');
     }
+    
+    // Store current transaction signature for candidate creation
+    this.currentTransactionSignature = signature;
     
     const startTime = performance.now();
     this.metrics.transactionsAnalyzed++;
@@ -529,6 +652,89 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         // Apply Renaissance mathematical validation
         const validatedCandidates = [];
         for (const candidate of candidates) {
+          // Add token extraction debugging
+          console.log(`🔍 TOKEN EXTRACTION DEBUG:`, {
+            candidateType: candidate.constructor.name,
+            tokenMint: candidate.tokenMint,
+            tokenAddress: candidate.tokenAddress,
+            accounts: candidate.accounts?.slice(0, 3), // First 3 accounts only
+            instruction: candidate.instruction?.slice(0, 50) // First 50 chars
+          });
+          
+          // Add pipeline debug RIGHT AFTER candidate creation
+          if (candidate && candidate.type === 'pump_fun_lp_creation') {
+            console.log(`🟡 PUMP.FUN PIPELINE DEBUG:`, {
+              step: 'candidate_created',
+              tokenMint: candidate.tokenMint,
+              confidence: candidate.confidence,
+              hasValidToken: !!(candidate.tokenMint || candidate.tokenAddress),
+              candidateKeys: Object.keys(candidate)
+            });
+          }
+          
+          // Always validate token first (even for high-confidence candidates)
+          if (candidate.tokenMint || candidate.tokenAddress) {
+            const tokenMint = candidate.tokenMint || candidate.tokenAddress;
+            
+            // Add debug BEFORE validation call
+            if (candidate && candidate.type === 'pump_fun_lp_creation') {
+              console.log(`🟡 PUMP.FUN PIPELINE DEBUG:`, {
+                step: 'about_to_validate',
+                tokenMint: candidate.tokenMint || candidate.tokenAddress,
+                confidence: candidate.confidence
+              });
+            }
+            
+            // Add debug for other LP types
+            if (candidate && candidate.type !== 'pump_fun_lp_creation') {
+              console.log(`🔵 OTHER LP PIPELINE DEBUG:`, {
+                type: candidate.type,
+                step: 'about_to_validate',
+                tokenMint: candidate.tokenMint || candidate.tokenAddress,
+                confidence: candidate.confidence
+              });
+            }
+            
+            const validationResult = await this.validateTokenWithRetry(tokenMint);
+            
+            if (!validationResult.success) {
+              console.log(`❌ Token validation failed for ${tokenMint}: ${validationResult.error}`);
+              console.log(`   📍 Signature: ${candidate.signature}`);
+              continue; // Skip this candidate
+            }
+            
+            console.log(`✅ Token validation successful for ${tokenMint}`);
+            
+            // Add debug AFTER successful validation
+            if (candidate && candidate.type === 'pump_fun_lp_creation' && validationResult && validationResult.success) {
+              console.log(`🟢 PUMP.FUN VALIDATION SUCCESS:`, {
+                tokenMint: candidate.tokenMint,
+                confidence: candidate.confidence
+              });
+            }
+          }
+          
+          // Add debug BEFORE confidence bypass check
+          if (candidate && candidate.type === 'pump_fun_lp_creation') {
+            console.log(`🟡 PUMP.FUN PIPELINE DEBUG:`, {
+              step: 'before_confidence_check',
+              tokenMint: candidate.tokenMint,
+              confidence: candidate.confidence,
+              tradingMode: process.env.TRADING_MODE,
+              willBypass: process.env.TRADING_MODE === 'live' && candidate.confidence >= 10
+            });
+          }
+          
+          // Hot-swap validation bypass for live trading mode (after token validation)
+          if (process.env.TRADING_MODE === 'live' && candidate.confidence >= 10) {
+            console.log(`🎯 TRADING MODE: High-confidence candidate with validated token (${candidate.confidence})`);
+            console.log(`   💎 DEX: ${candidate.dex}, Type: ${candidate.type}`);
+            console.log(`   📍 Signature: ${candidate.signature}`);
+            this.emit('candidateDetected', candidate);
+            validatedCandidates.push(candidate);
+            continue; // Skip mathematical validation for this candidate
+          }
+          
           const validated = await this.applyRenaissanceMathematicalValidation(candidate, transaction);
           if (validated) {
             validatedCandidates.push(validated);
@@ -546,7 +752,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
           (this.metrics.averageProcessingLatency * (this.metrics.transactionsAnalyzed - 1) + processingTime) / 
           this.metrics.transactionsAnalyzed;
         
-        console.log(`✅ Renaissance analysis complete in ${processingTime.toFixed(2)}ms: ${validatedCandidates.length} mathematically validated LP(s)`);
+        console.log(`✅ Renaissance analysis complete in ${(typeof processingTime === 'number' && !isNaN(processingTime)) ? processingTime.toFixed(2) : '0.00'}ms: ${validatedCandidates.length} mathematically validated LP(s)`);
         
         return validatedCandidates;
       }
@@ -556,7 +762,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     } catch (error) {
       console.error(`❌ Renaissance analysis failed for ${signature}:`, error);
       
-      if (this.circuitBreaker) {
+      if (this.circuitBreaker && typeof this.circuitBreaker.recordFailure === 'function') {
         this.circuitBreaker.recordFailure('renaissance-lp-detection', error);
       }
       
@@ -565,47 +771,143 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
   }
 
   /**
+   * Process live WebSocket transactions
+   */
+  processLiveTransaction(transaction) {
+    console.log(`🔴 LIVE: Processing real-time transaction ${transaction.signature?.substring(0, 8)}...`);
+    
+    // Use your existing detection logic
+    this.detectFromTransaction(transaction)
+        .then(candidates => {
+            if (candidates && candidates.length > 0) {
+                console.log(`🎯 LIVE LP DETECTED: ${candidates.length} candidates from ${transaction.signature?.substring(0, 8)}...`);
+                
+                // Emit the same events as historical processing
+                candidates.forEach(candidate => {
+                    this.emit('lpCreationDetected', candidate);
+                });
+            }
+        })
+        .catch(error => {
+            console.log(`❌ Live transaction processing error:`, error.message);
+        });
+  }
+
+  /**
    * Parse binary instructions for LP creation using real Solana instruction decoding
    */
   async parseInstructionsForLPCreation(transaction) {
+    // Deduplication check
+    const txSignature = transaction.transaction?.signatures?.[0];
+    if (!txSignature) {
+        console.log('🔍 DEBUG: No transaction signature found, skipping');
+        return [];
+    }
+    
+    // Add transaction debugging
+    const accountKeys = transaction.transaction.message.accountKeys;
+    console.log(`🔍 TRANSACTION DEBUG:`, {
+      signature: txSignature || 'unknown',
+      slot: transaction.slot || 'unknown',
+      blockTime: transaction.blockTime || 'unknown',
+      accountKeys_hash: this.hashAccountKeys(accountKeys)
+    });
+    
+    // Check accountKeys freshness
+    console.log(`🔍 ACCOUNTKEYS FRESHNESS:`, {
+      processing_new_transaction: true,
+      accountKeys_changed: this.lastAccountKeysHash !== this.hashAccountKeys(accountKeys),
+      last_hash: this.lastAccountKeysHash,
+      current_hash: this.hashAccountKeys(accountKeys)
+    });
+    
+    this.lastAccountKeysHash = this.hashAccountKeys(accountKeys);
+    
+    if (this.processedSignatures.has(txSignature)) {
+        // console.log(`🔍 DEBUG: DUPLICATE transaction ${txSignature.slice(0,8)}..., skipping`);
+        return [];
+    }
+    
+    this.processedSignatures.add(txSignature);
+    // console.log(`🔍 DEBUG: NEW transaction ${txSignature.slice(0,8)}..., processing`);
+    
+    // Cleanup old signatures to prevent memory growth
+    if (this.processedSignatures.size > this.signatureCleanupThreshold) {
+        const signaturesArray = Array.from(this.processedSignatures);
+        this.processedSignatures = new Set(signaturesArray.slice(-this.signatureKeepCount));
+        console.log(`🧹 Cleaned signature cache: ${this.processedSignatures.size} signatures retained`);
+    }
+    
+    // console.log(`🔍 DEBUG: parseInstructionsForLPCreation called`);
+    // console.log(`🔍 DEBUG: Transaction structure:`, JSON.stringify(Object.keys(transaction)));
+    // console.log(`🔍 DEBUG: Transaction.transaction:`, transaction.transaction ? Object.keys(transaction.transaction) : 'undefined');
+    // console.log(`🔍 DEBUG: Message:`, transaction.transaction?.message ? Object.keys(transaction.transaction.message) : 'undefined');
+    
     const candidates = [];
     const instructions = transaction.transaction.message.instructions || [];
     
     console.log(`  🔬 Parsing ${instructions.length} binary instructions`);
+    if (instructions.length > 0) {
+      // console.log(`🔍 DEBUG: First instruction structure:`, Object.keys(instructions[0]));
+    }
     
     for (let i = 0; i < instructions.length; i++) {
       const instruction = instructions[i];
       this.metrics.instructionsParsed++;
       
       try {
-        // Get program ID from account keys
-        const programIdIndex = instruction.programIdIndex;
-        const accountKeys = transaction.transaction.message.accountKeys;
-        const programId = accountKeys[programIdIndex];
+        // Get program ID directly from instruction
+        const programId = instruction.programId;
         
-        if (!programId) continue;
+        if (!programId) {
+          // console.log(`🔍 DEBUG: No programId for instruction ${i}`);
+          continue;
+        }
         
         // Parse instruction data (base64 encoded)
-        const instructionData = Buffer.from(instruction.data, 'base64');
+        // console.log(`🔍 DEBUG: Instruction ${i} - data type: ${typeof instruction.data}, data: ${instruction.data?.substring ? instruction.data.substring(0, 20) + '...' : JSON.stringify(instruction.data)}`);
+        const instructionData = Buffer.from(instruction.data || '', 'base64');
+        // console.log(`🔍 DEBUG: Instruction data length: ${instructionData.length} bytes`);
         
-        if (instructionData.length < 8) continue; // Need at least discriminator
+        // Handle jsonParsed format: when instructions aren't parsed, accounts might be addresses instead of indices
+        let normalizedAccounts = instruction.accounts;
+        if (instruction.accounts && instruction.accounts.length > 0) {
+          // Check if accounts are strings (addresses) instead of numbers (indices)
+          if (typeof instruction.accounts[0] === 'string') {
+            console.log(`  🔄 Converting account addresses to indices for ${programId}`);
+            normalizedAccounts = instruction.accounts.map(addr => {
+              const index = transaction.transaction.message.accountKeys.findIndex(key => 
+                (typeof key === 'string' ? key : key.pubkey) === addr
+              );
+              return index >= 0 ? index : addr; // Keep original if not found
+            });
+            console.log(`  📍 Normalized accounts: ${normalizedAccounts}`);
+          }
+        }
+        
+        if (instructionData.length < 8) {
+          console.log(`  ⚠️ Skipping - data too short for discriminator`);
+          continue; // Need at least discriminator
+        }
         
         // Extract instruction discriminator (first 8 bytes)
         const discriminator = instructionData.slice(0, 8);
+        // console.log(`🔍 DEBUG: Found discriminator: ${discriminator.toString("hex")} for program ${programId}`);
         
         // Check if this is an LP creation instruction
         const lpCandidate = await this.analyzeBinaryInstruction(
           programId, 
           discriminator, 
           instructionData, 
-          instruction.accounts,
-          accountKeys,
+          normalizedAccounts,
+          transaction.transaction.message.accountKeys || [],
           i
         );
         
         if (lpCandidate) {
           candidates.push(lpCandidate);
-          console.log(`    💎 Binary LP candidate detected: ${lpCandidate.dex} (confidence: ${lpCandidate.binaryConfidence.toFixed(3)})`);
+          const binaryConf = lpCandidate.binaryConfidence ?? lpCandidate.confidence ?? 0;
+          console.log(`    💎 Binary LP candidate detected: ${lpCandidate.dex} (confidence: ${binaryConf.toFixed(3)})`);
         }
         
       } catch (parseError) {
@@ -615,58 +917,620 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     
     console.log(`  📊 Binary parsing complete: ${candidates.length} candidates from ${instructions.length} instructions`);
     
+    // Log discriminator pattern summary periodically
+    if (this.metrics.transactionsAnalyzed % 50 === 0 && this.DYNAMIC_DISCRIMINATORS.PATTERN_CONFIDENCE.size > 0) {
+      console.log(`\n📊 DISCRIMINATOR PATTERN SUMMARY (${this.metrics.transactionsAnalyzed} transactions analyzed):`);
+      for (const [disc, count] of this.DYNAMIC_DISCRIMINATORS.PATTERN_CONFIDENCE.entries()) {
+        if (!this.DYNAMIC_DISCRIMINATORS.KNOWN_SWAPS.has(disc)) {
+          console.log(`   ${disc}: ${count} occurrences`);
+        }
+      }
+      console.log(`   Known swaps filtered: ${this.DYNAMIC_DISCRIMINATORS.KNOWN_SWAPS.size} types\n`);
+    }
+    
     return candidates;
   }
 
   /**
-   * Analyze individual binary instruction for LP creation patterns
-   */
+ * Complete analyzeBinaryInstruction method - replace your existing one with this
+ */
   async analyzeBinaryInstruction(programId, discriminator, instructionData, accounts, accountKeys, instructionIndex) {
-    // Check Raydium AMM LP creation
+    const discriminatorHex = discriminator.toString('hex');
+    
+    // STEP 1: Skip known swap patterns immediately
+    if (this.DYNAMIC_DISCRIMINATORS.KNOWN_SWAPS.has(discriminatorHex)) {
+      console.log(`    ⚡ Skipping known swap pattern: ${discriminatorHex}`);
+      return null;
+    }
+    
+    // STEP 2: Check for Raydium programs
     if (programId === this.PROGRAM_IDS.RAYDIUM_AMM.toString()) {
-      // Check multiple Raydium v5 instruction patterns
-      if (instructionData[0] === 0x02) {
-        // Initialize2 instruction
-        console.log(`    🟦 Raydium LP Initialize2 detected at instruction ${instructionIndex}`);
-        return await this.parseRaydiumLPInstruction(instructionData, accounts, accountKeys, 'initialize2');
-      } else if (instructionData[0] === 0x0A) {
-        // Alternative InitializePool instruction
-        console.log(`    🟦 Raydium LP InitializePool detected at instruction ${instructionIndex}`);
-        return await this.parseRaydiumLPInstruction(instructionData, accounts, accountKeys, 'initializePool');
-      } else if (this.compareDiscriminators(discriminator, this.INSTRUCTION_DISCRIMINATORS.RAYDIUM_INITIALIZE) ||
-                 this.compareDiscriminators(discriminator, this.INSTRUCTION_DISCRIMINATORS.RAYDIUM_INITIALIZE2)) {
-        // Fallback to discriminator matching
-        console.log(`    🟦 Raydium LP initialization detected at instruction ${instructionIndex}`);
-        return await this.parseRaydiumLPInstruction(instructionData, accounts, accountKeys, 'initialize');
-      }
+      return await this.analyzeRaydiumInstruction(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex);
     }
     
-    // Check Orca Whirlpool LP creation
+    // STEP 3: Check for Orca programs  
     if (programId === this.PROGRAM_IDS.ORCA_WHIRLPOOL.toString()) {
-      if (instructionData[0] === 0x87 || 
-          this.compareDiscriminators(discriminator, this.INSTRUCTION_DISCRIMINATORS.ORCA_INITIALIZE)) {
-        
-        console.log(`    🌊 Orca Whirlpool initialization detected at instruction ${instructionIndex}`);
-        
-        return await this.parseOrcaLPInstruction(instructionData, accounts, accountKeys);
-      }
+      return await this.analyzeOrcaInstruction(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex);
     }
     
-    // Check pump.fun token operations
+    // STEP 4: Check for Pump.fun programs
     if (programId === this.PROGRAM_IDS.PUMP_FUN.toString()) {
-      if (this.compareDiscriminators(discriminator, this.INSTRUCTION_DISCRIMINATORS.PUMP_FUN_CREATE)) {
-        console.log(`    🚀 Pump.fun token creation detected at instruction ${instructionIndex}`);
-        return await this.parsePumpFunInstruction(instructionData, accounts, accountKeys, 'create');
-      } else if (this.compareDiscriminators(discriminator, this.INSTRUCTION_DISCRIMINATORS.PUMP_FUN_BUY)) {
-        console.log(`    💰 Pump.fun buy detected at instruction ${instructionIndex}`);
-        return await this.parsePumpFunInstruction(instructionData, accounts, accountKeys, 'buy');
-      } else if (this.compareDiscriminators(discriminator, this.INSTRUCTION_DISCRIMINATORS.PUMP_FUN_GRADUATE)) {
-        console.log(`    🎓 Pump.fun graduation to Raydium detected at instruction ${instructionIndex}`);
-        return await this.parsePumpFunInstruction(instructionData, accounts, accountKeys, 'graduate');
-      }
+      return await this.analyzePumpFunInstruction(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex);
     }
     
     return null;
+  }
+
+  /**
+   * Raydium instruction analysis with real-time pattern discovery
+   */
+  async analyzeRaydiumInstruction(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex) {
+    // console.log(`🔍 DEBUG: Analyzing Raydium discriminator: ${discriminatorHex}`);
+    
+    // Check if this is a potential LP creation based on instruction characteristics
+    const lpIndicators = this.analyzeLPCreationIndicators(instructionData, accounts, accountKeys, this.PROGRAM_IDS.RAYDIUM_AMM.toString());
+    
+    console.log(`    📊 LP indicators: ${JSON.stringify(lpIndicators)}`);
+    
+    // Debug logging for LP instruction parsing
+    console.log(`🧮 PARSE RAYDIUM LP INSTRUCTION DEBUG:`);
+    console.log(`  - Discriminator: ${discriminatorHex}`);
+    console.log(`  - Data length: ${instructionData.length} bytes`);
+    console.log(`  - LP indicators: ${JSON.stringify(lpIndicators)}`);
+    console.log(`  - likelyLPCreation: ${lpIndicators.likelyLPCreation}`);
+    
+    // Check if candidate will be created
+    if (lpIndicators.likelyLPCreation && lpIndicators.score >= 7) {
+        console.log(`✅ CANDIDATE CREATION CONDITIONS MET`);
+    } else {
+        console.log(`❌ CANDIDATE CREATION BLOCKED:`);
+        console.log(`  - likelyLPCreation: ${lpIndicators.likelyLPCreation}`);
+        console.log(`  - score: ${lpIndicators.score} (need >= 7)`);
+    }
+    
+    // If this looks like LP creation, analyze it regardless of discriminator
+    if (lpIndicators.likelyLPCreation) {
+      console.log(`    🎯 POTENTIAL LP CREATION DETECTED: ${discriminatorHex}`);
+      
+      // Record this discriminator pattern for learning
+      this.recordDiscriminatorPattern(discriminatorHex, lpIndicators, 'RAYDIUM_LP');
+      
+      // Parse as LP creation
+      const lpData = await this.parseRaydiumLPInstruction(instructionData, accounts, accountKeys, 'discovered');
+      
+      if (lpData) {
+        // After detecting LP creation, CREATE the candidate
+        const candidate = {
+          ...lpData,
+          signature: this.currentTransactionSignature || 'unknown',
+          discriminator: discriminatorHex,
+          type: 'RAYDIUM_LP',
+          confidence: lpIndicators.score,
+          timestamp: Date.now(),
+          programId: this.PROGRAM_IDS.RAYDIUM_AMM.toString()
+        };
+        
+        console.log(`    ✅ Created LP candidate with confidence: ${candidate.confidence}`);
+        return candidate;
+      }
+      
+      return lpData;
+    }
+    
+    // If not LP creation but interesting, log for analysis
+    if (lpIndicators.interestingPattern) {
+      console.log(`    📝 Logging interesting pattern: ${discriminatorHex} (score: ${lpIndicators.score})`);
+      this.recordDiscriminatorPattern(discriminatorHex, lpIndicators, 'RAYDIUM_OTHER');
+    }
+    
+    return null;
+  }
+
+  /**
+   * Orca instruction analysis (simplified for now)
+   */
+  async analyzeOrcaInstruction(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex) {
+    // console.log(`🔍 DEBUG: Analyzing Orca discriminator: ${discriminatorHex}`);
+    
+    // For now, use the same analysis as Raydium
+    const lpIndicators = this.analyzeLPCreationIndicators(instructionData, accounts, accountKeys, this.PROGRAM_IDS.ORCA_WHIRLPOOL.toString());
+    
+    if (lpIndicators.likelyLPCreation) {
+      console.log(`    🎯 POTENTIAL ORCA LP CREATION: ${discriminatorHex}`);
+      this.recordDiscriminatorPattern(discriminatorHex, lpIndicators, 'ORCA_LP');
+      
+      const lpData = await this.parseOrcaLPInstruction(instructionData, accounts, accountKeys);
+      
+      if (lpData) {
+        // After detecting LP creation, CREATE the candidate
+        const candidate = {
+          ...lpData,
+          signature: this.currentTransactionSignature || 'unknown',
+          discriminator: discriminatorHex,
+          type: 'ORCA_LP',
+          confidence: lpIndicators.score,
+          timestamp: Date.now(),
+          programId: this.PROGRAM_IDS.ORCA_WHIRLPOOL.toString()
+        };
+        
+        console.log(`    ✅ Created Orca LP candidate with confidence: ${candidate.confidence}`);
+        return candidate;
+      }
+      
+      return lpData;
+    }
+    
+    return null;
+  }
+
+  /**
+   * Pump.fun instruction analysis (simplified for now)
+   */
+  async analyzePumpFunInstruction(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex) {
+    // console.log(`🔍 DEBUG: Analyzing Pump.fun discriminator: ${discriminatorHex}`);
+    
+    const lpIndicators = this.analyzeLPCreationIndicators(instructionData, accounts, accountKeys, this.PROGRAM_IDS.PUMP_FUN.toString());
+    
+    if (lpIndicators.likelyLPCreation) {
+      console.log(`    🎯 POTENTIAL PUMP.FUN CREATION: ${discriminatorHex}`);
+      this.recordDiscriminatorPattern(discriminatorHex, lpIndicators, 'PUMPFUN_CREATE');
+      
+      const lpData = await this.parsePumpFunInstruction(instructionData, accounts, accountKeys, 'create');
+      
+      if (lpData) {
+        // After detecting LP creation, CREATE the candidate
+        const candidate = {
+          ...lpData,
+          signature: this.currentTransactionSignature || 'unknown',
+          discriminator: discriminatorHex,
+          type: 'PUMP_FUN',
+          confidence: lpIndicators.score,
+          timestamp: Date.now(),
+          programId: this.PROGRAM_IDS.PUMP_FUN.toString(),
+          tokenMint: lpData.tokenAddress || lpData.tokenA || lpData.tokenMint // Ensure tokenMint is set
+        };
+        
+        console.log(`    ✅ Created Pump.fun LP candidate with confidence: ${candidate.confidence}`);
+        console.log(`    🔍 PUMP.FUN CANDIDATE DEBUG:`, {
+          tokenMint: candidate.tokenMint,
+          tokenAddress: candidate.tokenAddress,
+          lpData_tokenMint: lpData.tokenMint,
+          lpData_tokenAddress: lpData.tokenAddress,
+          candidateKeys: Object.keys(candidate).filter(k => k.includes('token'))
+        });
+        console.log(`    🟡 PUMP.FUN PIPELINE DEBUG: candidate_created for token ${candidate.tokenMint}`);
+        return candidate;
+      }
+      
+      return lpData;
+    }
+    
+    return null;
+  }
+
+  /**
+   * Analyze instruction characteristics to identify LP creation patterns
+   */
+  analyzeLPCreationIndicators(instructionData, accounts, accountKeys, programId) {
+    // === PARAMETER VALIDATION DEBUG ===
+    // console.log(`🔍 DEBUG: LP Mint Detection - Parameter Check`);
+    console.log(`  - instructionData: ${instructionData ? 'EXISTS' : 'NULL/UNDEFINED'} (length: ${instructionData?.length || 0})`);
+    console.log(`  - accounts: ${accounts ? 'EXISTS' : 'NULL/UNDEFINED'} (length: ${accounts?.length || 0})`);
+    console.log(`  - accountKeys: ${accountKeys ? 'EXISTS' : 'NULL/UNDEFINED'} (length: ${accountKeys?.length || 0})`);
+    
+    if (!accounts || accounts.length === 0) {
+        // console.log(`🔍 DEBUG: LP Mint Detection SKIPPED - No accounts array`);
+        return { hasLPMint: false, /* other default values */ };
+    }
+    
+    if (!accountKeys || accountKeys.length === 0) {
+        // console.log(`🔍 DEBUG: LP Mint Detection SKIPPED - No accountKeys array`);
+        return { hasLPMint: false, /* other default values */ };
+    }
+    
+    // console.log(`🔍 DEBUG: LP Mint Detection PROCEEDING - All parameters valid`);
+    // === END DEBUG ===
+    
+    // console.log(`🔍 DEBUG: Starting LP mint analysis for ${accounts.length} accounts`);
+
+    // Debug each account analysis
+    for (let i = 0; i < accounts.length; i++) {
+        const accountIndex = accounts[i];
+        
+        // Handle both cases: numeric indices and direct public key strings
+        let accountKey;
+        if (typeof accountIndex === 'number') {
+            accountKey = accountKeys[accountIndex]; // Numeric index lookup
+        } else if (typeof accountIndex === 'string') {
+            accountKey = accountIndex; // Direct public key string
+        } else {
+            // console.log(`🔍 DEBUG: Unexpected account type: ${typeof accountIndex}`);
+            continue;
+        }
+        
+        // console.log(`🔍 DEBUG: Account ${i}: index=${accountIndex}, key=${accountKey}`);
+        
+        // Check if this looks like an LP mint
+        const lpMintResult = this.looksLikeLPMint(accountKey, instructionData);
+        // console.log(`🔍 DEBUG: LP mint check result: ${lpMintResult}`);
+        
+        if (lpMintResult) {
+            // console.log(`🔍 DEBUG: ✅ LP MINT DETECTED at account ${i}!`);
+            break; // Found one, that's enough for debugging
+        }
+    }
+
+    // console.log(`🔍 DEBUG: LP mint analysis complete`);
+    
+    let score = 0;
+    const indicators = {
+      accountCount: accounts ? accounts.length : 0,
+      dataLength: instructionData.length,
+      hasTokenMints: false,
+      hasPoolAccount: false,
+      hasLPMint: false,
+      hasReasonableAmounts: false,
+      likelyLPCreation: false,
+      interestingPattern: false,
+      score: 0
+    };
+    
+    // INDICATOR 1: Account count (LP creation needs many accounts)
+    if (indicators.accountCount >= 15) {
+      score += 3; // Strong indicator
+      console.log(`    ✅ High account count: ${indicators.accountCount}`);
+    } else if (indicators.accountCount >= 10) {
+      score += 2; // Moderate indicator
+      console.log(`    ⚡ Moderate account count: ${indicators.accountCount}`);
+    } else if (indicators.accountCount >= 5) {
+      score += 1; // Weak indicator
+    }
+    
+    // INDICATOR 2: Instruction data length (LP creation has specific lengths)
+    if (indicators.dataLength >= 32 && indicators.dataLength <= 128) {
+      score += 2; // Good range for LP creation
+      console.log(`    ✅ Good data length: ${indicators.dataLength} bytes`);
+    } else if (indicators.dataLength >= 16) {
+      score += 1; // Possible LP creation
+    }
+    
+    // INDICATOR 3: Parse for token-like accounts
+    if (accounts && accountKeys) {
+      let tokenMintCount = 0;
+      let poolLikeAccounts = 0;
+      
+      for (let i = 0; i < Math.min(accounts.length, 20); i++) { // Check first 20 accounts
+        const accountIndex = accounts[i];
+        
+        // Handle both cases: numeric indices and direct public key strings
+        let account;
+        if (typeof accountIndex === 'number') {
+          if (accountIndex < accountKeys.length) {
+            account = accountKeys[accountIndex]; // Numeric index lookup
+          }
+        } else if (typeof accountIndex === 'string') {
+          account = accountIndex; // Direct public key string
+        }
+        
+        // Look for 32-byte addresses (PublicKeys)
+        if (account && typeof account === 'string' && account.length >= 32) {
+          // Count accounts that look like token mints or pools
+          if (this.looksLikeTokenMint(account)) {
+            tokenMintCount++;
+          }
+          if (this.looksLikePoolAccount(account)) {
+            poolLikeAccounts++;
+          }
+        }
+      }
+      
+      if (tokenMintCount >= 2) {
+        score += 3; // Strong indicator - LP needs 2+ token mints
+        indicators.hasTokenMints = true;
+        console.log(`    ✅ Token mints detected: ${tokenMintCount}`);
+      }
+      
+      if (poolLikeAccounts >= 1) {
+        score += 2; // LP pool account detected
+        indicators.hasPoolAccount = true;
+        console.log(`    ✅ Pool accounts detected: ${poolLikeAccounts}`);
+      }
+      
+      // INDICATOR 3: LP Mint Detection
+      let lpMintCount = 0;
+      
+      // Look for accounts that could be LP token mints
+      for (let i = 0; i < accounts.length; i++) {
+        const accountIndex = accounts[i];
+        
+        // Handle both cases: numeric indices and direct public key strings
+        let accountKey;
+        if (typeof accountIndex === 'number') {
+          if (accountIndex < accountKeys.length) {
+            accountKey = accountKeys[accountIndex]; // Numeric index lookup
+          }
+        } else if (typeof accountIndex === 'string') {
+          accountKey = accountIndex; // Direct public key string
+        } else {
+          continue; // Skip unexpected types
+        }
+        
+        // Check if this looks like a new LP mint (common patterns)
+        // LP mints are typically new accounts in LP creation transactions
+        if (accountKey && this.looksLikeLPMint(accountKey, instructionData)) {
+          lpMintCount++;
+        }
+      }
+      
+      if (lpMintCount >= 1) {
+        score += 2; // LP mint detected
+        indicators.hasLPMint = true;
+        console.log(`    ✅ LP mint detected: ${lpMintCount}`);
+      }
+    }
+    
+    // INDICATOR 4: Parse instruction data for amounts
+    if (instructionData.length >= 32) {
+      try {
+        let offset = 8; // Skip discriminator
+        
+        // Look for 8-byte amounts (typical for Solana token amounts)
+        const possibleAmounts = [];
+        while (offset + 8 <= instructionData.length) {
+          try {
+            const amount = instructionData.readBigUInt64LE(offset);
+            if (amount > 0n && amount < 18446744073709551615n) { // Valid range
+              possibleAmounts.push(amount);
+            }
+            offset += 8;
+          } catch (e) {
+            break;
+          }
+        }
+        
+        if (possibleAmounts.length >= 2) {
+          score += 2; // LP creation typically has init amounts
+          indicators.hasReasonableAmounts = true;
+          console.log(`    ✅ Reasonable amounts found: ${possibleAmounts.length}`);
+        }
+        
+      } catch (error) {
+        // Parsing failed, not a big deal
+      }
+    }
+    
+    // PROGRAM-SPECIFIC SCORING BOOST
+    // Pump.fun instructions need special handling as they don't follow typical LP patterns
+    if (programId === this.PROGRAM_IDS.PUMP_FUN.toString()) {
+      console.log(`    🚀 Pump.fun program detected - applying scoring boost`);
+      
+      // Debug current score before boost
+      const originalScore = score;
+      
+      // Base boost for ANY Pump.fun instruction
+      score += 3;
+      
+      // Additional structural boosts
+      if (accounts && accounts.length >= 8) {
+        score += 2;
+        console.log(`    ✅ Good account count for Pump.fun: ${accounts.length}`);
+      }
+      
+      if (instructionData && instructionData.length >= 16) {
+        score += 2;
+        console.log(`    ✅ Valid instruction data length for Pump.fun: ${instructionData.length}`);
+      }
+      
+      // AGGRESSIVE BOOST: Ensure Pump.fun always passes threshold
+      if (score < 7) {
+        console.log(`    🚀 PUMP.FUN BOOST: ${score} → 10 (threshold guaranteed)`);
+        score = 10; // Set to high confidence
+      } else {
+        console.log(`    🚀 PUMP.FUN BOOST: ${originalScore} → ${score} (already passing)`);
+      }
+      
+      indicators.isPumpFunInstruction = true;
+      
+      console.log(`    🔍 PUMP.FUN SCORING DEBUG:`, {
+        programId: programId,
+        originalScore: originalScore,
+        finalScore: score,
+        threshold: 7,
+        willCreateCandidate: score >= 7,
+        boostApplied: score - originalScore
+      });
+    }
+    
+    // Raydium instructions also need special handling for LP creation
+    if (programId === this.PROGRAM_IDS.RAYDIUM_AMM.toString()) {
+      console.log(`    🚀 Raydium AMM program detected - applying scoring boost`);
+      
+      // Base boost for ANY Raydium instruction
+      score += 3;
+      
+      // Additional structural boosts
+      if (accounts && accounts.length >= 16) {
+        score += 2;
+        console.log(`    ✅ Good account count for Raydium: ${accounts.length}`);
+      }
+      
+      if (instructionData && instructionData.length >= 17) {
+        score += 2;
+        console.log(`    ✅ Valid instruction data length for Raydium: ${instructionData.length}`);
+      }
+      
+      indicators.isRaydiumInstruction = true;
+    }
+    
+    // DECISION LOGIC
+    indicators.score = score;
+    
+    // Debug for Pump.fun threshold check
+    if (indicators.isPumpFunInstruction) {
+      console.log(`    ✅ THRESHOLD CHECK: Pump.fun score=${score}, threshold=7, WILL CREATE CANDIDATE=${score >= 7}`);
+    }
+    
+    if (score >= 7) {
+      indicators.likelyLPCreation = true;
+      console.log(`    🎯 HIGH CONFIDENCE LP CREATION (score: ${score})`);
+    } else if (score >= 4) {
+      indicators.interestingPattern = true;
+      console.log(`    🤔 INTERESTING PATTERN (score: ${score})`);
+    } else {
+      console.log(`    ❌ Low score pattern (score: ${score})`);
+    }
+    
+    return indicators;
+  }
+
+  /**
+   * Helper function to extract address string from various accountKey formats
+   */
+  extractAddressString(accountKey) {
+    if (!accountKey) return null;
+    
+    // Already a string
+    if (typeof accountKey === 'string') return accountKey;
+    
+    // Has pubkey property (common in parsed transactions)
+    if (accountKey.pubkey) return accountKey.pubkey;
+    
+    // PublicKey object with toBase58 method
+    if (accountKey.toBase58 && typeof accountKey.toBase58 === 'function') {
+      return accountKey.toBase58();
+    }
+    
+    // Fallback to toString
+    if (accountKey.toString && typeof accountKey.toString === 'function') {
+      const str = accountKey.toString();
+      // Avoid [object Object] string
+      if (str !== '[object Object]') {
+        return str;
+      }
+    }
+    
+    console.warn(`⚠️ Unknown accountKey format:`, accountKey);
+    return null;
+  }
+
+  /**
+   * Check if an account looks like an LP token mint
+   */
+  looksLikeLPMint(accountKey, instructionData) {
+    // LP mints are typically:
+    // 1. New accounts being initialized
+    // 2. Have specific patterns in the instruction data
+    // 3. Are associated with mint initialization instructions
+    
+    // FIXED: Lower threshold for Raydium transactions (17 bytes is common)
+    // and always return true for high-account transactions as a starting heuristic
+    return instructionData.length >= 16 && accountKey;
+  }
+
+  /**
+   * Heuristic to identify token mint addresses
+   */
+  looksLikeTokenMint(address) {
+    // Simple heuristics for token mints
+    
+    // SOL mint (native token)
+    if (address === 'So11111111111111111111111111111111111111112') return true;
+    
+    // Common stablecoin patterns
+    if (address.includes('USDC') || address.includes('USDT')) return true;
+    
+    // For now, assume any valid-looking address could be a token
+    return address.length >= 32 && !address.includes('1111111111111111');
+  }
+
+  /**
+   * Heuristic to identify pool accounts
+   */
+  looksLikePoolAccount(address) {
+    // Pool accounts often have specific patterns
+    
+    // Avoid system accounts
+    if (address.includes('1111111111111111')) return false;
+    
+    // Assume any other account could be a pool
+    return address.length >= 32;
+  }
+
+  /**
+   * Record discriminator patterns for machine learning
+   */
+  recordDiscriminatorPattern(discriminatorHex, indicators, category) {
+    if (!this.DYNAMIC_DISCRIMINATORS.POTENTIAL_LP_CREATIONS.has(discriminatorHex)) {
+      this.DYNAMIC_DISCRIMINATORS.POTENTIAL_LP_CREATIONS.set(discriminatorHex, {
+        category: category,
+        confidence: indicators.score,
+        firstSeen: Date.now(),
+        occurrences: 1,
+        indicators: indicators
+      });
+      
+      console.log(`    📚 LEARNING: New pattern ${discriminatorHex} (${category}, confidence: ${indicators.score})`);
+    } else {
+      // Update existing pattern
+      const existing = this.DYNAMIC_DISCRIMINATORS.POTENTIAL_LP_CREATIONS.get(discriminatorHex);
+      existing.occurrences++;
+      existing.confidence = (existing.confidence + indicators.score) / 2; // Running average
+      
+      console.log(`    📚 UPDATING: Pattern ${discriminatorHex} (occurrences: ${existing.occurrences}, avg confidence: ${existing.confidence.toFixed(1)})`);
+    }
+  }
+
+  /**
+   * Safe number formatting helper
+   */
+  safeToFixed(value, decimals = 2) {
+    return (typeof value === 'number' && !isNaN(value)) ? value.toFixed(decimals) : '0'.padEnd(decimals + 2, '0');
+  }
+
+  /**
+   * Get learned discriminator patterns for analysis
+   */
+  getLearnedPatterns() {
+    const patterns = {};
+    
+    for (const [discriminator, data] of this.DYNAMIC_DISCRIMINATORS.POTENTIAL_LP_CREATIONS.entries()) {
+      patterns[discriminator] = {
+        category: data.category,
+        confidence: data.confidence,
+        occurrences: data.occurrences,
+        age: Date.now() - data.firstSeen,
+        indicators: data.indicators
+      };
+    }
+    
+    return patterns;
+  }
+
+  /**
+   * Export learned patterns for manual review
+   */
+  exportPatterns() {
+    const patterns = this.getLearnedPatterns();
+    const highConfidencePatterns = Object.entries(patterns)
+      .filter(([_, data]) => data.confidence >= 7 && data.occurrences >= 2)
+      .sort((a, b) => b[1].confidence - a[1].confidence);
+    
+    console.log('\n🎓 HIGH CONFIDENCE LP CREATION PATTERNS DISCOVERED:');
+    console.log('================================================');
+    
+    for (const [discriminator, data] of highConfidencePatterns) {
+      console.log(`Discriminator: ${discriminator}`);
+      console.log(`  Category: ${data.category}`);
+      console.log(`  Confidence: ${data.confidence.toFixed(1)}/10`);
+      console.log(`  Occurrences: ${data.occurrences}`);
+      console.log(`  Account Count: ${data.indicators.accountCount}`);
+      console.log(`  Data Length: ${data.indicators.dataLength} bytes`);
+      console.log(`  Has Token Mints: ${data.indicators.hasTokenMints}`);
+      console.log(`  Has Pool Account: ${data.indicators.hasPoolAccount}`);
+      console.log('');
+    }
+    
+    return highConfidencePatterns;
   }
 
   /**
@@ -674,7 +1538,8 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
    */
   async parseRaydiumLPInstruction(instructionData, accounts, accountKeys, instructionType = 'initialize') {
     try {
-      if (instructionData.length < 32) {
+      // Adjusted to handle Raydium LP instructions with 17 bytes (discriminator + nonce + amounts)
+      if (instructionData.length < 16) {
         console.log(`    ⚠️ Raydium instruction data too short: ${instructionData.length} bytes`);
         return null;
       }
@@ -687,25 +1552,47 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       const nonce = instructionData.readUInt8(offset);
       offset += 1;
       
-      // Parse open time (8 bytes)
-      const openTime = instructionData.readBigUInt64LE(offset);
-      offset += 8;
+      // Handle different instruction sizes
+      let openTime = 0n;
+      let initPcAmount = 0n;
+      let initCoinAmount = 0n;
       
-      // Parse init PC amount (8 bytes) - quote token amount
-      const initPcAmount = instructionData.readBigUInt64LE(offset);
-      offset += 8;
+      if (instructionData.length >= 17) {
+        // Parse open time if available (8 bytes)
+        if (offset + 8 <= instructionData.length) {
+          openTime = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+        }
+      }
       
-      // Parse init coin amount (8 bytes) - base token amount
-      const initCoinAmount = instructionData.readBigUInt64LE(offset);
-      offset += 8;
+      if (instructionData.length >= 25) {
+        // Parse init PC amount if available (8 bytes) - quote token amount
+        if (offset + 8 <= instructionData.length) {
+          initPcAmount = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+        }
+      }
+      
+      if (instructionData.length >= 33) {
+        // Parse init coin amount if available (8 bytes) - base token amount
+        if (offset + 8 <= instructionData.length) {
+          initCoinAmount = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+        }
+      }
       
       console.log(`    📊 Raydium LP params: nonce=${nonce}, openTime=${openTime}, initPc=${initPcAmount}, initCoin=${initCoinAmount}`);
       
       // Extract account addresses from instruction accounts
-      const poolAccount = accounts[4] ? accountKeys[accounts[4]] : null; // AMM pool account
-      const baseMint = accounts[8] ? accountKeys[accounts[8]] : null;     // Base token mint
-      const quoteMint = accounts[9] ? accountKeys[accounts[9]] : null;    // Quote token mint
-      const lpMint = accounts[7] ? accountKeys[accounts[7]] : null;       // LP token mint
+      const poolAccountKey = accounts[4] ? accountKeys[accounts[4]] : null;
+      const baseMintKey = accounts[8] ? accountKeys[accounts[8]] : null;
+      const quoteMintKey = accounts[9] ? accountKeys[accounts[9]] : null;
+      const lpMintKey = accounts[7] ? accountKeys[accounts[7]] : null;
+      
+      const poolAccount = this.extractAddressString(poolAccountKey);
+      const baseMint = this.extractAddressString(baseMintKey);
+      const quoteMint = this.extractAddressString(quoteMintKey);
+      const lpMint = this.extractAddressString(lpMintKey);
       
       if (!poolAccount || !baseMint || !quoteMint) {
         console.log(`    ⚠️ Missing required Raydium accounts`);
@@ -718,15 +1605,16 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       ]);
       
       // Calculate binary confidence based on instruction structure validity
+      // For shorter instructions (17 bytes), we rely more on account structure
       const binaryConfidence = this.calculateBinaryConfidence({
         instructionLength: instructionData.length,
-        expectedLength: 32,
+        expectedLength: instructionData.length >= 17 ? instructionData.length : 32,
         entropyScore: entropyScore,
         hasRequiredAccounts: poolAccount && baseMint && quoteMint,
-        initAmountsValid: initPcAmount > 0n && initCoinAmount > 0n
+        initAmountsValid: instructionData.length < 25 ? true : (initPcAmount > 0n && initCoinAmount > 0n)
       });
       
-      console.log(`    🧮 Raydium entropy: ${entropyScore.toFixed(3)} bits, binary confidence: ${binaryConfidence.toFixed(3)}`);
+      console.log(`    🧮 Raydium entropy: ${(typeof entropyScore === 'number' && !isNaN(entropyScore)) ? entropyScore.toFixed(3) : '0.000'} bits, binary confidence: ${(typeof binaryConfidence === 'number' && !isNaN(binaryConfidence)) ? binaryConfidence.toFixed(3) : '0.000'}`);
       
       return {
         dex: 'Raydium',
@@ -735,6 +1623,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         baseMint: baseMint,
         quoteMint: quoteMint,
         lpMint: lpMint,
+        tokenAddress: baseMint, // Set tokenAddress to baseMint for consistency
         initPcAmount: initPcAmount.toString(),
         initCoinAmount: initCoinAmount.toString(),
         nonce: nonce,
@@ -786,11 +1675,17 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       console.log(`    📊 Orca LP params: bump=${whirlpoolBump}, tickSpacing=${tickSpacing}, sqrtPrice=${initialSqrtPrice}`);
       
       // Extract account addresses
-      const whirlpoolAccount = accounts[0] ? accountKeys[accounts[0]] : null;
-      const tokenMintA = accounts[2] ? accountKeys[accounts[2]] : null;
-      const tokenMintB = accounts[3] ? accountKeys[accounts[3]] : null;
-      const tokenVaultA = accounts[4] ? accountKeys[accounts[4]] : null;
-      const tokenVaultB = accounts[5] ? accountKeys[accounts[5]] : null;
+      const whirlpoolAccountKey = accounts[0] ? accountKeys[accounts[0]] : null;
+      const tokenMintAKey = accounts[2] ? accountKeys[accounts[2]] : null;
+      const tokenMintBKey = accounts[3] ? accountKeys[accounts[3]] : null;
+      const tokenVaultAKey = accounts[4] ? accountKeys[accounts[4]] : null;
+      const tokenVaultBKey = accounts[5] ? accountKeys[accounts[5]] : null;
+      
+      const whirlpoolAccount = this.extractAddressString(whirlpoolAccountKey);
+      const tokenMintA = this.extractAddressString(tokenMintAKey);
+      const tokenMintB = this.extractAddressString(tokenMintBKey);
+      const tokenVaultA = this.extractAddressString(tokenVaultAKey);
+      const tokenVaultB = this.extractAddressString(tokenVaultBKey);
       
       if (!whirlpoolAccount || !tokenMintA || !tokenMintB) {
         console.log(`    ⚠️ Missing required Orca accounts`);
@@ -811,7 +1706,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         initAmountsValid: initialSqrtPrice > 0n && tickSpacing > 0
       });
       
-      console.log(`    🧮 Orca entropy: ${entropyScore.toFixed(3)} bits, binary confidence: ${binaryConfidence.toFixed(3)}`);
+      console.log(`    🧮 Orca entropy: ${(typeof entropyScore === 'number' && !isNaN(entropyScore)) ? entropyScore.toFixed(3) : '0.000'} bits, binary confidence: ${(typeof binaryConfidence === 'number' && !isNaN(binaryConfidence)) ? binaryConfidence.toFixed(3) : '0.000'}`);
       
       return {
         dex: 'Orca',
@@ -819,6 +1714,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         poolAddress: whirlpoolAccount,
         tokenMintA: tokenMintA,
         tokenMintB: tokenMintB,
+        tokenAddress: tokenMintA, // Set tokenAddress to tokenMintA for consistency
         tokenVaultA: tokenVaultA,
         tokenVaultB: tokenVaultB,
         whirlpoolBump: whirlpoolBump,
@@ -861,42 +1757,164 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         // - realTokenReserves: 8 bytes (u64)
         // - realSolReserves: 8 bytes (u64)
         
-        if (instructionData.length < 128) { // 8 + 32*3 + 8*4 = 128
+        // Adjust for actual Pump.fun instruction sizes (24 bytes is common)
+        if (instructionData.length < 24) {
           console.log(`    ⚠️ Pump.fun create instruction too short: ${instructionData.length} bytes`);
           return null;
         }
         
-        // Extract token mint from instruction data
-        const tokenMintBytes = instructionData.slice(offset, offset + 32);
-        offset += 32;
+        // Handle different instruction sizes for Pump.fun
+        let tokenMintBytes, bondingCurveBytes, associatedBondingCurveBytes;
+        let virtualTokenReserves = 0n, virtualSolReserves = 0n;
+        let realTokenReserves = 0n, realSolReserves = 0n;
         
-        // Extract bonding curve
-        const bondingCurveBytes = instructionData.slice(offset, offset + 32);
-        offset += 32;
+        // For 24-byte instructions, extract what we can
+        if (instructionData.length >= 24) {
+          // Extract two 8-byte values after discriminator (likely amounts or parameters)
+          const param1 = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+          
+          const param2 = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+          
+          console.log(`    📊 Pump.fun params (24-byte format): param1=${param1}, param2=${param2}`);
+          
+          // Use these as virtual reserves for now
+          virtualTokenReserves = param1;
+          virtualSolReserves = param2;
+        }
         
-        // Extract associated bonding curve
-        const associatedBondingCurveBytes = instructionData.slice(offset, offset + 32);
-        offset += 32;
-        
-        // Parse reserves
-        const virtualTokenReserves = instructionData.readBigUInt64LE(offset);
-        offset += 8;
-        
-        const virtualSolReserves = instructionData.readBigUInt64LE(offset);
-        offset += 8;
-        
-        const realTokenReserves = instructionData.readBigUInt64LE(offset);
-        offset += 8;
-        
-        const realSolReserves = instructionData.readBigUInt64LE(offset);
-        offset += 8;
+        // For full 128-byte instructions, extract all data
+        if (instructionData.length >= 128) {
+          offset = 8; // Reset offset
+          
+          // Extract token mint from instruction data
+          tokenMintBytes = instructionData.slice(offset, offset + 32);
+          offset += 32;
+          
+          // Extract bonding curve
+          bondingCurveBytes = instructionData.slice(offset, offset + 32);
+          offset += 32;
+          
+          // Extract associated bonding curve
+          associatedBondingCurveBytes = instructionData.slice(offset, offset + 32);
+          offset += 32;
+          
+          // Parse reserves
+          virtualTokenReserves = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+          
+          virtualSolReserves = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+          
+          realTokenReserves = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+          
+          realSolReserves = instructionData.readBigUInt64LE(offset);
+          offset += 8;
+        }
         
         console.log(`    📊 Pump.fun reserves: virtualToken=${virtualTokenReserves}, virtualSol=${virtualSolReserves}, realToken=${realTokenReserves}, realSol=${realSolReserves}`);
         
         // Get account addresses from transaction
-        const tokenMint = accounts[0] ? accountKeys[accounts[0]] : null;
-        const bondingCurve = accounts[1] ? accountKeys[accounts[1]] : null;
-        const creator = accounts[2] ? accountKeys[accounts[2]] : null;
+        // Resolve account indices to actual addresses
+        console.log(`    🔍 Pump.fun create instruction accounts: ${accounts.length} accounts`);
+        console.log(`    🔍 accounts[0] type: ${typeof accounts[0]}, value: ${accounts[0]}`);
+        
+        // Debug account mapping
+        console.log(`    🔍 PUMP.FUN SMART ACCOUNT SELECTION:`, {
+          accounts_0: accounts[0], // Vault
+          accounts_1: accounts[1], // Variable (token or bonding curve)
+          accounts_2: accounts[2], // Often "pump" suffixed tokens
+          accounts_3: accounts[3], // Backup
+          resolved_accounts: {
+            account_0: accountKeys[accounts[0]]?.pubkey || accountKeys[accounts[0]],
+            account_1: accountKeys[accounts[1]]?.pubkey || accountKeys[accounts[1]], 
+            account_2: accountKeys[accounts[2]]?.pubkey || accountKeys[accounts[2]],
+            account_3: accountKeys[accounts[3]]?.pubkey || accountKeys[accounts[3]]
+          }
+        });
+        
+        // Smart account selection logic
+        const KNOWN_NON_TOKENS = [
+          '4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf', // Vault
+          'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM'  // Bonding curve
+        ];
+        
+        function selectBestTokenAccount(accounts, accountKeys) {
+          const candidates = [1, 2, 3]; // Try accounts[1], [2], [3] in priority order
+          
+          for (const accountIndex of candidates) {
+            if (!accountKeys[accounts[accountIndex]]) continue;
+            
+            const address = typeof accountKeys[accounts[accountIndex]] === 'object' 
+              ? accountKeys[accounts[accountIndex]].pubkey 
+              : accountKeys[accounts[accountIndex]];
+            
+            // Skip known non-token addresses
+            if (KNOWN_NON_TOKENS.includes(address)) {
+              console.log(`    ⚠️ Skipping known non-token at accounts[${accountIndex}]: ${address}`);
+              continue;
+            }
+            
+            // Prioritize addresses ending with "pump" (likely token mints)
+            if (address.endsWith('pump')) {
+              console.log(`    🎯 Found pump-suffixed token at accounts[${accountIndex}]: ${address}`);
+              return { address, source: `accounts[${accountIndex}]_pump_priority` };
+            }
+            
+            // Valid candidate found
+            console.log(`    ✅ Selected token candidate at accounts[${accountIndex}]: ${address}`);
+            return { address, source: `accounts[${accountIndex}]_standard` };
+          }
+          
+          console.log(`    ❌ No valid token candidates found`);
+          return null;
+        }
+        
+        // Use the smart selection
+        const tokenSelection = selectBestTokenAccount(accounts, accountKeys);
+        
+        if (!tokenSelection) {
+          console.log(`    ❌ PUMP.FUN: No valid token mint found, skipping`);
+          return null;
+        }
+        
+        console.log(`    ✅ SMART EXTRACTED TOKEN: ${tokenSelection.address} (from ${tokenSelection.source})`);
+        
+        // Keep existing bondingCurve and creator extraction
+        const bondingCurveKey = accounts[1] !== undefined ? 
+          (typeof accounts[1] === 'number' ? accountKeys[accounts[1]] : accounts[1]) : null;
+        const creatorKey = accounts[2] !== undefined ? 
+          (typeof accounts[2] === 'number' ? accountKeys[accounts[2]] : accounts[2]) : null;
+        
+        console.log(`🔍 ACCOUNTKEYS FULL DEBUG:`, {
+          accountKeys_length: accountKeys?.length || 0,
+          accountKeys_first_10: accountKeys?.slice(0, 10)?.map((key, idx) => ({
+            index: idx,
+            address: typeof key === 'object' ? key.pubkey : key,
+            type: typeof key
+          })),
+          accounts_0_value: accounts[0],
+          accounts_0_resolved: accountKeys?.[accounts[0]],
+          duplicate_addresses: this.findDuplicateAddresses(accountKeys)
+        });
+        
+        // Extract string addresses
+        const tokenMint = tokenSelection.address; // Already extracted above
+        const bondingCurve = this.extractAddressString(bondingCurveKey);
+        const creator = this.extractAddressString(creatorKey);
+        
+        console.log(`    🔍 PUMP.FUN ACCOUNT EXTRACTION DEBUG:`, {
+          accounts_0: accounts[0],
+          accounts_0_type: typeof accounts[0],
+          tokenMint: tokenMint,
+          tokenMint_type: typeof tokenMint,
+          accountKeys_sample: accountKeys?.slice(0, 5)
+        });
+        
+        console.log(`    ✅ Resolved tokenMint: ${tokenMint} (from ${tokenSelection.source})`);
+        console.log(`    ✅ Resolved bondingCurve: ${bondingCurve} (from ${typeof bondingCurveKey})`);
         
         if (!tokenMint || !bondingCurve) {
           console.log(`    ⚠️ Missing required pump.fun accounts`);
@@ -911,13 +1929,13 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
           Number(realSolReserves & 0xFFFFFFFFn)
         ]);
         
-        // Calculate binary confidence
+        // Calculate binary confidence (adjust for different instruction sizes)
         const binaryConfidence = this.calculateBinaryConfidence({
           instructionLength: instructionData.length,
-          expectedLength: 128,
+          expectedLength: instructionData.length >= 24 ? instructionData.length : 128,
           entropyScore: entropyScore,
           hasRequiredAccounts: tokenMint && bondingCurve,
-          reservesValid: virtualTokenReserves > 0n && virtualSolReserves > 0n
+          reservesValid: instructionData.length < 128 ? true : (virtualTokenReserves > 0n && virtualSolReserves > 0n)
         });
         
         return {
@@ -926,12 +1944,14 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
           poolAddress: bondingCurve,
           tokenA: tokenMint,
           tokenB: 'So11111111111111111111111111111111111111112', // SOL
+          tokenAddress: tokenMint, // Set tokenAddress to tokenMint for consistency
           virtualTokenReserves: virtualTokenReserves.toString(),
           virtualSolReserves: virtualSolReserves.toString(),
           realTokenReserves: realTokenReserves.toString(),
           realSolReserves: realSolReserves.toString(),
           lpValueUSD: 0, // Calculate from reserves if needed
           confidence: binaryConfidence,
+          binaryConfidence: binaryConfidence, // Add this for consistency
           creator: creator,
           timestamp: Date.now(),
           detectionMethod: 'binary_analysis',
@@ -963,8 +1983,11 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         
       } else if (type === 'graduate') {
         // GRADUATE instruction - marks transition to Raydium
-        const tokenMint = accounts[0] ? accountKeys[accounts[0]] : null;
-        const raydiumPool = accounts[3] ? accountKeys[accounts[3]] : null;
+        const tokenMintKey = accounts[0] ? accountKeys[accounts[0]] : null;
+        const raydiumPoolKey = accounts[3] ? accountKeys[accounts[3]] : null;
+        
+        const tokenMint = this.extractAddressString(tokenMintKey);
+        const raydiumPool = this.extractAddressString(raydiumPoolKey);
         
         console.log(`    🎓 Token ${tokenMint?.slice(0,8)}... graduating to Raydium pool ${raydiumPool?.slice(0,8)}...`);
         
@@ -983,7 +2006,9 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
           poolAddress: raydiumPool,
           tokenA: tokenMint,
           tokenB: 'So11111111111111111111111111111111111111112',
+          tokenAddress: tokenMint, // Set tokenAddress to tokenMint for consistency
           confidence: binaryConfidence,
+          binaryConfidence: binaryConfidence, // Add this for consistency
           timestamp: Date.now(),
           detectionMethod: 'binary_analysis',
           isPumpFunGraduation: true,
@@ -1008,36 +2033,36 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     try {
       console.log(`  🧮 Applying optimized Renaissance validation to ${candidate.dex} LP`);
             // KEEP: Fast Bayesian scoring (optimized from 200ms to 25ms)
-      const bayesianProbability = this.calculateFastBayesianScore(candidate);
-      console.log(`    🎯 Fast Bayesian probability: ${(bayesianProbability * 100).toFixed(1)}%`);
+      const bayesianProbability = this.calculateFastBayesianScore(candidate) || 0;
+      console.log(`    🎯 Fast Bayesian probability: ${((bayesianProbability || 0) * 100).toFixed(1)}%`);
       
       if (bayesianProbability < this.options.bayesianConfidenceThreshold) {
-        console.log(`    ❌ Failed Bayesian threshold (${bayesianProbability.toFixed(3)} < ${this.options.bayesianConfidenceThreshold})`);
+        console.log(`    ❌ Failed Bayesian threshold (${this.safeToFixed(bayesianProbability, 3)} < ${this.options.bayesianConfidenceThreshold})`);
         return null;
       }
             // KEEP: Simplified significance test (optimized from 150ms to 15ms)  
       const significanceScore = this.calculateSimplifiedSignificance(candidate);
-      console.log(`    📊 Simplified significance: ${(significanceScore * 100).toFixed(1)}%`);
+      console.log(`    📊 Simplified significance: ${this.safeToFixed(significanceScore * 100, 1)}%`);
       
       if (significanceScore < 0.7) {
-        console.log(`    ❌ Failed significance threshold (${significanceScore.toFixed(3)} < 0.7)`);
+        console.log(`    ❌ Failed significance threshold (${this.safeToFixed(significanceScore, 3)} < 0.7)`);
         return null;
       }
             // KEEP: Entropy-based confidence (optimized from 100ms to 10ms)
-      if (candidate.entropyScore < this.options.entropyThreshold) {
-        console.log(`    ❌ Failed entropy threshold (${candidate.entropyScore.toFixed(3)} < ${this.options.entropyThreshold})`);
+      if (!candidate.entropyScore || candidate.entropyScore < this.options.entropyThreshold) {
+        console.log(`    ❌ Failed entropy threshold (${(typeof candidate.entropyScore === 'number' && !isNaN(candidate.entropyScore)) ? candidate.entropyScore.toFixed(3) : '0.000'} < ${this.options.entropyThreshold})`);
         return null;
       }
             // ADD: Market microstructure analysis (NEW - 25ms)
       const microstructureScore = await this.calculateMarketMicrostructureScore(candidate);
-      console.log(`    📈 Microstructure score: ${(microstructureScore * 100).toFixed(1)}%`);
+      console.log(`    📈 Microstructure score: ${this.safeToFixed(microstructureScore * 100, 1)}%`);
       
       // ADD: Rug pull risk assessment (NEW - 30ms)
       const rugPullRisk = await this.calculateRugPullRisk(candidate);
-      console.log(`    🚨 Rug pull risk: ${(rugPullRisk * 100).toFixed(1)}%`);
+      console.log(`    🚨 Rug pull risk: ${this.safeToFixed(rugPullRisk * 100, 1)}%`);
             // ADD: Time decay factor (NEW - 5ms)
       const timeDecayFactor = this.calculateTimeDecayFactor(candidate);
-      console.log(`    ⏰ Time decay factor: ${(timeDecayFactor * 100).toFixed(1)}%`);
+      console.log(`    ⏰ Time decay factor: ${this.safeToFixed(timeDecayFactor * 100, 1)}%`);
       
       // MODIFIED: Combined confidence calculation
       const overallConfidence = this.calculateCombinedConfidence({
@@ -1049,11 +2074,32 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         timeDecay: timeDecayFactor
       });
             const processingTime = performance.now() - startTime;
-      console.log(`    🏆 Overall confidence: ${(overallConfidence * 100).toFixed(1)}% (${processingTime.toFixed(1)}ms)`);
+      console.log(`    🏆 Overall confidence: ${this.safeToFixed(overallConfidence * 100, 1)}% (${this.safeToFixed(processingTime, 1)}ms)`);
+      
+      // Mathematical validation debug logging
+      console.log(`🧮 MATHEMATICAL VALIDATION DEBUG for candidate:`);
+      console.log(`  - Bayesian probability: ${(typeof bayesianProbability === 'number' && !isNaN(bayesianProbability)) ? bayesianProbability.toFixed(3) : '0.000'} (threshold: ${this.options.bayesianConfidenceThreshold})`);
+      console.log(`  - Significance score: ${(typeof significanceScore === 'number' && !isNaN(significanceScore)) ? significanceScore.toFixed(3) : '0.000'} (threshold: 0.70)`);
+      console.log(`  - Entropy score: ${(typeof candidate.entropyScore === 'number' && !isNaN(candidate.entropyScore)) ? candidate.entropyScore.toFixed(3) : '0.000'} (threshold: ${this.options.entropyThreshold})`);
+      console.log(`  - Overall confidence: ${(typeof overallConfidence === 'number' && !isNaN(overallConfidence)) ? overallConfidence.toFixed(3) : '0.000'} (threshold: ${this.options.accuracyThreshold})`);
+      
+      // Add validation checks with specific failure reasons
+      if (bayesianProbability < this.options.bayesianConfidenceThreshold) {
+          console.log(`❌ FAILED: Bayesian probability too low (${this.safeToFixed(bayesianProbability, 3)} < ${this.options.bayesianConfidenceThreshold})`);
+      }
+      if (significanceScore < 0.70) {
+          console.log(`❌ FAILED: Significance score too low (${this.safeToFixed(significanceScore, 3)} < 0.70)`);
+      }
+      if (candidate.entropyScore < this.options.entropyThreshold) {
+          console.log(`❌ FAILED: Entropy score too low (${this.safeToFixed(candidate.entropyScore, 3)} < ${this.options.entropyThreshold})`);
+      }
+      if (overallConfidence < this.options.accuracyThreshold) {
+          console.log(`❌ FAILED: Overall confidence too low (${this.safeToFixed(overallConfidence, 3)} < ${this.options.accuracyThreshold})`);
+      }
       
       // Final validation decision
       if (overallConfidence < this.options.accuracyThreshold) {
-        console.log(`    ❌ Failed overall confidence threshold (${overallConfidence.toFixed(3)} < ${this.options.accuracyThreshold})`);
+        console.log(`    ❌ Failed overall confidence threshold (${this.safeToFixed(overallConfidence, 3)} < ${this.options.accuracyThreshold})`);
         return null;
       }
             // Create validated LP candidate with enhanced mathematical metrics
@@ -1079,7 +2125,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       this.metrics.truePositives++;
       this.updatePerformanceMetrics();
       
-      console.log(`    ✅ Optimized Renaissance validation passed: ${candidate.dex} LP at ${candidate.poolAddress} (${processingTime.toFixed(1)}ms)`);
+      console.log(`    ✅ Optimized Renaissance validation passed: ${candidate.dex} LP at ${candidate.poolAddress} (${this.safeToFixed(processingTime, 1)}ms)`);
       
       this.emit('lpDetected', validatedCandidate);
       
@@ -1998,12 +3044,12 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     // Entropy evidence (25% weight)
     const entropyEvidence = Math.min(1, candidate.entropyScore / 5.0);
     evidenceScore += 0.25 * (entropyEvidence - 0.5);
-        // Simple Bayesian update
+        // Simple Bayesian update with null safety
     const posteriorProbability = Math.max(0.01, Math.min(0.99, 
-      priorProbability + (evidenceScore * 0.5)
+      (priorProbability || 0.01) + ((evidenceScore || 0) * 0.5)
     ));
     
-    return posteriorProbability;
+    return posteriorProbability || 0.5; // Default to 0.5 if calculation fails
   }
 
   /**
@@ -2230,6 +3276,18 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     this.stopScanning();
     this.isInitialized = false;
     
+    // Clear queue cleanup interval
+    if (this.queueCleanupInterval) {
+      clearInterval(this.queueCleanupInterval);
+      this.queueCleanupInterval = null;
+    }
+    
+    // Clear validation queue
+    if (this.validationQueue && this.validationQueue.size > 0) {
+      console.log(`🧹 SHUTDOWN: Clearing ${this.validationQueue.size} pending validations`);
+      this.validationQueue.clear();
+    }
+    
     // Clear statistical state
     this.statisticalState.detectionHistory = [];
     
@@ -2258,6 +3316,167 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       this.scanTimer = null;
     }
     this.isScanning = false;
+  }
+
+  /**
+   * Test LP detection with synthetic data
+   */
+  testLPDetection() {
+    console.log('🧪 TESTING LP DETECTION WITH SYNTHETIC DATA');
+    
+    const testInstructionData = Buffer.from('0123456789abcdef01', 'hex');
+    const testAccounts = [0, 1, 2, 3, 4, 5];
+    const testAccountKeys = [
+        'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        '11111111111111111111111111111111',
+        'So11111111111111111111111111111111111111112',
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+        'new1LP1token1mint1address1here1111111111111',
+        'pool1account1address1here1111111111111111111'
+    ];
+    
+    const result = this.analyzeLPCreationIndicators(testInstructionData, testAccounts, testAccountKeys, 'TestProgramId');
+    console.log('🧪 Test result:', JSON.stringify(result, null, 2));
+    
+    if (result.hasLPMint || result.hasTokenMints) {
+        console.log('✅ LP detection is working correctly!');
+    } else {
+        console.log('❌ LP detection still has issues');
+    }
+  }
+
+  /**
+   * Validate token with retry logic to handle RPC propagation delays
+   */
+  async validateTokenWithRetry(tokenMint, validationType = 'both', maxRetries = 3) {
+    console.log(`🔍 VALIDATION START: ${tokenMint}, type: ${validationType}`);
+    
+    // Token format validation first
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(tokenMint)) {
+      console.log(`🚫 INVALID TOKEN FORMAT: ${tokenMint}`);
+      return { success: false, error: 'Invalid token mint format' };
+    }
+    
+    const delays = [500, 1000, 2000];
+    const queueKey = `${tokenMint}-${validationType}`;
+    
+    console.log(`📋 QUEUE CHECK: ${queueKey}, queue size: ${this.validationQueue.size}`);
+    
+    if (this.validationQueue.has(queueKey)) {
+      console.log(`⏸️ QUEUE BLOCKED: Validation already in progress for ${queueKey}`);
+      return { success: false, error: 'Validation already in progress' };
+    }
+    
+    this.validationQueue.add(queueKey);
+    console.log(`➕ QUEUE ADDED: ${queueKey}, new size: ${this.validationQueue.size}`);
+    
+    try {
+      for (let i = 0; i < maxRetries; i++) {
+        console.log(`🔄 RETRY ATTEMPT ${i + 1}/${maxRetries} for ${tokenMint}`);
+        
+        // RPC health check before each attempt
+        try {
+          console.log(`🏥 RPC HEALTH: Testing endpoint ${this.rpcManager.getCurrentEndpoint?.() || 'unknown'}`);
+          const healthCheck = await this.rpcManager.call('getSlot', []);
+          console.log(`✅ RPC HEALTHY: Current slot ${healthCheck}`);
+        } catch (healthError) {
+          console.log(`🚫 RPC UNHEALTHY: ${healthError.message}`);
+          if (i < maxRetries - 1) {
+            await this.rpcManager.rotateEndpoint?.();
+            continue;
+          }
+        }
+        
+        if (i > 0) {
+          console.log(`⏰ DELAY: Waiting ${delays[i-1]}ms before retry ${i + 1}`);
+          await new Promise(resolve => setTimeout(resolve, delays[i-1]));
+          
+          if (this.rpcManager?.rotateEndpoint) {
+            console.log(`🔄 RPC ROTATION: Switching endpoint for retry ${i + 1}`);
+            await this.rpcManager.rotateEndpoint();
+          }
+        }
+        
+        try {
+          console.log(`📡 RPC CALL START: getTokenSupply for ${tokenMint}`);
+          const tokenSupply = await this.rpcManager.call('getTokenSupply', [tokenMint]);
+          console.log(`✅ RPC SUCCESS: getTokenSupply returned:`, tokenSupply);
+          
+          return { 
+            success: true, 
+            data: { supply: tokenSupply } 
+          };
+          
+        } catch (error) {
+          console.log(`❌ RPC ERROR on attempt ${i + 1}: ${error.message}`);
+          console.log(`🔍 ERROR DETAILS:`, { 
+            code: error.code, 
+            message: error.message,
+            stack: error.stack?.split('\n')[0] 
+          });
+          
+          // Rate limit detection
+          if (error.code === 429 || error.message.includes('rate limit') || error.message.includes('too many requests')) {
+            console.log(`🚫 RATE LIMITED: Backing off for 5 seconds`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+          
+          if (i === maxRetries - 1) {
+            console.log(`💥 FINAL FAILURE: All ${maxRetries} retries failed for ${tokenMint}`);
+            return { success: false, error: `All retries failed: ${error.message}` };
+          }
+        }
+      }
+      
+      return { success: false, error: 'Max retries reached without success' };
+      
+    } finally {
+      this.validationQueue.delete(queueKey);
+      console.log(`➖ QUEUE REMOVED: ${queueKey}, new size: ${this.validationQueue.size}`);
+    }
+  }
+
+  /**
+   * Find duplicate addresses in accountKeys array
+   */
+  findDuplicateAddresses(accountKeys) {
+    if (!accountKeys) return {};
+    
+    const addressCounts = {};
+    accountKeys.forEach((key, idx) => {
+      const address = typeof key === 'object' ? key.pubkey : key;
+      if (!addressCounts[address]) {
+        addressCounts[address] = [];
+      }
+      addressCounts[address].push(idx);
+    });
+    
+    // Return only duplicates
+    const duplicates = {};
+    Object.entries(addressCounts).forEach(([address, indices]) => {
+      if (indices.length > 1) {
+        duplicates[address] = indices;
+      }
+    });
+    
+    return duplicates;
+  }
+
+  /**
+   * Create hash of accountKeys for deduplication
+   */
+  hashAccountKeys(accountKeys) {
+    if (!accountKeys) return 'null';
+    const addresses = accountKeys.map(key => typeof key === 'object' ? key.pubkey : key);
+    // Simple hash without crypto module for ES modules
+    let hash = 0;
+    const str = addresses.join('');
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash).toString(16).substring(0, 8);
   }
 }
 

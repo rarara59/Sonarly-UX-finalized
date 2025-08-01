@@ -1,44 +1,12 @@
 {
   "compilerOptions": {
     "target": "es2018",
-    "module": "commonjs", 
-    "lib": ["es2018", "dom"],
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "strict": true,
+    "module": "commonjs",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "downlevelIteration": true,
-    "resolveJsonModule": true,
-    "moduleResolution": "node",
-    "declaration": true,
-    "sourceMap": true,
-    "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
-    "allowJs": true
+    "moduleResolution": "node"
   },
   "include": ["src/**/*"],
-  "exclude": [
-    "node_modules", "dist", "**/*.test.ts", "**/*.spec.ts",
-    "src/legacy/**/*",
-    "src/services/wallet-import.service.ts",
-    "src/services/wallet-monitor.service.ts", 
-    "src/services/walletPerformanceHistory.service.ts",
-    "src/services/smart-money-integration.ts",
-    "src/services/market-data-service.ts",
-    "src/services/performance-integration.service.ts",
-    "src/services/performance-services-setup.ts",
-    "src/thorp-mvp.ts",
-    "src/scripts/start-thorp-system.ts",
-    "src/services/liquidity-pool-data-extractor.service.ts",
-    "src/services/external-wallet.service.ts",
-    "src/services/smart-money-detection.ts",
-    "src/services/smart-wallet-service.ts", 
-    "src/services/apis/solscan.ts",
-    "src/services/birdeye-lp-service.ts",
-    "src/services/token-tracking-data-enhanced.service.ts",
-    "src/services/trade-execution.service.ts"
-  ]
+  "exclude": ["node_modules", "dist"]
 }

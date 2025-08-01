@@ -68,3 +68,8 @@ check-*.ts
 # Reports
 *-report.txt
 ts-prune-*.txt
+
+# Add legacy exclusion to the end of your .gitignore:
+echo "" >> .gitignore
+echo "# Legacy code" >> .gitignore  
+echo "src/legacy/" >> .gitignore

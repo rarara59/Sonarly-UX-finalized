@@ -2,7 +2,7 @@
 import axios from 'axios';
 import { performance } from 'perf_hooks';
 import winston from 'winston';
-import { config } from '../config';
+import { config } from '../legacy';
 import { Connection, ConnectionConfig, PublicKey } from '@solana/web3.js';
 
 // =============================================

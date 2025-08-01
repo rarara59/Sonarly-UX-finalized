@@ -1,6 +1,6 @@
 // src/signal-modules/social-signals.module.ts
 
-import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
+import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from './signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
 
 export class SocialSignalsModule extends SignalModule {

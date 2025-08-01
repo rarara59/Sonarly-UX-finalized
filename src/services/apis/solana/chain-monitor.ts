@@ -8,7 +8,7 @@ import {
     ConnectionConfig
 } from '@solana/web3.js';
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
-import { config } from '../../../config';
+import { config } from '../../../legacy';
 
 interface TransactionData {
     hash: string;

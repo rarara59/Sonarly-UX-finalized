@@ -1,9 +1,9 @@
 // src/signal-modules/smart-wallet-signal.module.ts
 // EXACT FIX: Replace await connectToDatabase() with mongoose connection check
 
-import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from '../interfaces/signal-module.interface';
+import { SignalModule, SignalContext, SignalResult, SignalModuleConfig } from './signal-module.interface';
 import { DetectionSignals } from '../interfaces/detection-signals.interface';
-import SmartWallet from '../models/smartWallet';
+import SmartWallet from '../legacy/smartWallet';
 import mongoose from 'mongoose'; // ← ADD: Import mongoose for connection check
 // REMOVE: import { connectToDatabase } from '../config/database'; 
 import { PublicKey } from '@solana/web3.js';

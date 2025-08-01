@@ -1,5 +1,5 @@
 // src/services/smart-money-validator.service.ts
-import SmartWallet from '../models/smartWallet';
+import SmartWallet from '../legacy/smartWallet';
 import rpcConnectionManager from './rpc-connection-manager'; 
 import { logger } from '../utils/logger';
 

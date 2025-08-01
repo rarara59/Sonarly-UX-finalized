@@ -4,7 +4,7 @@ import mongoose, { Document, Schema, Model } from 'mongoose';
 import axios from 'axios';
 import externalWalletScraper from '../legacy/external-wallet-scraper';
 import rpcConnectionManager from './rpc-connection-manager';
-import { config } from '../config';
+import { config } from '../legacy';
 
 // Types and interfaces
 export interface ISmartWallet extends Document {

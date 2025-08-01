@@ -1,8 +1,8 @@
 import { 
   ClassificationHistory, 
   IClassificationHistory
-} from '../models/classificationHistory';
-import { ClassificationAuditTrail } from '../models/classificationAuditTrail';
+} from '../legacy/classificationHistory';
+import { ClassificationAuditTrail } from '../legacy/classificationAuditTrail';
 import logger from '../utils/logger';
 
 // Define types locally to avoid conflicts
