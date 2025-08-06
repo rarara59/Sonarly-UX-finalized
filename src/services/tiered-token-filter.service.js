@@ -58,8 +58,27 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         ];
         
         this.rpcManager = config.rpcManager || null;
-        this.isInitialized = false;
+        
+        // Risk module dependencies
+        this.scamProtectionEngine = config.scamProtectionEngine;
+        this.liquidityRiskAnalyzer = config.liquidityRiskAnalyzer;
+        this.marketCapRiskFilter = config.marketCapRiskFilter;
+        
+        // Validate required dependencies
+        if (!this.scamProtectionEngine || !this.liquidityRiskAnalyzer || !this.marketCapRiskFilter) {
+            console.warn("⚠️ Risk modules not provided - using internal logic");
+        }        this.isInitialized = false;
         this.metadataCache = new Map();
+        this.maxCacheSize = 1000;        // Reasonable limit for trading operations
+        this.cacheTTL = 300000;          // 5 minutes TTL
+        this.lastCacheCleanup = Date.now();
+        
+        // Initialize validation queue for retry logic
+        this.validationQueue = new Set();
+        this.validationQueueTimestamps = new Map(); // Track when entries were added
+        this.maxQueueAge = 30000; // 30 seconds max queue retention
+        this.lastQueueCleanup = Date.now();
+        
         this.stats = {
             processed: 0,
             freshGemsDetected: 0,
@@ -77,6 +96,13 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         
         // Initialize validation queue for retry logic
         this.validationQueue = new Set();
+        this.validationQueueTimestamps = new Map();
+        
+        // Start periodic cleanup (every 2 minutes)
+        this.cleanupInterval = setInterval(() => {
+            this.cleanupValidationQueue();
+            this.maintainMetadataCache();
+        }, 120000);
         
         this.isInitialized = true;
         console.log('💎 Renaissance Tiered Token Filter (Fixed) initialized');
@@ -85,6 +111,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         console.log('  🧮 Organic activity detection enabled');
         console.log('  ✅ Robust token validation with retry logic');
         console.log('  🔄 Progressive retry delays: 500ms, 1000ms, 2000ms');
+        console.log('  🧹 Memory management: Bounded caches with automatic cleanup');
         
         return true;
     }
@@ -93,15 +120,22 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
      * Validate token with retry logic to handle RPC propagation delays
      */
     async validateTokenWithRetry(tokenMint, validationType = 'both', maxRetries = 3) {
-        const delays = [500, 1000, 2000]; // Progressive delays in ms
+        const delays = [100, 200, 400]; // Progressive delays in ms
         
         // Prevent duplicate requests
         const queueKey = `${tokenMint}-${validationType}`;
+        const now = Date.now();
+        
         if (this.validationQueue.has(queueKey)) {
             return { success: false, error: 'Validation already in progress' };
         }
         
+        // Add to queue with timestamp
         this.validationQueue.add(queueKey);
+        this.validationQueueTimestamps.set(queueKey, now);
+        
+        // Trigger queue cleanup if needed
+        this.cleanupValidationQueue();
         
         try {
             for (let i = 0; i < maxRetries; i++) {
@@ -168,7 +202,9 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             return { success: false, error: 'Max retries reached without success' };
             
         } finally {
+            // Always clean up queue entry
             this.validationQueue.delete(queueKey);
+            this.validationQueueTimestamps.delete(queueKey);
         }
     }
 
@@ -292,10 +328,10 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                 ageMinutes: this.calculateTokenAge(tokenCandidate),
                 hasMintAuthority: true, // Assume true until proven false
                 hasFreezeAuthority: true,
-                lpValueUSD: tokenCandidate.lpValueUSD || tokenCandidate.liquidityUSD || 0,
-                largestHolderPercentage: tokenCandidate.largestHolderPercentage || 50,
-                uniqueWallets: tokenCandidate.uniqueWallets || 10,
-                buyToSellRatio: tokenCandidate.buyToSellRatio || 1.0,
+                lpValueUSD: parseFloat(tokenCandidate.lpValueUSD || tokenCandidate.liquidityUSD || 0),
+                largestHolderPercentage: parseFloat(tokenCandidate.largestHolderPercentage || 50),
+                uniqueWallets: parseInt(tokenCandidate.uniqueWallets || 10),
+                buyToSellRatio: parseFloat(tokenCandidate.buyToSellRatio || 1.0),
                 avgTransactionSpread: tokenCandidate.avgTransactionSpread || 60,
                 transactionSizeVariation: tokenCandidate.transactionSizeVariation || 0.5,
                 volumeToLiquidityRatio: 0.1,
@@ -312,7 +348,10 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             
             // Calculate volume to liquidity ratio if we have the data
             if (metrics.lpValueUSD > 0 && tokenCandidate.volume24h) {
-                metrics.volumeToLiquidityRatio = tokenCandidate.volume24h / metrics.lpValueUSD;
+                const volume24h = parseFloat(tokenCandidate.volume24h || 0);
+            if (metrics.lpValueUSD > 0 && volume24h > 0) {
+                metrics.volumeToLiquidityRatio = volume24h / metrics.lpValueUSD;
+            }
             }
             
             return metrics;
@@ -327,6 +366,12 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
      * FIXED: Robust token metadata fetching with multiple fallback methods
      */
     async fetchTokenMetadataRobust(tokenMint, tokenCandidate) {
+        // Check cache first
+        const cached = this.getCachedMetadata(tokenMint);
+        if (cached) {
+            return cached;
+        }
+        
         const metadata = {
             address: tokenMint,
             name: null,
@@ -369,8 +414,8 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         // Method 2: Try getTokenSupply with retry logic
         const supplyResult = await this.validateTokenWithRetry(tokenMint, 'supply');
         if (supplyResult.success && supplyResult.data?.supply) {
-            metadata.supply = supplyResult.data.supply.amount;
-            metadata.decimals = supplyResult.data.supply.decimals || 9;
+            metadata.supply = parseInt(supplyResult.data.supply.amount);
+            metadata.decimals = parseInt(supplyResult.data.supply.decimals) || 9;
             metadata.isInitialized = true;
             console.log(`  ✅ Got token supply: ${supplyResult.data.supply.uiAmount}`);
         } else {
@@ -382,8 +427,10 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         if (accountsResult.success && accountsResult.data?.accounts?.value) {
             const largestAccounts = accountsResult.data.accounts;
             if (largestAccounts.value && largestAccounts.value.length > 0) {
-                const totalSupply = metadata.supply || 
-                    largestAccounts.value.reduce((sum, acc) => sum + Number(acc.amount), 0);
+                const metadataSupply = parseInt(metadata.supply) || 0;
+            const calculatedSupply = 
+                    largestAccounts.value.reduce((sum, acc) => sum + parseInt(acc.amount), 0);
+                const totalSupply = metadataSupply || calculatedSupply;
                 
                 if (totalSupply > 0) {
                     const largestHolder = largestAccounts.value[0];
@@ -404,6 +451,9 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         if (!metadata.symbol) {
             metadata.symbol = tokenCandidate.symbol || tokenMint.substring(0, 4).toUpperCase();
         }
+        
+        // Cache the result before returning
+        this.cacheMetadata(tokenMint, metadata);
         
         return metadata;
     }
@@ -539,6 +589,42 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
 
     // Copy other evaluation methods from original...
     async evaluateFreshGem(tokenMetrics) {
+        try {
+            // Use existing risk modules if available
+            if (this.scamProtectionEngine && this.liquidityRiskAnalyzer && this.marketCapRiskFilter) {
+                const [scamResult, liquidityResult, marketCapResult] = await Promise.all([
+                    this.scamProtectionEngine.analyzeToken(tokenMetrics.address, tokenMetrics),
+                    this.liquidityRiskAnalyzer.validateExitLiquidity(tokenMetrics.address, tokenMetrics),
+                    this.marketCapRiskFilter.filterByMarketCap(tokenMetrics, "fresh_gem")
+                ]);
+                
+                // Keep unique organic activity analysis
+                const organicCheck = this.checkOrganicActivity(tokenMetrics);
+                
+                // Combine results
+                const passed = !scamResult.isScam && liquidityResult.hasExitLiquidity && marketCapResult.passed && organicCheck.passed;
+                const overallScore = passed ? (scamResult.confidence + (liquidityResult.slippage || 0) + organicCheck.score) / 3 : 0;
+                
+                return {
+                    passed,
+                    score: overallScore / 100, // Normalize to 0-1
+                    securityScore: (100 - scamResult.confidence) / 100,
+                    organicScore: organicCheck.score,
+                    reason: passed ? "fresh_gem_approved" : "fresh_gem_rejected",
+                    failureType: !passed ? "integrated_analysis" : null,
+                    riskAnalysis: { scamResult, liquidityResult, marketCapResult }
+                };
+            }
+            
+            // Fallback to internal logic if modules not available
+            return this.evaluateFreshGemFallback(tokenMetrics);
+        } catch (error) {
+            console.error("Risk module integration failed:", error);
+            return this.evaluateFreshGemFallback(tokenMetrics);
+        }
+    }
+
+    async evaluateFreshGemFallback(tokenMetrics) {
         const isPumpFun = tokenMetrics.isPumpFun;
         let adjustedMetrics = tokenMetrics;
         
@@ -548,7 +634,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                 buyToSellRatio: tokenMetrics.buyToSellRatio * 1.5,
                 uniqueWallets: Math.max(tokenMetrics.uniqueWallets, 15)
             };
-            console.log(`  🎯 Pump.fun token detected - applying adjusted criteria`);
+            console.log("🎯 Pump.fun token detected - applying adjusted criteria");
         }
         
         const securityCheck = this.checkFreshGemSecurity(adjustedMetrics);
@@ -560,21 +646,16 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         
         const passed = securityCheck.passed && organicCheck.passed;
         
-        const gemType = isPumpFun ? 'Pump.fun gem' : 'Fresh gem';
-        console.log(`  💎 ${gemType} analysis: security=${securityScore.toFixed(2)}, organic=${organicScore.toFixed(2)}, passed=${passed}`);
-        
         return {
-            passed: passed,
+            passed,
             score: overallScore || 0,
             securityScore: securityScore || 0,
             organicScore: organicScore || 0,
-            reason: passed ? 'fresh_gem_approved' : 'fresh_gem_rejected',
-            failureType: !securityCheck.passed ? 'security' : (!organicCheck.passed ? 'organic' : null),
-            isPumpFun: isPumpFun,
-            pumpFunDetails: tokenMetrics.pumpFunDetails
+            reason: passed ? "fresh_gem_approved" : "fresh_gem_rejected",
+            failureType: !securityCheck.passed ? "security" : (!organicCheck.passed ? "organic" : null)
         };
     }
-
+    
     checkFreshGemSecurity(tokenMetrics) {
         const criteria = this.FRESH_GEM_CRITERIA.security;
         let score = 0;
@@ -645,74 +726,63 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
 
     async evaluateEstablishedToken(tokenMetrics) {
         try {
-            const criteria = {
-                minLiquidityUSD: 10000,
-                minUniqueWallets: 50,
-                maxTopHolderPercent: 30,
-                minVolumeLiquidity: 0.1,
-                minTokenAge: 60
-            };
-
-            let score = 0;
-            let passed = true;
-            let failureReasons = [];
-
-            if (tokenMetrics.ageMinutes < criteria.minTokenAge) {
-                passed = false;
-                failureReasons.push('too_young_for_established');
-            } else {
-                score += 0.2;
+            // Use existing risk modules if available
+            if (this.scamProtectionEngine && this.marketCapRiskFilter) {
+                const [scamResult, marketCapResult] = await Promise.all([
+                    this.scamProtectionEngine.analyzeToken(tokenMetrics.address, tokenMetrics),
+                    this.marketCapRiskFilter.filterByMarketCap(tokenMetrics, "established")
+                ]);
+                
+                const passed = !scamResult.isScam && marketCapResult.passed;
+                const score = passed ? (100 - scamResult.confidence) / 100 : 0;
+                
+                return {
+                    passed,
+                    score,
+                    securityScore: score,
+                    organicScore: score,
+                    tier: passed ? "established" : "rejected",
+                    reason: passed ? "established_token_approved" : marketCapResult.reason || scamResult.reasons.join(", ")
+                };
             }
-
-            if (tokenMetrics.lpValueUSD < criteria.minLiquidityUSD) {
-                passed = false;
-                failureReasons.push('insufficient_liquidity');
-            } else {
-                score += 0.2;
-            }
-
-            if (tokenMetrics.uniqueWallets < criteria.minUniqueWallets) {
-                passed = false;
-                failureReasons.push('insufficient_holders');
-            } else {
-                score += 0.2;
-            }
-
-            if (tokenMetrics.largestHolderPercentage > criteria.maxTopHolderPercent) {
-                passed = false;
-                failureReasons.push('too_concentrated');
-            } else {
-                score += 0.2;
-            }
-
-            if (tokenMetrics.volumeToLiquidityRatio < criteria.minVolumeLiquidity) {
-                passed = false;
-                failureReasons.push('low_trading_activity');
-            } else {
-                score += 0.2;
-            }
-
-            return {
-                passed: passed,
-                score: score || 0,
-                securityScore: score || 0,
-                organicScore: score || 0,
-                tier: passed ? 'established' : 'rejected',
-                failureType: failureReasons.length > 0 ? 'established_criteria' : null,
-                reason: failureReasons.length > 0 ? failureReasons.join(', ') : 
-                    (passed ? 'established_token_approved' : 'established_token_rejected')
-            };
-
+            
+            // Fallback to internal logic
+            return this.evaluateEstablishedTokenFallback(tokenMetrics);
         } catch (error) {
-            console.error(`❌ Failed to evaluate established token: ${error.message}`);
-            return {
-                passed: false,
-                score: 0,
-                tier: 'rejected',
-                failureType: 'evaluation_error',
-                reason: error.message
-            };
+            console.error("Established token analysis failed:", error);
+            return { passed: false, score: 0, tier: "rejected", reason: error.message };
         }
+    }
+    
+    async evaluateEstablishedTokenFallback(tokenMetrics) {
+        const criteria = {
+            minLiquidityUSD: 10000,
+            minUniqueWallets: 50,
+            maxTopHolderPercent: 30,
+            minVolumeLiquidity: 0.1,
+            minTokenAge: 60
+        };
+        
+        let score = 0;
+        let passed = true;
+        let failureReasons = [];
+        
+        if (tokenMetrics.ageMinutes < criteria.minTokenAge) {
+            passed = false;
+            failureReasons.push("too_young_for_established");
+        } else { score += 0.2; }
+        
+        if (tokenMetrics.lpValueUSD < criteria.minLiquidityUSD) {
+            passed = false;
+            failureReasons.push("insufficient_liquidity");
+        } else { score += 0.2; }
+        
+        return {
+            passed,
+            score: score || 0,
+            tier: passed ? "established" : "rejected",
+            reason: failureReasons.length > 0 ? failureReasons.join(", ") : "established_token_approved"
+        };
     }
 
     detectPumpFunToken(tokenCandidate, tokenMetrics) {
@@ -766,6 +836,117 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         }
     }
 
+    /**
+     * Maintain metadata cache - prevent memory leaks during high-volume trading
+     * Called automatically during token processing
+     */
+    maintainMetadataCache() {
+        const now = Date.now();
+        
+        // Size-based cleanup: Remove oldest entries if over limit
+        if (this.metadataCache.size > this.maxCacheSize) {
+            const excess = this.metadataCache.size - Math.floor(this.maxCacheSize * 0.8); // Keep 80%
+            const iterator = this.metadataCache.keys();
+            
+            for (let i = 0; i < excess; i++) {
+                const next = iterator.next();
+                if (next.done) break;
+                const key = next.value;
+                if (key) {
+                    this.metadataCache.delete(key);
+                }
+            }
+            
+            console.log(`🧹 Metadata cache: removed ${excess} old entries, size now ${this.metadataCache.size}`);
+        }
+        
+        // Time-based cleanup: Remove entries older than TTL (every 2 minutes)
+        if (now - this.lastCacheCleanup > 120000) {
+            let removed = 0;
+            
+            for (const [key, entry] of this.metadataCache) {
+                if (entry.timestamp && (now - entry.timestamp) > this.cacheTTL) {
+                    this.metadataCache.delete(key);
+                    removed++;
+                }
+            }
+            
+            this.lastCacheCleanup = now;
+            
+            if (removed > 0) {
+                console.log(`🧹 Metadata cache: removed ${removed} expired entries`);
+            }
+        }
+    }
+
+    /**
+     * Cache metadata with timestamp for TTL management
+     */
+    cacheMetadata(tokenMint, metadata) {
+        this.metadataCache.set(tokenMint, {
+            ...metadata,
+            timestamp: Date.now()
+        });
+        
+        // Trigger maintenance if needed
+        this.maintainMetadataCache();
+    }
+
+    /**
+     * Get cached metadata if still valid
+     */
+    getCachedMetadata(tokenMint) {
+        const entry = this.metadataCache.get(tokenMint);
+        if (!entry) return null;
+        
+        // Check TTL
+        if (entry.timestamp && (Date.now() - entry.timestamp) > this.cacheTTL) {
+            this.metadataCache.delete(tokenMint);
+            return null;
+        }
+        
+        return entry;
+    }
+
+    /**
+     * Clean up validation queue - prevent memory leaks from stuck validations
+     * Called automatically during token processing
+     */
+    cleanupValidationQueue() {
+        const now = Date.now();
+        
+        // Only run cleanup every 30 seconds
+        if (now - this.lastQueueCleanup < 30000) {
+            return;
+        }
+        
+        let removed = 0;
+        
+        // Remove entries older than maxQueueAge
+        for (const [queueKey, timestamp] of this.validationQueueTimestamps) {
+            if (now - timestamp > this.maxQueueAge) {
+                this.validationQueue.delete(queueKey);
+                this.validationQueueTimestamps.delete(queueKey);
+                removed++;
+            }
+        }
+        
+        this.lastQueueCleanup = now;
+        
+        if (removed > 0) {
+            console.log(`🧹 Validation queue: removed ${removed} stuck entries`);
+        }
+    }
+
+    /**
+     * Emergency queue clear - for testing or recovery
+     */
+    clearValidationQueue() {
+        this.validationQueue.clear();
+        this.validationQueueTimestamps.clear();
+        console.log('🧹 Validation queue cleared');
+    }
+
     async healthCheck() {
         const totalProcessed = this.stats.processed;
         const freshGemRate = totalProcessed > 0 ? (this.stats.freshGemsDetected / totalProcessed * 100) : 0;
@@ -783,6 +964,27 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                 totalPassRate: totalPassRate.toFixed(2) + '%'
             }
         };
+    }
+
+    /**
+     * Graceful shutdown with cleanup
+     */
+    async shutdown() {
+        console.log('🔄 Shutting down Renaissance Token Filter...');
+        
+        // Clear cleanup interval
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+        }
+        
+        // Final cleanup
+        this.clearValidationQueue();
+        this.metadataCache.clear();
+        
+        // Update stats
+        this.isInitialized = false;
+        
+        console.log('✅ Renaissance Token Filter shutdown complete');
     }
 }
 

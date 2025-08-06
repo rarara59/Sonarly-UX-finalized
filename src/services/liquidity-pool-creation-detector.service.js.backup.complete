@@ -16,7 +16,6 @@
 
 import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
-import { RenaissanceCircuitBreaker, SolanaRpcCircuitBreaker } from '../detection/core/circuit-breaker.js';
 import {
   RAYDIUM_LAYOUT_CONSTANTS,
   ORCA_LAYOUT_CONSTANTS,
@@ -64,6 +63,91 @@ const safeConsole = {
   }
 };
 
+/**
+ * Renaissance-grade circuit breaker for meme coin trading
+ * Prevents memory crashes during viral token launches
+ */
+class MemeCoinCircuitBreaker {
+  constructor() {
+    // Production limits based on Digital Ocean memory constraints
+    this.maxMemoryMB = 1800; // Leave 200MB buffer on 2GB instances
+    this.maxTransactionsPerScan = 100; // Reasonable batch size
+    this.maxProcessingTimeMs = 30000; // 30s timeout for scan cycles
+    this.duplicateCache = new Map(); // LRU cache for processed transactions
+    this.maxCacheSize = 10000; // Keep last 10k transaction signatures
+    
+    // Performance monitoring
+    this.scanMetrics = {
+      totalScans: 0,
+      duplicatesBlocked: 0,
+      memoryBreaks: 0,
+      timeoutBreaks: 0
+    };
+  }
+  
+  /**
+   * Check if transaction was already processed (O(1) lookup)
+   */
+  isDuplicate(signature) {
+    if (this.duplicateCache.has(signature)) {
+      this.scanMetrics.duplicatesBlocked++;
+      return true;
+    }
+    
+    // Add to cache with LRU eviction
+    if (this.duplicateCache.size >= this.maxCacheSize) {
+      const firstKey = this.duplicateCache.keys().next().value;
+      this.duplicateCache.delete(firstKey);
+    }
+    
+    this.duplicateCache.set(signature, Date.now());
+    return false;
+  }
+  
+  /**
+   * Check system resource limits
+   */
+  checkResourceLimits(transactionCount, startTime) {
+    // Memory limit check
+    const memUsage = process.memoryUsage();
+    const memoryMB = memUsage.heapUsed / 1024 / 1024;
+    
+    if (memoryMB > this.maxMemoryMB) {
+      this.scanMetrics.memoryBreaks++;
+      console.log(`🚨 MEMORY CIRCUIT BREAKER: ${memoryMB.toFixed(1)}MB > ${this.maxMemoryMB}MB`);
+      return { break: true, reason: 'memory', value: memoryMB };
+    }
+    
+    // Transaction count limit
+    if (transactionCount > this.maxTransactionsPerScan) {
+      console.log(`🚨 TRANSACTION CIRCUIT BREAKER: ${transactionCount} > ${this.maxTransactionsPerScan}`);
+      return { break: true, reason: 'transaction_count', value: transactionCount };
+    }
+    
+    // Time limit check
+    const elapsedMs = Date.now() - startTime;
+    if (elapsedMs > this.maxProcessingTimeMs) {
+      this.scanMetrics.timeoutBreaks++;
+      console.log(`🚨 TIME CIRCUIT BREAKER: ${elapsedMs}ms > ${this.maxProcessingTimeMs}ms`);
+      return { break: true, reason: 'timeout', value: elapsedMs };
+    }
+    
+    return { break: false };
+  }
+  
+  /**
+   * Get performance metrics for monitoring
+   */
+  getMetrics() {
+    const memUsage = process.memoryUsage();
+    return {
+      ...this.scanMetrics,
+      cacheSize: this.duplicateCache.size,
+      memoryMB: (memUsage.heapUsed / 1024 / 1024).toFixed(1),
+      efficiency: this.scanMetrics.duplicatesBlocked / Math.max(this.scanMetrics.totalScans, 1)
+    };
+  }
+}
 
 /**
  * Validation performance tracker for optimization
@@ -188,11 +272,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     this.lpScannerConfig = options.lpScannerConfig || { enabled: false };
     
     // Initialize circuit breaker for production stability
-    this.circuitBreaker = new RenaissanceCircuitBreaker({
-      maxFailures: 3,           // Trip after 3 failures
-      cooldownMs: 30000,        // 30 second cooldown
-      timeoutMs: 100            // 100ms timeout
-    });
+    this.memeCoinCircuitBreaker = new MemeCoinCircuitBreaker();
     console.log('🛡️ Circuit breaker initialized for meme coin protection');
     
     // Initialize validation metrics for performance tracking
@@ -291,15 +371,6 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       totalScanTime: 0,
       averageProcessingLatency: 0
     };
-
-    // Initialize transaction fetching system
-    this.initializeTransactionFetching();
-    
-    // Initialize ultra-fast token validation system
-    this.initializeUltraFastTokenValidation();
-    
-    // Add cache cleanup timer
-    setInterval(() => this.cleanupTransactionCache(), 60000); // Every minute
   }
 
   /**
@@ -314,346 +385,6 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       measurementNoise: 0.05, // Measurement noise
       lastUpdate: Date.now()
     };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Robust Transaction Detail Fetching
-   * Implements comprehensive error handling, caching, and RPC failover
-   * 
-   * Performance Requirements:
-   * - Fetch success rate: >95%
-   * - Cache hit rate: >80% for repeated requests  
-   * - Failover time: <500ms between RPC endpoints
-   * - Rate limiting: Respect 100 requests/second limits
-   * - Memory usage: <50MB for transaction cache
-   */
-  
-  /**
-   * Initialize transaction cache and RPC management
-   */
-  initializeTransactionFetching() {
-    // Transaction detail cache to prevent repeated RPC calls
-    this.transactionCache = new Map();
-    this.cacheExpiry = 5 * 60 * 1000; // 5 minutes
-    
-    // RPC endpoint rotation for failover
-    this.rpcEndpoints = ['helius', 'chainstack', 'public'];
-    this.currentRpcIndex = 0;
-    this.rpcFailureCount = new Map();
-    
-    // Rate limiting protection
-    this.requestQueue = [];
-    this.processingQueue = false;
-    this.maxConcurrentRequests = 10;
-    this.requestsPerSecond = 80; // Conservative rate limit
-    
-    console.log('✅ Transaction fetching system initialized with caching and failover');
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Enhanced transaction details fetching with comprehensive error handling
-   */
-  async getTransactionDetails(transaction) {
-    const startTime = performance.now();
-    const signature = transaction.signature;
-    
-    if (!signature) {
-      console.log(`❌ Missing transaction signature`);
-      return null;
-    }
-    
-    // CACHE CHECK: Avoid repeated RPC calls
-    const cacheKey = signature;
-    const cached = this.transactionCache.get(cacheKey);
-    if (cached && (Date.now() - cached.timestamp) < this.cacheExpiry) {
-      console.log(`🎯 Cache hit: ${signature.slice(0,8)}... (${(performance.now() - startTime).toFixed(1)}ms)`);
-      return cached.data;
-    }
-    
-    // RATE LIMITING: Queue requests to avoid overwhelming RPC
-    return new Promise((resolve) => {
-      this.requestQueue.push({
-        signature,
-        startTime,
-        resolve,
-        retryCount: 0
-      });
-      
-      this.processRequestQueue();
-    });
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Request queue processing with rate limiting
-   */
-  async processRequestQueue() {
-    if (this.processingQueue || this.requestQueue.length === 0) {
-      return;
-    }
-    
-    this.processingQueue = true;
-    
-    while (this.requestQueue.length > 0) {
-      // Process requests in batches to respect rate limits
-      const batch = this.requestQueue.splice(0, this.maxConcurrentRequests);
-      const batchStartTime = performance.now();
-      
-      // Process batch concurrently
-      const batchPromises = batch.map(request => 
-        this.fetchTransactionWithRetry(request)
-      );
-      
-      await Promise.all(batchPromises);
-      
-      // Rate limiting: Ensure we don't exceed requests per second
-      const batchTime = performance.now() - batchStartTime;
-      const minBatchTime = (batch.length / this.requestsPerSecond) * 1000;
-      const remainingTime = Math.max(0, minBatchTime - batchTime);
-      
-      if (remainingTime > 0) {
-        await this.sleep(remainingTime);
-      }
-    }
-    
-    this.processingQueue = false;
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Transaction fetching with retry logic and RPC failover
-   */
-  async fetchTransactionWithRetry(request) {
-    const { signature, startTime, resolve, retryCount } = request;
-    const maxRetries = 3;
-    
-    try {
-      console.log(`🔍 Fetching transaction: ${signature.slice(0,8)}... (attempt ${retryCount + 1}/${maxRetries + 1})`);
-      
-      // Get current RPC connection with failover support
-      const rpcConnection = this.getCurrentRpcConnection();
-      
-      // Fetch transaction with comprehensive parameters
-      const txDetails = await rpcConnection.getTransaction(signature, {
-        encoding: 'jsonParsed',
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0  // CRITICAL: Support versioned transactions
-      });
-      
-      if (!txDetails) {
-        throw new Error('Transaction not found or null response');
-      }
-      
-      // Validate transaction structure
-      if (!txDetails.transaction || !txDetails.transaction.message) {
-        throw new Error('Invalid transaction structure - missing message');
-      }
-      
-      // CACHE SUCCESS: Store for future requests
-      this.transactionCache.set(signature, {
-        data: txDetails,
-        timestamp: Date.now()
-      });
-      
-      // Clear failure count on success
-      const currentEndpoint = this.rpcEndpoints[this.currentRpcIndex];
-      this.rpcFailureCount.set(currentEndpoint, 0);
-      
-      const fetchTime = performance.now() - startTime;
-      console.log(`✅ Transaction fetched: ${signature.slice(0,8)}... (${fetchTime.toFixed(1)}ms)`);
-      
-      // Performance monitoring
-      if (fetchTime > 5000) { // 5 seconds
-        console.log(`⚠️ SLOW FETCH: Transaction took ${fetchTime.toFixed(1)}ms (target: <1000ms)`);
-      }
-      
-      resolve(txDetails);
-      
-    } catch (error) {
-      console.log(`❌ Transaction fetch failed: ${signature.slice(0,8)}... - ${error.message}`);
-      
-      // Track RPC endpoint failures
-      const currentEndpoint = this.rpcEndpoints[this.currentRpcIndex];
-      const failures = this.rpcFailureCount.get(currentEndpoint) || 0;
-      this.rpcFailureCount.set(currentEndpoint, failures + 1);
-      
-      // RPC FAILOVER: Switch endpoint if too many failures
-      if (failures >= 3) {
-        console.log(`🔄 RPC failover: ${currentEndpoint} → ${this.getNextRpcEndpoint()}`);
-        this.rotateRpcEndpoint();
-      }
-      
-      // RETRY LOGIC: Retry with exponential backoff
-      if (retryCount < maxRetries) {
-        const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 5000); // Max 5 second delay
-        console.log(`🔄 Retrying in ${backoffDelay}ms...`);
-        
-        setTimeout(() => {
-          this.fetchTransactionWithRetry({
-            signature,
-            startTime,
-            resolve,
-            retryCount: retryCount + 1
-          });
-        }, backoffDelay);
-        
-      } else {
-        // FINAL FAILURE: Log detailed error and return null
-        const totalTime = performance.now() - startTime;
-        console.log(`❌ FINAL FAILURE: ${signature.slice(0,8)}... after ${maxRetries + 1} attempts (${totalTime.toFixed(1)}ms)`);
-        console.log(`   Error details: ${error.message}`);
-        console.log(`   RPC endpoint: ${currentEndpoint}`);
-        console.log(`   Failure count: ${this.rpcFailureCount.get(currentEndpoint)}`);
-        
-        resolve(null);
-      }
-    }
-  }
-
-  /**
-   * RENAISSANCE-GRADE: RPC connection management with failover
-   */
-  getCurrentRpcConnection() {
-    const endpointName = this.rpcEndpoints[this.currentRpcIndex];
-    
-    try {
-      // Use the existing RPC manager with call method for consistency
-      // The rpcManager already handles connection pooling internally
-      return {
-        getTransaction: async (signature, options) => {
-          return this.rpcManager.call('getTransaction', [signature, options]);
-        }
-      };
-      
-    } catch (error) {
-      console.log(`⚠️ RPC connection error for ${endpointName}: ${error.message}`);
-      this.rotateRpcEndpoint();
-      
-      // Try fallback connection
-      return {
-        getTransaction: async (signature, options) => {
-          return this.rpcManager.call('getTransaction', [signature, options]);
-        }
-      };
-    }
-  }
-
-  /**
-   * RENAISSANCE-GRADE: RPC endpoint rotation for failover
-   */
-  rotateRpcEndpoint() {
-    const previousEndpoint = this.rpcEndpoints[this.currentRpcIndex];
-    this.currentRpcIndex = (this.currentRpcIndex + 1) % this.rpcEndpoints.length;
-    const newEndpoint = this.rpcEndpoints[this.currentRpcIndex];
-    
-    console.log(`🔄 RPC endpoint rotation: ${previousEndpoint} → ${newEndpoint}`);
-    
-    // Reset failure count for new endpoint
-    this.rpcFailureCount.set(newEndpoint, 0);
-  }
-
-  getNextRpcEndpoint() {
-    const nextIndex = (this.currentRpcIndex + 1) % this.rpcEndpoints.length;
-    return this.rpcEndpoints[nextIndex];
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Cache management and cleanup
-   */
-  cleanupTransactionCache() {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    for (const [signature, entry] of this.transactionCache.entries()) {
-      if (now - entry.timestamp > this.cacheExpiry) {
-        this.transactionCache.delete(signature);
-        cleaned++;
-      }
-    }
-    
-    if (cleaned > 0) {
-      console.log(`🧹 Cleaned ${cleaned} expired cache entries`);
-    }
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Get transaction fetching metrics for monitoring
-   */
-  getTransactionFetchingMetrics() {
-    return {
-      cacheSize: this.transactionCache.size,
-      queueLength: this.requestQueue.length,
-      rpcFailures: Object.fromEntries(this.rpcFailureCount),
-      currentRpcEndpoint: this.rpcEndpoints[this.currentRpcIndex],
-      processingQueue: this.processingQueue,
-      performanceTargets: {
-        maxFetchTime: 1000,     // ms
-        minSuccessRate: 0.95,   // 95%
-        maxCacheSize: 1000,     // entries
-        maxQueueLength: 50      // requests
-      }
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Sub-1ms Token Validation for Meme Coin Trading
-   * 
-   * Performance Requirements:
-   * - Target: <1ms per token validation (51x improvement)
-   * - Cache hit rate: >95% after 5-minute warmup
-   * - Memory usage: <50MB token cache (10,000 tokens)
-   * - Throughput: 1000+ validations/second during viral events
-   * - Error rate: <0.1% for valid tokens
-   * - Meme coin optimized: Aggressive timeouts, permissive fallbacks
-   */
-
-  /**
-   * Initialize ultra-fast token validation system
-   * Call this in constructor after RPC manager initialization
-   */
-  initializeUltraFastTokenValidation() {
-    // High-performance token cache with LRU eviction
-    this.tokenValidationCache = new Map();
-    this.cacheExpiry = 10 * 60 * 1000; // 10 minutes for meme coin volatility
-    this.maxCacheSize = 10000; // 10,000 tokens max
-    
-    // Deduplication queue to prevent concurrent validations
-    this.validationQueue = new Set();
-    this.queueTimeout = 5000; // 5 second queue cleanup
-    
-    // Known tokens for instant 0ms validation
-    this.knownValidTokens = new Set([
-      'So11111111111111111111111111111111111111112', // Wrapped SOL
-      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-      'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // BONK
-      '5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC'  // PEPE
-    ]);
-    
-    // System addresses to instantly reject
-    this.knownInvalidAddresses = new Set([
-      'G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP', // Pump.fun vault
-      'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM', // Pump.fun bonding curve
-      '11111111111111111111111111111111', // System program
-      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // SPL Token program
-      '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM
-      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'  // Pump.fun program
-    ]);
-    
-    // Performance metrics for monitoring
-    this.tokenValidationMetrics = {
-      totalValidations: 0,
-      cacheHits: 0,
-      rpcCalls: 0,
-      averageLatency: 0,
-      errorCount: 0,
-      timeoutCount: 0,
-      memeTokensDetected: 0
-    };
-    
-    console.log('⚡ Ultra-fast token validation initialized');
-    console.log(`📊 Cache: ${this.maxCacheSize} tokens, Known: ${this.knownValidTokens.size} valid, ${this.knownInvalidAddresses.size} invalid`);
-    
-    // Setup periodic cache cleanup
-    this.setupTokenValidationCleanup();
   }
 
   /**
@@ -789,196 +520,111 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
    * Production-grade LP scanning with circuit breakers
    * Optimized for meme coin detection without memory crashes
    */
-  /**
-   * RENAISSANCE-GRADE: Complete Transaction Pipeline Debug & Repair
-   * Instruments every stage of transaction processing to identify pipeline failures
-   * 
-   * Performance Requirements:
-   * - Debug overhead: <5ms per transaction
-   * - Pipeline latency: <100ms end-to-end
-   * - Detection accuracy: 99%+ program ID matching
-   * - Memory footprint: <10MB debug data
-   */
   async scanForNewLPs() {
-    const startTime = performance.now();
-    console.log('🔍 STARTING TRANSACTION PIPELINE DEBUG');
+    const scanStartTime = Date.now();
+    this.memeCoinCircuitBreaker.scanMetrics.totalScans++;
+    
+    console.log('🔍 Scanning for new LP creations...');
     
     try {
-      // STAGE 1: TRANSACTION FETCHING with detailed logging
-      console.log('📊 STAGE 1: FETCHING TRANSACTIONS');
-      const fetchStartTime = performance.now();
-      
+      const allSignatureArrays = [];
       const rpcCallPromises = [];
       
-      // Fetch Raydium transactions
+      // Parallel RPC calls for speed (meme coins need fast detection)
       if (this.lpScannerConfig.enableRaydiumDetection !== false) {
         rpcCallPromises.push(
           this.rpcManager.call('getSignaturesForAddress', [
             '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
             { limit: 20, commitment: 'confirmed' }
-          ], { priority: 'high' }).then(sigs => ({ 
-            source: 'Raydium', 
-            signatures: sigs || [],
-            programId: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'
-          }))
+          ], { priority: 'high' }).then(sigs => ({ source: 'Raydium', signatures: sigs }))
         );
       }
       
-      // Fetch PumpFun transactions
       if (this.lpScannerConfig.enablePumpFunDetection !== false) {
         rpcCallPromises.push(
           this.rpcManager.call('getSignaturesForAddress', [
             '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
             { limit: 20, commitment: 'confirmed' }
-          ], { priority: 'high' }).then(sigs => ({ 
-            source: 'PumpFun', 
-            signatures: sigs || [],
-            programId: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
-          }))
+          ], { priority: 'high' }).then(sigs => ({ source: 'Pump.fun', signatures: sigs }))
         );
       }
       
-      // Fetch Orca transactions
       if (this.lpScannerConfig.enableOrcaDetection !== false) {
         rpcCallPromises.push(
           this.rpcManager.call('getSignaturesForAddress', [
             'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
             { limit: 10, commitment: 'confirmed' }
-          ], { priority: 'high' }).then(sigs => ({ 
-            source: 'Orca', 
-            signatures: sigs || [],
-            programId: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'
-          }))
+          ], { priority: 'high' }).then(sigs => ({ source: 'Orca', signatures: sigs }))
         );
       }
       
+      // Wait for all RPC calls with timeout
       const rpcResults = await Promise.allSettled(rpcCallPromises);
       
-      // Extract results with source tracking
-      const sourceSignatures = {
-        raydium: [],
-        pumpfun: [],
-        orca: []
-      };
-      
+      // Extract successful results
       for (const result of rpcResults) {
-        if (result.status === 'fulfilled' && result.value) {
-          const { source, signatures } = result.value;
-          const key = source.toLowerCase().replace('.', '');
-          sourceSignatures[key] = signatures || [];
+        if (result.status === 'fulfilled' && result.value.signatures) {
+          allSignatureArrays.push(result.value.signatures);
+          console.log(`  📊 Found ${result.value.signatures.length} recent ${result.value.source} transactions`);
         }
       }
       
-      const fetchTime = performance.now() - fetchStartTime;
-      console.log(`  📊 Found ${sourceSignatures.raydium.length} recent Raydium transactions`);
-      console.log(`  📊 Found ${sourceSignatures.pumpfun.length} recent Pump.fun transactions`);
-      console.log(`  📊 Found ${sourceSignatures.orca.length} recent Orca transactions`);
-      console.log(`  ⏱️ Fetch time: ${fetchTime.toFixed(1)}ms`);
+      // Deduplicate signatures across all sources
+      const uniqueSignatures = deduplicateSignatures(allSignatureArrays);
       
-      // STAGE 2: TRANSACTION VALIDATION with detailed analysis
-      console.log('🔍 STAGE 2: TRANSACTION VALIDATION');
-      const validationResults = {
-        raydium: this.validateTransactionBatch(sourceSignatures.raydium, 'Raydium'),
-        pumpfun: this.validateTransactionBatch(sourceSignatures.pumpfun, 'PumpFun'),
-        orca: this.validateTransactionBatch(sourceSignatures.orca, 'Orca')
-      };
+      // Sort by recency for meme coin priority
+      uniqueSignatures.sort((a, b) => (b.blockTime || 0) - (a.blockTime || 0));
       
-      console.log(`  ✅ Raydium valid: ${validationResults.raydium.valid}/${validationResults.raydium.total}`);
-      console.log(`  ✅ PumpFun valid: ${validationResults.pumpfun.valid}/${validationResults.pumpfun.total}`);
-      console.log(`  ✅ Orca valid: ${validationResults.orca.valid}/${validationResults.orca.total}`);
+      console.log(`  📊 Processing ${uniqueSignatures.length} total unique transactions (sorted by recency)`);
       
-      // STAGE 3: DEDUPLICATION with collision analysis
-      console.log('🔍 STAGE 3: DEDUPLICATION');
-      const allTransactions = [
-        ...sourceSignatures.raydium.map(sig => ({ ...sig, source: 'Raydium' })),
-        ...sourceSignatures.pumpfun.map(sig => ({ ...sig, source: 'PumpFun' })),
-        ...sourceSignatures.orca.map(sig => ({ ...sig, source: 'Orca' }))
-      ];
-      
-      const { uniqueTransactions, duplicates, collisionMap } = this.deduplicateTransactionsAdvanced(allTransactions);
-      
-      console.log(`  📊 DEDUP: ${uniqueTransactions.length} unique, ${duplicates.length} duplicates removed`);
-      if (duplicates.length > 0) {
-        console.log(`  ⚠️ Duplicate signatures: ${duplicates.slice(0, 3).join(', ')}${duplicates.length > 3 ? '...' : ''}`);
-      }
-      
-      // STAGE 4: PROGRAM ID EXTRACTION with detailed mapping
-      console.log('🔍 STAGE 4: PROGRAM ID EXTRACTION');
-      const programAnalysis = await this.analyzeProgramDistribution(uniqueTransactions);
-      
-      console.log(`  📊 Program distribution:`);
-      Object.entries(programAnalysis.distribution).forEach(([programId, count]) => {
-        const programName = this.getProgramName(programId);
-        console.log(`    - ${programName}: ${count} transactions (${programId.slice(0,8)}...)`);
-      });
-      
-      // STAGE 5: TRANSACTION PROCESSING with routing visibility
-      console.log('🔍 STAGE 5: TRANSACTION PROCESSING');
-      console.log(`  📊 Processing ${uniqueTransactions.length} total unique transactions (sorted by recency)`);
-      
-      let processedCount = 0;
-      let candidatesGenerated = 0;
-      const routingStats = { raydium: 0, pumpfun: 0, orca: 0, unknown: 0 };
       const candidates = [];
+      let processedCount = 0;
       
-      // Sort by recency
-      uniqueTransactions.sort((a, b) => (b.blockTime || 0) - (a.blockTime || 0));
-      
-      for (const transaction of uniqueTransactions.slice(0, 50)) { // Process up to 50 transactions
-        try {
-          const routingResult = await this.processTransactionWithRouting(transaction, processedCount);
-          
-          if (routingResult) {
-            routingStats[routingResult.dex.toLowerCase()]++;
-            if (routingResult.candidateGenerated && routingResult.candidate) {
-              candidatesGenerated++;
-              candidates.push(routingResult.candidate);
-            }
-          } else {
-            routingStats.unknown++;
+      // Process with circuit breaker protection
+      for (const sigInfo of uniqueSignatures) {
+        const signature = typeof sigInfo === 'string' ? sigInfo : sigInfo.signature;
+        
+        // Circuit breaker check every 10 transactions for performance
+        if (processedCount % 10 === 0) {
+          const circuitCheck = this.memeCoinCircuitBreaker.checkResourceLimits(processedCount, scanStartTime);
+          if (circuitCheck.break) {
+            console.log(`🛑 SCAN TERMINATED: ${circuitCheck.reason} (${circuitCheck.value})`);
+            break;
           }
+        }
+        
+        // Skip if already processed in previous scans
+        if (this.memeCoinCircuitBreaker.isDuplicate(signature)) {
+          continue;
+        }
+        
+        console.log(`🔍 TRANSACTION DEBUG: { signature: '${signature}', processed: ${processedCount} }`);
+        
+        try {
+          // Get transaction with timeout
+          const transaction = await Promise.race([
+            this.rpcManager.call('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Transaction timeout')), 5000))
+          ]);
           
-          processedCount++;
-          
-          // Rate limiting for production stability
-          if (processedCount % 10 === 0) {
-            await this.sleep(1);
+          if (transaction?.transaction?.message?.instructions) {
+            const txCandidates = await this.parseInstructionsForLPCreation(transaction);
+            if (txCandidates?.length > 0) {
+              candidates.push(...txCandidates);
+            }
           }
           
         } catch (error) {
-          console.log(`⚠️ Transaction processing failed: ${transaction.signature?.slice(0,8)}... - ${error.message}`);
-          routingStats.unknown++;
+          console.log(`  ⚠️ Transaction fetch failed: ${signature} (${error.message})`);
         }
+        
+        processedCount++;
       }
       
-      // STAGE 6: PIPELINE SUMMARY with actionable insights
-      const totalTime = performance.now() - startTime;
-      console.log('📊 PIPELINE SUMMARY:');
-      console.log(`  ⏱️ Total time: ${totalTime.toFixed(1)}ms`);
-      console.log(`  📊 Transactions processed: ${processedCount}`);
-      console.log(`  🎯 Candidates generated: ${candidatesGenerated}`);
-      console.log(`  📈 Routing breakdown:`);
-      Object.entries(routingStats).forEach(([dex, count]) => {
-        const percentage = processedCount > 0 ? (count / processedCount * 100).toFixed(1) : '0.0';
-        console.log(`    - ${dex}: ${count} (${percentage}%)`);
-      });
+      const scanDuration = Date.now() - scanStartTime;
+      const metrics = this.memeCoinCircuitBreaker.getMetrics();
       
-      // PERFORMANCE ALERTS
-      if (totalTime > 10000) { // 10 seconds
-        console.log(`🚨 PERFORMANCE ALERT: Pipeline took ${totalTime.toFixed(1)}ms (target: <10000ms)`);
-      }
-      
-      if (routingStats.raydium === 0 && sourceSignatures.raydium.length > 0) {
-        console.log(`🚨 CRITICAL ALERT: Found ${sourceSignatures.raydium.length} Raydium transactions but ZERO routed to parser!`);
-        await this.debugRaydiumRoutingFailure(sourceSignatures.raydium.slice(0, 3));
-      }
-      
-      const pipelineHealth = this.calculatePipelineHealth(routingStats, validationResults);
-      console.log(`📊 SCAN COMPLETE: ${candidatesGenerated} candidates, ${totalTime.toFixed(1)}ms, efficiency: ${(processedCount / (totalTime / 1000) * 60).toFixed(1)}/min`);
-      console.log(`📊 Pipeline Health: ${(pipelineHealth.overall * 100).toFixed(1)}% (${pipelineHealth.status})`);
-      
-      // Update circuit breaker metrics
-      this.circuitBreaker.systemMetrics.totalScans++;
+      console.log(`📊 SCAN COMPLETE: ${candidates.length} candidates, ${scanDuration}ms, efficiency: ${(metrics.efficiency * 100).toFixed(1)}%`);
       
       // Emit candidates for processing
       for (const candidate of candidates) {
@@ -988,8 +634,8 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       return candidates;
       
     } catch (error) {
-      console.error('❌ Pipeline debug failed:', error);
-      throw error;
+      console.error(`❌ SCAN ERROR: ${error.message}`);
+      return [];
     }
   }
 
@@ -2659,146 +2305,53 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
   }
 
   /**
-   * PRODUCTION-READY: Replace existing validateTokenMintUltraFast method
-   * Target: <1ms per token validation (51x improvement from current 51ms)
+   * Renaissance-grade token validation optimized for meme coin speed
+   * Tiered validation: Speed → Confidence → Certainty
+   * Designed for microsecond advantage in meme token trading
    */
   async validateTokenMintUltraFast(address, rpcManager, context = {}) {
-    const startTime = performance.now();
-    this.tokenValidationMetrics.totalValidations++;
+    const startTime = Date.now();
+    let result;
     
-    try {
-      // STAGE 1: INSTANT VALIDATION (0ms) - No network calls
-      const instantResult = this.performInstantTokenValidation(address, context);
-      if (instantResult.certainty === 'high') {
-        this.recordValidationMetric(performance.now() - startTime, 'instant', instantResult.isValid);
-        return instantResult;
-      }
-      
-      // STAGE 2: CACHE LOOKUP (0ms)
-      const cacheResult = this.getCachedTokenValidation(address, context);
-      if (cacheResult) {
-        this.tokenValidationMetrics.cacheHits++;
-        this.recordValidationMetric(performance.now() - startTime, 'cache', cacheResult.isValid);
-        return cacheResult;
-      }
-      
-      // STAGE 3: DEDUPLICATION CHECK (0ms)
-      if (this.validationQueue.has(address)) {
-        const result = {
-          isValid: true,
-          confidence: 0.6,
-          reason: 'validation_in_progress',
-          warning: 'concurrent_validation'
-        };
-        this.recordValidationMetric(performance.now() - startTime, 'dedup', true);
-        return result;
-      }
-      
-      // STAGE 4: ULTRA-FAST RPC VALIDATION (target: <1ms)
-      this.validationQueue.add(address);
-      
-      try {
-        const rpcResult = await this.performUltraFastRpcValidation(address, rpcManager, context);
-        
-        // Cache successful result for future instant access
-        this.cacheTokenValidationResult(address, context, rpcResult);
-        
-        // Add to known tokens if validated
-        if (rpcResult.isValid && rpcResult.confidence >= 0.8) {
-          this.knownValidTokens.add(address);
-          this.tokenValidationMetrics.memeTokensDetected++;
-        }
-        
-        const elapsedMs = performance.now() - startTime;
-        this.recordValidationMetric(elapsedMs, 'rpc', rpcResult.isValid);
-        
-        // Performance alert for Renaissance optimization
-        if (elapsedMs > 1) {
-          console.log(`⚠️ SLOW TOKEN VALIDATION: ${address.slice(0,8)}... took ${elapsedMs.toFixed(1)}ms (target: <1ms)`);
-        }
-        
-        return rpcResult;
-        
-      } finally {
-        this.validationQueue.delete(address);
-      }
-      
-    } catch (error) {
-      this.tokenValidationMetrics.errorCount++;
-      
-      // MEME COIN FALLBACK: Accept on validation errors (new tokens)
-      const fallbackResult = {
-        isValid: true,
-        confidence: 0.3,
-        reason: 'validation_error_fallback',
-        error: error.message,
-        warning: 'assumed_new_meme_token'
-      };
-      
-      this.recordValidationMetric(performance.now() - startTime, 'error', true);
-      return fallbackResult;
-    }
-  }
-
-  /**
-   * STAGE 1: Instant validation (0ms) - No network calls required
-   */
-  performInstantTokenValidation(address, context) {
-    // Format validation
     if (!address || typeof address !== 'string' || address.length !== 44) {
-      return {
-        isValid: false,
-        confidence: 0,
-        certainty: 'high',
-        reason: 'invalid_format'
-      };
+      result = { isValid: false, confidence: 0, reason: 'invalid_format' };
+      this.validationMetrics.recordValidation(result, Date.now() - startTime);
+      return result;
     }
     
-    // Known valid tokens (instant success)
-    if (this.knownValidTokens.has(address)) {
-      return {
-        isValid: true,
-        confidence: 1.0,
-        certainty: 'high',
-        reason: 'known_valid_token',
-        cached: true
-      };
+    // TIER 1: INSTANT VALIDATION (0ms) - Known good/bad addresses
+    const validationResult = this.performInstantValidation(address, context);
+    if (validationResult.certainty === 'high') {
+      this.validationMetrics.recordValidation(validationResult, Date.now() - startTime);
+      return validationResult;
     }
     
-    // Known invalid addresses (instant rejection)
-    if (this.knownInvalidAddresses.has(address)) {
-      return {
-        isValid: false,
-        confidence: 0,
-        certainty: 'high',
-        reason: 'known_invalid_address'
-      };
+    // TIER 2: FAST RPC CHECK (50ms timeout) - Basic existence
+    try {
+      const quickResult = await this.performQuickValidation(address, rpcManager);
+      if (quickResult.isValid || quickResult.confidence >= 0.7) {
+        this.validationMetrics.recordValidation(quickResult, Date.now() - startTime);
+        return quickResult;
+      }
+    } catch (error) {
+      // For meme coins, RPC errors often mean "too new" - proceed with caution
+      console.log(`    ⚡ RPC ERROR (meme token possibly too new): ${address}`);
     }
     
-    // Context-based heuristics for meme coins
-    if (context.source === 'pump_fun') {
-      return {
-        isValid: true,
-        confidence: 0.8,
-        certainty: 'high',
-        reason: 'pump_fun_heuristic'
-      };
-    }
+    // TIER 3: PERMISSIVE FALLBACK - Allow through with lower confidence
+    result = {
+      isValid: true,
+      confidence: 0.3,
+      reason: 'permissive_fallback',
+      warning: 'new_token_minimal_validation'
+    };
     
-    if (context.source === 'raydium' && context.isNonQuoteToken) {
-      return {
-        isValid: true,
-        confidence: 0.75,
-        certainty: 'high',
-        reason: 'raydium_meme_heuristic'
-      };
-    }
-    
-    return { certainty: 'low' };
+    this.validationMetrics.recordValidation(result, Date.now() - startTime);
+    return result;
   }
 
   /**
-   * Old performInstantValidation method - keeping for compatibility
+   * Instant validation using cached data and heuristics
    * Returns high-certainty results in <1ms
    */
   performInstantValidation(address, context) {
@@ -2935,259 +2488,6 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       
       throw error; // Re-throw for higher-level handling
     }
-  }
-
-  /**
-   * STAGE 2: Cache lookup (0ms)
-   */
-  getCachedTokenValidation(address, context) {
-    const cacheKey = `${address}-${context.role || 'default'}`;
-    const cached = this.tokenValidationCache.get(cacheKey);
-    
-    if (cached && (Date.now() - cached.timestamp) < this.cacheExpiry) {
-      return {
-        ...cached.result,
-        cached: true
-      };
-    }
-    
-    return null;
-  }
-
-  /**
-   * STAGE 4: Ultra-fast RPC validation (target: <1ms)
-   */
-  async performUltraFastRpcValidation(address, rpcManager, context) {
-    this.tokenValidationMetrics.rpcCalls++;
-    
-    try {
-      // MEME COIN OPTIMIZED: 2ms timeout for maximum speed
-      const timeoutMs = context.source === 'pump_fun' ? 1 : 2; // Pump.fun gets fastest validation
-      
-      const rpcPromise = this.executeTokenValidationRpc(address, rpcManager);
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => {
-          this.tokenValidationMetrics.timeoutCount++;
-          reject(new Error(`Validation timeout: ${timeoutMs}ms`));
-        }, timeoutMs)
-      );
-      
-      const accountInfo = await Promise.race([rpcPromise, timeoutPromise]);
-      
-      if (!accountInfo?.value) {
-        return {
-          isValid: false,
-          confidence: 0.1,
-          reason: 'account_not_found'
-        };
-      }
-      
-      // FAST TOKEN MINT VALIDATION: Check owner and data structure
-      const isValidTokenMint = 
-        accountInfo.value.owner === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' &&
-        accountInfo.value.data &&
-        accountInfo.value.data[0] &&
-        accountInfo.value.data[0].length >= 80; // Token mint data structure
-      
-      if (isValidTokenMint) {
-        return {
-          isValid: true,
-          confidence: 0.95,
-          reason: 'rpc_validated_token_mint',
-          owner: accountInfo.value.owner,
-          dataLength: accountInfo.value.data[0]?.length || 0
-        };
-      }
-      
-      return {
-        isValid: false,
-        confidence: 0.2,
-        reason: 'not_token_mint',
-        owner: accountInfo.value.owner
-      };
-      
-    } catch (error) {
-      if (error.message.includes('timeout')) {
-        // MEME COIN OPTIMIZATION: Accept timeouts as potential new tokens
-        return {
-          isValid: true,
-          confidence: 0.4,
-          reason: 'timeout_assume_new_meme',
-          warning: 'validation_timeout',
-          timeoutMs: error.message.includes('1ms') ? 1 : 2
-        };
-      }
-      
-      // Network/RPC errors: Be permissive for meme coin opportunities
-      return {
-        isValid: true,
-        confidence: 0.3,
-        reason: 'rpc_error_permissive',
-        error: error.message,
-        warning: 'assumed_new_token'
-      };
-    }
-  }
-
-  /**
-   * Execute actual RPC call with optimized parameters
-   */
-  async executeTokenValidationRpc(address, rpcManager) {
-    return await rpcManager.call('getAccountInfo', [
-      address,
-      {
-        encoding: 'base64',
-        commitment: 'confirmed', // Consistent with transaction fetching
-        dataSlice: { offset: 0, length: 100 } // Only need first 100 bytes for validation
-      }
-    ]);
-  }
-
-  /**
-   * Cache validation result for future instant access
-   */
-  cacheTokenValidationResult(address, context, result) {
-    const cacheKey = `${address}-${context.role || 'default'}`;
-    
-    // LRU eviction if cache is full
-    if (this.tokenValidationCache.size >= this.maxCacheSize) {
-      const firstKey = this.tokenValidationCache.keys().next().value;
-      this.tokenValidationCache.delete(firstKey);
-    }
-    
-    this.tokenValidationCache.set(cacheKey, {
-      result: result,
-      timestamp: Date.now()
-    });
-  }
-
-  /**
-   * Record performance metrics for monitoring
-   */
-  recordValidationMetric(latencyMs, type, success) {
-    this.tokenValidationMetrics.averageLatency = 
-      ((this.tokenValidationMetrics.averageLatency * (this.tokenValidationMetrics.totalValidations - 1)) + latencyMs) / 
-      this.tokenValidationMetrics.totalValidations;
-    
-    // Performance alerting
-    if (type === 'rpc' && latencyMs > 1) {
-      console.log(`⚠️ RPC validation slow: ${latencyMs.toFixed(1)}ms (target: <1ms)`);
-    }
-    
-    if (type === 'rpc' && latencyMs > 5) {
-      console.log(`🚨 CRITICAL: RPC validation very slow: ${latencyMs.toFixed(1)}ms`);
-    }
-  }
-
-  /**
-   * Setup periodic cache cleanup and metrics reporting
-   */
-  setupTokenValidationCleanup() {
-    // Cache cleanup every 5 minutes
-    setInterval(() => {
-      this.cleanupTokenValidationCache();
-    }, 5 * 60 * 1000);
-    
-    // Validation queue cleanup every 30 seconds
-    setInterval(() => {
-      if (this.validationQueue.size > 0) {
-        console.log(`🧹 Clearing ${this.validationQueue.size} stuck validations`);
-        this.validationQueue.clear();
-      }
-    }, 30000);
-    
-    // Performance metrics reporting every 2 minutes
-    setInterval(() => {
-      this.reportTokenValidationMetrics();
-    }, 2 * 60 * 1000);
-  }
-
-  /**
-   * Clean up expired cache entries
-   */
-  cleanupTokenValidationCache() {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    for (const [key, entry] of this.tokenValidationCache.entries()) {
-      if (now - entry.timestamp > this.cacheExpiry) {
-        this.tokenValidationCache.delete(key);
-        cleaned++;
-      }
-    }
-    
-    if (cleaned > 0) {
-      console.log(`🧹 Token validation cache cleanup: ${cleaned} expired entries removed`);
-    }
-  }
-
-  /**
-   * Report performance metrics for monitoring
-   */
-  reportTokenValidationMetrics() {
-    const metrics = this.tokenValidationMetrics;
-    const cacheHitRate = metrics.totalValidations > 0 ? 
-      (metrics.cacheHits / metrics.totalValidations * 100).toFixed(1) : '0.0';
-    const timeoutRate = metrics.totalValidations > 0 ? 
-      (metrics.timeoutCount / metrics.totalValidations * 100).toFixed(1) : '0.0';
-    const errorRate = metrics.totalValidations > 0 ? 
-      (metrics.errorCount / metrics.totalValidations * 100).toFixed(1) : '0.0';
-    
-    console.log(`📊 TOKEN VALIDATION METRICS:`);
-    console.log(`  Total validations: ${metrics.totalValidations}`);
-    console.log(`  Cache hit rate: ${cacheHitRate}% (target: >95%)`);
-    console.log(`  Average latency: ${metrics.averageLatency.toFixed(1)}ms (target: <1ms)`);
-    console.log(`  RPC calls: ${metrics.rpcCalls}`);
-    console.log(`  Timeout rate: ${timeoutRate}% (target: <5%)`);
-    console.log(`  Error rate: ${errorRate}% (target: <0.1%)`);
-    console.log(`  Meme tokens detected: ${metrics.memeTokensDetected}`);
-    console.log(`  Cache size: ${this.tokenValidationCache.size}/${this.maxCacheSize}`);
-    console.log(`  Known tokens: ${this.knownValidTokens.size}`);
-    
-    // Performance alerts
-    if (parseFloat(cacheHitRate) < 80) {
-      console.log(`🚨 LOW CACHE HIT RATE: ${cacheHitRate}% (target: >95%)`);
-    }
-    
-    if (metrics.averageLatency > 1) {
-      console.log(`🚨 HIGH LATENCY: ${metrics.averageLatency.toFixed(1)}ms (target: <1ms)`);
-    }
-    
-    if (parseFloat(timeoutRate) > 10) {
-      console.log(`🚨 HIGH TIMEOUT RATE: ${timeoutRate}% (target: <5%)`);
-    }
-  }
-
-  /**
-   * Get token validation performance metrics for external monitoring
-   */
-  getTokenValidationMetrics() {
-    const metrics = this.tokenValidationMetrics;
-    return {
-      performance: {
-        totalValidations: metrics.totalValidations,
-        averageLatency: metrics.averageLatency,
-        cacheHitRate: metrics.totalValidations > 0 ? metrics.cacheHits / metrics.totalValidations : 0,
-        timeoutRate: metrics.totalValidations > 0 ? metrics.timeoutCount / metrics.totalValidations : 0,
-        errorRate: metrics.totalValidations > 0 ? metrics.errorCount / metrics.totalValidations : 0
-      },
-      cache: {
-        size: this.tokenValidationCache.size,
-        maxSize: this.maxCacheSize,
-        utilization: this.tokenValidationCache.size / this.maxCacheSize,
-        knownTokens: this.knownValidTokens.size
-      },
-      targets: {
-        maxLatency: 1.0,        // ms
-        minCacheHitRate: 0.95,  // 95%
-        maxTimeoutRate: 0.05,   // 5%
-        maxErrorRate: 0.001     // 0.1%
-      },
-      memeCoins: {
-        detected: metrics.memeTokensDetected,
-        queueSize: this.validationQueue.size
-      }
-    };
   }
 
   /**
@@ -3349,15 +2649,8 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
    * Target: <25ms analysis time for meme coin opportunities
    */
   /**
-   * RENAISSANCE-GRADE: Complete Raydium Instruction Analysis
-   * Supports all 10 discovered discriminators with discriminator-aware processing
-   * 
-   * Performance Requirements:
-   * - Analysis time: <20ms per instruction
-   * - Validation time: <50ms per token pair
-   * - Total signal generation: <100ms end-to-end
-   * - Throughput: 1000+ tokens/minute during viral events
-   * - Success rate: 90%+ on valid LP creations
+   * RENAISSANCE-GRADE: Complete Raydium discriminator support with live analysis
+   * Handles all known LP creation variants + unknown discriminator analysis
    */
   async analyzeRaydiumInstructionDebug(discriminatorHex, instructionData, accounts, accountKeys, instructionIndex, analysisMetrics, signature = null) {
     const startTime = performance.now();
@@ -3366,93 +2659,40 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     console.log(`      - Discriminator: 0x${discriminatorHex}`);
     console.log(`      - Data length: ${instructionData.length} bytes`);
     console.log(`      - Account count: ${accounts.length}`);
-    console.log(`      - Signature: ${signature?.slice(0,8) || 'unknown'}...`);
+    console.log(`      - Expected accounts: ≥16 for LP creation`);
     
-    // PRODUCTION COMPLETE: All 10 discriminators from Claude Code analysis
-    const RAYDIUM_DISCRIMINATOR_MAP = {
-      // LP CREATION INSTRUCTIONS (6 variants)
-      'e7': {
-        type: 'initialize2',
-        category: 'lp_creation',
-        confidence: 0.95,
-        minAccounts: 19,
-        avgAccounts: 19.2,
-        description: 'Standard LP creation (most common)'
-      },
-      'e8': {
-        type: 'initialize',
-        category: 'lp_creation', 
-        confidence: 0.90,
-        minAccounts: 18,
-        avgAccounts: 18.1,
-        description: 'Original LP creation format'
-      },
-      'e9': {
-        type: 'initialize3',
-        category: 'lp_creation',
-        confidence: 0.85,
-        minAccounts: 18, 
-        avgAccounts: 18.8,
-        description: 'Third LP creation variant'
-      },
-      'ea': {
-        type: 'initializeV4',
-        category: 'lp_creation',
-        confidence: 0.80,
-        minAccounts: 20,
-        avgAccounts: 20.3,
-        description: 'V4 AMM initialization'
-      },
-      'eb': {
-        type: 'initializeV5',
-        category: 'lp_creation',
-        confidence: 0.75,
-        minAccounts: 21,
-        avgAccounts: 21.0,
-        description: 'V5 AMM initialization'
-      },
-      'f8': {
-        type: 'createPool',
-        category: 'lp_creation',
-        confidence: 0.88,
-        minAccounts: 16,
-        avgAccounts: 16.5,
-        description: 'Direct pool creation'
-      },
-      
-      // NON-LP INSTRUCTIONS (4 variants - filter out)
-      '09': {
-        type: 'swap',
-        category: 'trading',
-        confidence: 0.0,
-        description: 'Token swap (not LP creation)'
-      },
-      'cc': {
-        type: 'deposit',
-        category: 'liquidity',
-        confidence: 0.0,
-        description: 'Liquidity deposit (not creation)'
-      },
-      'e3': {
-        type: 'withdraw',
-        category: 'liquidity',
-        confidence: 0.0,
-        description: 'Liquidity withdrawal (not creation)'
-      },
-      'dd': {
-        type: 'route',
-        category: 'routing',
-        confidence: 0.0,
-        description: 'Route instruction (not LP creation)'
-      }
+    // PRODUCTION VERIFIED: Complete Raydium discriminator mapping from mainnet analysis
+    const raydiumDiscriminators = {
+      'e7': 'initialize2',    // Standard LP creation (most common)
+      'e8': 'initialize',     // Alternative LP creation format
+      'e9': 'initialize3',    // NEW: Third LP creation variant (production detected)
+      'ea': 'initializeV4',   // V4 AMM initialization
+      'eb': 'initializeV5',   // V5 AMM initialization
+      '09': 'swap',           // Swap instruction (filter out)
+      'cc': 'deposit',        // Deposit instruction (filter out)
+      'e3': 'withdraw',       // Withdraw instruction (filter out)
+      'f8': 'createPool'      // Pool creation instruction
     };
     
-    const discriminatorInfo = RAYDIUM_DISCRIMINATOR_MAP[discriminatorHex];
+    const instructionType = raydiumDiscriminators[discriminatorHex];
+    console.log(`      - Instruction type: ${instructionType || 'analyzing_unknown'}`);
     
-    if (!discriminatorInfo) {
-      console.log(`    🔍 UNKNOWN DISCRIMINATOR: 0x${discriminatorHex} - applying heuristics`);
+    // LIVE DISCRIMINATOR ANALYSIS for unknown types
+    if (!instructionType) {
+      console.log(`    🔍 UNKNOWN DISCRIMINATOR ANALYSIS: 0x${discriminatorHex}`);
       
-      // HEURISTIC ANALYSIS for unknown discriminators
+      // Capture for analysis
+      const unknownData = {
+        discriminator: discriminatorHex,
+        signature: signature || 'unknown',
+        accountCount: accounts.length,
+        dataLength: instructionData.length,
+        timestamp: Date.now()
+      };
+      
+      console.log(`    📊 UNKNOWN PATTERN: accounts=${accounts.length}, data=${instructionData.length}bytes`);
+      
+      // Heuristic analysis for LP creation patterns
       const isLikelyLPCreation = (
         accounts.length >= 16 &&           // Minimum accounts for LP
         accounts.length <= 25 &&           // Maximum reasonable accounts
@@ -3461,33 +2701,36 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       );
       
       if (isLikelyLPCreation) {
-        console.log(`    🎯 HEURISTIC: Likely LP creation - proceeding with fallback analysis`);
-        // Record for future discriminator mapping
-        this.recordUnknownDiscriminator(discriminatorHex, accounts.length, instructionData.length, signature);
+        console.log(`    🎯 HEURISTIC: Likely LP creation - proceeding with analysis`);
+        // Store for future discriminator mapping updates
+        this.recordUnknownDiscriminator(unknownData);
+        // Continue analysis using initialize2 layout as fallback
+        const fallbackType = 'initialize2_heuristic';
+        return this.analyzeRaydiumWithLayout(discriminatorHex, fallbackType, instructionData, accounts, accountKeys, startTime);
       } else {
         const elapsedMs = performance.now() - startTime;
         console.log(`    ❌ RAYDIUM: Unknown discriminator rejected by heuristics (${elapsedMs.toFixed(1)}ms)`);
         return null;
       }
-    } else {
-      console.log(`    ✅ DISCRIMINATOR RECOGNIZED: ${discriminatorInfo.type} (${discriminatorInfo.description})`);
-      
-      // Filter out non-LP creation instructions immediately
-      if (discriminatorInfo.category !== 'lp_creation') {
-        const elapsedMs = performance.now() - startTime;
-        console.log(`    ❌ RAYDIUM: Not LP creation - ${discriminatorInfo.category} instruction (${elapsedMs.toFixed(1)}ms)`);
-        return null;
-      }
-      
-      // Validate account count against expected minimum
-      if (accounts.length < discriminatorInfo.minAccounts) {
-        const elapsedMs = performance.now() - startTime;
-        console.log(`    ❌ RAYDIUM: Insufficient accounts for ${discriminatorInfo.type} (${accounts.length} < ${discriminatorInfo.minAccounts}) (${elapsedMs.toFixed(1)}ms)`);
-        return null;
-      }
     }
     
-    // INSTRUCTION DATA VALIDATION
+    // Filter out non-LP creation instructions
+    const lpCreationTypes = ['initialize', 'initialize2', 'initialize3', 'initializeV4', 'initializeV5', 'createPool'];
+    if (!lpCreationTypes.includes(instructionType)) {
+      const elapsedMs = performance.now() - startTime;
+      console.log(`    ❌ RAYDIUM: Not LP creation instruction (${instructionType}) (${elapsedMs.toFixed(1)}ms)`);
+      return null;
+    }
+    
+    // ACCOUNT STRUCTURE VALIDATION with discriminator-specific requirements
+    const minAccounts = this.getMinAccountsForDiscriminator(discriminatorHex);
+    if (accounts.length < minAccounts) {
+      const elapsedMs = performance.now() - startTime;
+      console.log(`    ❌ RAYDIUM: Insufficient accounts for ${instructionType} (${accounts.length} < ${minAccounts}) (${elapsedMs.toFixed(1)}ms)`);
+      return null;
+    }
+    
+    // INSTRUCTION DATA LENGTH VALIDATION
     if (instructionData.length < 8) {
       const elapsedMs = performance.now() - startTime;
       console.log(`    ❌ RAYDIUM: Insufficient data length (${instructionData.length} < 8) (${elapsedMs.toFixed(1)}ms)`);
@@ -3496,108 +2739,8 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
     
     console.log(`    ✅ RAYDIUM: Structure validation passed`);
     
-    // DISCRIMINATOR-AWARE TOKEN EXTRACTION
-    console.log(`    🔍 EXTRACTING TOKEN MINTS (DISCRIMINATOR-AWARE):`);
-    const extractionResult = this.extractRaydiumTokenMintsAdvanced(accounts, accountKeys, discriminatorHex, discriminatorInfo, signature);
-    
-    if (!extractionResult) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`    ❌ RAYDIUM: Token extraction failed (${elapsedMs.toFixed(1)}ms)`);
-      return null;
-    }
-    
-    const { primaryToken, secondaryToken, ammId, extractionMethod, confidence } = extractionResult;
-    console.log(`    ✅ RAYDIUM: Tokens extracted via ${extractionMethod} (confidence: ${confidence})`);
-    
-    // ULTRA-FAST TOKEN VALIDATION (Renaissance performance requirement)
-    const validationStartTime = performance.now();
-    const [primaryResult, secondaryResult] = await Promise.all([
-      this.validateTokenMintUltraFast(primaryToken, this.rpcManager, {
-        source: 'raydium',
-        role: 'primary',
-        discriminator: discriminatorHex,
-        isNonQuoteToken: !this.isKnownQuoteToken(primaryToken)
-      }),
-      this.validateTokenMintUltraFast(secondaryToken, this.rpcManager, {
-        source: 'raydium', 
-        role: 'secondary',
-        discriminator: discriminatorHex
-      })
-    ]);
-    const validationTime = performance.now() - validationStartTime;
-    
-    console.log(`    ⚡ VALIDATION: primary=${primaryResult.confidence.toFixed(2)} secondary=${secondaryResult.confidence.toFixed(2)} (${validationTime.toFixed(1)}ms)`);
-    
-    // PERFORMANCE MONITORING: Alert if validation exceeds target
-    if (validationTime > 50) {
-      console.log(`    ⚠️ PERFORMANCE ALERT: Token validation took ${validationTime.toFixed(1)}ms (target: <50ms)`);
-    }
-    
-    // TIERED VALIDATION with discriminator-specific confidence scoring
-    const baseConfidence = discriminatorInfo?.confidence || 0.5;
-    const validationBonus = (primaryResult.confidence + secondaryResult.confidence) * 0.5;
-    const finalConfidence = Math.min((baseConfidence * 20) + (validationBonus * 10), 20);
-    
-    // TIER 1: High confidence (immediate acceptance)
-    if (primaryResult.isValid && primaryResult.confidence >= 0.3 && 
-        secondaryResult.isValid && secondaryResult.confidence >= 0.2) {
-      
-      console.log(`    ✅ RAYDIUM HIGH CONFIDENCE: primary=${primaryToken} secondary=${secondaryToken} (confidence: ${finalConfidence.toFixed(1)})`);
-      
-      const elapsedMs = performance.now() - startTime;
-      const candidate = this.createRaydiumCandidateAdvanced(
-        primaryToken, secondaryToken, ammId, finalConfidence, 
-        primaryResult, secondaryResult, validationTime, 
-        discriminatorHex, discriminatorInfo, false, elapsedMs
-      );
-      
-      // Performance tracking
-      this.recordRaydiumAnalysisMetric(discriminatorHex, elapsedMs, 'high_confidence', true);
-      return candidate;
-    }
-    
-    // TIER 2: Medium confidence (cautious acceptance)
-    if (primaryResult.isValid && primaryResult.confidence >= 0.1 && 
-        secondaryResult.isValid && secondaryResult.confidence >= 0.15) {
-      
-      const mediumConfidence = Math.max(finalConfidence * 0.8, 8);
-      console.log(`    ⚠️ RAYDIUM MEDIUM CONFIDENCE: primary=${primaryToken} secondary=${secondaryToken} (confidence: ${mediumConfidence.toFixed(1)})`);
-      
-      const elapsedMs = performance.now() - startTime;
-      const candidate = this.createRaydiumCandidateAdvanced(
-        primaryToken, secondaryToken, ammId, mediumConfidence,
-        primaryResult, secondaryResult, validationTime,
-        discriminatorHex, discriminatorInfo, false, elapsedMs
-      );
-      
-      this.recordRaydiumAnalysisMetric(discriminatorHex, elapsedMs, 'medium_confidence', true);
-      return candidate;
-    }
-    
-    // TIER 3: Permissive mode (meme coin hunting)
-    if ((primaryResult.confidence >= 0.05 || secondaryResult.confidence >= 0.25) && 
-        (primaryResult.confidence + secondaryResult.confidence >= 0.15)) {
-      
-      const permissiveConfidence = Math.max(finalConfidence * 0.6, 5);
-      console.log(`    🟡 RAYDIUM PERMISSIVE: Potential meme opportunity (confidence: ${permissiveConfidence.toFixed(1)})`);
-      
-      const elapsedMs = performance.now() - startTime;
-      const candidate = this.createRaydiumCandidateAdvanced(
-        primaryToken, secondaryToken, ammId, permissiveConfidence,
-        primaryResult, secondaryResult, validationTime,
-        discriminatorHex, discriminatorInfo, true, elapsedMs
-      );
-      
-      this.recordRaydiumAnalysisMetric(discriminatorHex, elapsedMs, 'permissive', true);
-      return candidate;
-    }
-    
-    // TIER 4: Rejection with detailed logging
-    const elapsedMs = performance.now() - startTime;
-    console.log(`    ❌ RAYDIUM REJECTED: All tiers failed - primary=${primaryResult.confidence.toFixed(2)}, secondary=${secondaryResult.confidence.toFixed(2)} (${elapsedMs.toFixed(1)}ms)`);
-    
-    this.recordRaydiumAnalysisMetric(discriminatorHex, elapsedMs, 'rejected', false);
-    return null;
+    // Proceed with layout-specific analysis
+    return this.analyzeRaydiumWithLayout(discriminatorHex, instructionType, instructionData, accounts, accountKeys, startTime);
   }
 
   /**
@@ -3836,431 +2979,6 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       instructionType: instructionName,
       discriminator: discriminatorHex,
       quoteName: quoteName
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Advanced Token Extraction with Discriminator-Aware Layouts
-   * Handles all 6 LP creation discriminator variants with optimized account mapping
-   */
-  extractRaydiumTokenMintsAdvanced(accounts, accountKeys, discriminatorHex, discriminatorInfo = null, signature = null) {
-    const startTime = performance.now();
-    
-    console.log(`      🔍 ADVANCED RAYDIUM TOKEN EXTRACTION:`);
-    console.log(`        - Discriminator: 0x${discriminatorHex}`);
-    console.log(`        - Account count: ${accounts.length}`);
-    console.log(`        - AccountKeys length: ${accountKeys.length}`);
-    
-    // DISCRIMINATOR-SPECIFIC ACCOUNT LAYOUTS (from Claude Code analysis)
-    const ACCOUNT_LAYOUTS = {
-      'e7': {
-        name: 'INITIALIZE2',
-        TOKEN_PROGRAM: 0,
-        SYSTEM_PROGRAM: 1,
-        RENT_SYSVAR: 2,
-        AMM_ID: 4,              // Pool at position 4
-        AMM_AUTHORITY: 5,
-        AMM_OPEN_ORDERS: 6,
-        AMM_LP_MINT: 7,
-        AMM_COIN_MINT: 8,       // Token A at position 8
-        AMM_PC_MINT: 9,         // Token B at position 9
-        AMM_COIN_VAULT: 10,
-        AMM_PC_VAULT: 11,
-        minAccounts: 19
-      },
-      'e8': {
-        name: 'INITIALIZE',
-        TOKEN_PROGRAM: 0,
-        SYSTEM_PROGRAM: 1,
-        RENT_SYSVAR: 2,
-        AMM_ID: 3,              // Pool at position 3
-        AMM_AUTHORITY: 4,
-        AMM_OPEN_ORDERS: 5,
-        AMM_LP_MINT: 6,
-        AMM_COIN_MINT: 7,       // Token A at position 7
-        AMM_PC_MINT: 8,         // Token B at position 8
-        AMM_COIN_VAULT: 9,
-        AMM_PC_VAULT: 10,
-        minAccounts: 18
-      },
-      'e9': {
-        name: 'INITIALIZE3',
-        TOKEN_PROGRAM: 0,
-        SYSTEM_PROGRAM: 1,
-        RENT_SYSVAR: 2,
-        AMM_ID: 3,              // Pool at position 3 (same as e8)
-        AMM_AUTHORITY: 4,
-        AMM_OPEN_ORDERS: 5,
-        AMM_LP_MINT: 6,
-        AMM_COIN_MINT: 7,       // Token A at position 7 (same as e8)
-        AMM_PC_MINT: 8,         // Token B at position 8 (same as e8)
-        AMM_COIN_VAULT: 9,
-        AMM_PC_VAULT: 10,
-        minAccounts: 18
-      },
-      'ea': {
-        name: 'INITIALIZEV4',
-        TOKEN_PROGRAM: 0,
-        SYSTEM_PROGRAM: 1,
-        RENT_SYSVAR: 2,
-        AMM_ID: 5,              // Pool at position 5
-        AMM_AUTHORITY: 6,
-        AMM_OPEN_ORDERS: 7,
-        AMM_LP_MINT: 8,
-        AMM_COIN_MINT: 9,       // Token A at position 9
-        AMM_PC_MINT: 10,        // Token B at position 10
-        AMM_COIN_VAULT: 11,
-        AMM_PC_VAULT: 12,
-        minAccounts: 20
-      },
-      'eb': {
-        name: 'INITIALIZEV5',
-        TOKEN_PROGRAM: 0,
-        SYSTEM_PROGRAM: 1,
-        RENT_SYSVAR: 2,
-        AMM_ID: 6,              // Pool at position 6
-        AMM_AUTHORITY: 7,
-        AMM_OPEN_ORDERS: 8,
-        AMM_LP_MINT: 9,
-        AMM_COIN_MINT: 10,      // Token A at position 10
-        AMM_PC_MINT: 11,        // Token B at position 11
-        AMM_COIN_VAULT: 12,
-        AMM_PC_VAULT: 13,
-        minAccounts: 21
-      },
-      'f8': {
-        name: 'CREATEPOOL',
-        TOKEN_PROGRAM: 0,
-        SYSTEM_PROGRAM: 1,
-        RENT_SYSVAR: 2,
-        AMM_ID: 3,              // Pool at position 3
-        AMM_AUTHORITY: 4,
-        AMM_LP_MINT: 5,
-        AMM_COIN_MINT: 6,       // Token A at position 6
-        AMM_PC_MINT: 7,         // Token B at position 7
-        AMM_COIN_VAULT: 8,
-        AMM_PC_VAULT: 9,
-        minAccounts: 16
-      }
-    };
-    
-    // SELECT LAYOUT based on discriminator
-    let layout = ACCOUNT_LAYOUTS[discriminatorHex];
-    let extractionMethod = 'layout_based';
-    
-    if (!layout) {
-      console.log(`        ⚠️ Unknown discriminator 0x${discriminatorHex} - using heuristic extraction`);
-      return this.extractRaydiumTokensHeuristic(accounts, accountKeys, discriminatorHex, startTime);
-    }
-    
-    console.log(`        - Layout: ${layout.name}`);
-    console.log(`        - Min accounts: ${layout.minAccounts}`);
-    
-    // BOUNDS VALIDATION
-    if (accounts.length < layout.minAccounts) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`        ❌ Insufficient accounts: ${accounts.length} < ${layout.minAccounts} (${elapsedMs.toFixed(1)}ms)`);
-      return null;
-    }
-    
-    // EXTRACT ACCOUNT INDICES
-    const coinMintIndex = accounts[layout.AMM_COIN_MINT];
-    const pcMintIndex = accounts[layout.AMM_PC_MINT];
-    const ammIdIndex = accounts[layout.AMM_ID];
-    
-    console.log(`        - Coin mint index: ${coinMintIndex} (position ${layout.AMM_COIN_MINT})`);
-    console.log(`        - PC mint index: ${pcMintIndex} (position ${layout.AMM_PC_MINT})`);
-    console.log(`        - AMM ID index: ${ammIdIndex} (position ${layout.AMM_ID})`);
-    
-    // VALIDATE INDICES
-    if (coinMintIndex === undefined || pcMintIndex === undefined || ammIdIndex === undefined) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`        ❌ Missing account indices (${elapsedMs.toFixed(1)}ms)`);
-      return this.extractRaydiumTokensHeuristic(accounts, accountKeys, discriminatorHex, startTime);
-    }
-    
-    if (coinMintIndex >= accountKeys.length || pcMintIndex >= accountKeys.length || ammIdIndex >= accountKeys.length) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`        ❌ Account indices out of bounds (${elapsedMs.toFixed(1)}ms)`);
-      return this.extractRaydiumTokensHeuristic(accounts, accountKeys, discriminatorHex, startTime);
-    }
-    
-    // EXTRACT ADDRESSES
-    const coinMint = this.extractAddressString(accountKeys[coinMintIndex]);
-    const pcMint = this.extractAddressString(accountKeys[pcMintIndex]);
-    const ammId = this.extractAddressString(accountKeys[ammIdIndex]);
-    
-    if (!coinMint || !pcMint || !ammId) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`        ❌ Failed to extract addresses (${elapsedMs.toFixed(1)}ms)`);
-      return this.extractRaydiumTokensHeuristic(accounts, accountKeys, discriminatorHex, startTime);
-    }
-    
-    console.log(`        - Coin mint: ${coinMint}`);
-    console.log(`        - PC mint: ${pcMint}`);
-    console.log(`        - AMM ID: ${ammId}`);
-    
-    // DUPLICATE ADDRESS DETECTION with intelligent handling
-    if (coinMint === pcMint || coinMint === ammId || pcMint === ammId) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`        ⚠️ Duplicate addresses detected - switching to heuristic extraction (${elapsedMs.toFixed(1)}ms)`);
-      return this.extractRaydiumTokensHeuristic(accounts, accountKeys, discriminatorHex, startTime);
-    }
-    
-    // QUOTE TOKEN IDENTIFICATION
-    const KNOWN_QUOTE_TOKENS = new Map([
-      ['So11111111111111111111111111111111111111112', 'SOL'],
-      ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'USDC'],
-      ['Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 'USDT'],
-      ['DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', 'BONK'],
-      ['5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC', 'PEPE']
-    ]);
-    
-    let primaryToken, secondaryToken, quoteName;
-    
-    if (KNOWN_QUOTE_TOKENS.has(pcMint)) {
-      primaryToken = coinMint;     // Likely meme token
-      secondaryToken = pcMint;     // Known quote token
-      quoteName = KNOWN_QUOTE_TOKENS.get(pcMint);
-      console.log(`        ✅ Quote pair: meme=${primaryToken.slice(0,8)}..., quote=${quoteName}`);
-    } else if (KNOWN_QUOTE_TOKENS.has(coinMint)) {
-      primaryToken = pcMint;       // Likely meme token  
-      secondaryToken = coinMint;   // Known quote token
-      quoteName = KNOWN_QUOTE_TOKENS.get(coinMint);
-      console.log(`        ✅ Quote pair: meme=${primaryToken.slice(0,8)}..., quote=${quoteName}`);
-    } else {
-      primaryToken = coinMint;     // Default assignment
-      secondaryToken = pcMint;
-      quoteName = 'Unknown';
-      console.log(`        ⚠️ Unknown pair: coin=${primaryToken.slice(0,8)}..., pc=${secondaryToken.slice(0,8)}...`);
-    }
-    
-    // PERFORMANCE MONITORING
-    const elapsedMs = performance.now() - startTime;
-    console.log(`        ✅ Layout extraction successful (${elapsedMs.toFixed(1)}ms)`);
-    
-    if (elapsedMs > 10) {
-      console.log(`        ⚠️ PERFORMANCE ALERT: Extraction took ${elapsedMs.toFixed(1)}ms (target: <10ms)`);
-    }
-    
-    return {
-      primaryToken,
-      secondaryToken,
-      ammId,
-      confidence: 'high',
-      extractionMethod,
-      source: `raydium_${layout.name.toLowerCase()}`,
-      extractionTime: elapsedMs,
-      discriminator: discriminatorHex,
-      quoteName,
-      layoutUsed: layout.name
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Heuristic Token Extraction (fallback for unknown patterns)
-   */
-  extractRaydiumTokensHeuristic(accounts, accountKeys, discriminatorHex, startTime) {
-    console.log(`        🔍 HEURISTIC EXTRACTION (fallback mode)`);
-    
-    // Build address frequency map
-    const addressFreq = {};
-    const uniqueAddresses = [];
-    
-    accounts.forEach(accountIndex => {
-      if (accountIndex < accountKeys.length) {
-        const address = this.extractAddressString(accountKeys[accountIndex]);
-        if (address) {
-          addressFreq[address] = (addressFreq[address] || 0) + 1;
-          if (addressFreq[address] === 1) {
-            uniqueAddresses.push(address);
-          }
-        }
-      }
-    });
-    
-    // Known programs to exclude
-    const PROGRAM_ADDRESSES = new Set([
-      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-      '11111111111111111111111111111111111111111112',
-      'SysvarRent111111111111111111111111111111111',
-      '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
-      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
-      'ComputeBudget111111111111111111111111111111'
-    ]);
-    
-    const QUOTE_TOKENS = new Map([
-      ['So11111111111111111111111111111111111111112', 'SOL'],
-      ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'USDC'],
-      ['Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 'USDT']
-    ]);
-    
-    // Filter out programs
-    const nonProgramAddresses = uniqueAddresses.filter(addr => !PROGRAM_ADDRESSES.has(addr));
-    
-    // Find quote token
-    const quoteToken = nonProgramAddresses.find(addr => QUOTE_TOKENS.has(addr));
-    const potentialMemeTokens = nonProgramAddresses.filter(addr => 
-      !QUOTE_TOKENS.has(addr) && addressFreq[addr] === 1
-    );
-    const potentialPools = nonProgramAddresses.filter(addr => 
-      !QUOTE_TOKENS.has(addr) && addressFreq[addr] > 1
-    );
-    
-    if (!quoteToken || potentialMemeTokens.length === 0) {
-      const elapsedMs = performance.now() - startTime;
-      console.log(`        ❌ Heuristic extraction failed: quote=${!!quoteToken}, meme=${potentialMemeTokens.length} (${elapsedMs.toFixed(1)}ms)`);
-      return null;
-    }
-    
-    const primaryToken = potentialMemeTokens[0];
-    const secondaryToken = quoteToken;
-    const ammId = potentialPools.length > 0 ? potentialPools[0] : nonProgramAddresses[0];
-    const quoteName = QUOTE_TOKENS.get(quoteToken);
-    
-    const elapsedMs = performance.now() - startTime;
-    console.log(`        ✅ Heuristic extraction: meme=${primaryToken.slice(0,8)}..., quote=${quoteName} (${elapsedMs.toFixed(1)}ms)`);
-    
-    return {
-      primaryToken,
-      secondaryToken,
-      ammId,
-      confidence: 'medium',
-      extractionMethod: 'heuristic',
-      source: `raydium_heuristic_${discriminatorHex}`,
-      extractionTime: elapsedMs,
-      discriminator: discriminatorHex,
-      quoteName,
-      layoutUsed: 'HEURISTIC'
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Enhanced candidate creation with discriminator info
-   */
-  createRaydiumCandidateAdvanced(primaryToken, secondaryToken, ammId, confidence, primaryResult, secondaryResult, validationTime, discriminatorHex, discriminatorInfo, isPermissive, totalTime) {
-    return {
-      source: 'raydium',
-      discriminator: discriminatorHex,
-      instructionType: discriminatorInfo?.type || 'unknown',
-      primaryToken,
-      secondaryToken,
-      ammId,
-      confidence,
-      isPermissive,
-      validation: {
-        primary: {
-          isValid: primaryResult.isValid,
-          confidence: primaryResult.confidence,
-          supply: primaryResult.supply,
-          decimals: primaryResult.decimals
-        },
-        secondary: {
-          isValid: secondaryResult.isValid,
-          confidence: secondaryResult.confidence,
-          supply: secondaryResult.supply,
-          decimals: secondaryResult.decimals
-        },
-        validationTime
-      },
-      performance: {
-        totalAnalysisTime: totalTime,
-        validationTime,
-        extractionTime: totalTime - validationTime
-      },
-      metadata: {
-        discriminatorConfidence: discriminatorInfo?.confidence || 0.5,
-        avgAccountsForType: discriminatorInfo?.avgAccounts || 0,
-        timestamp: Date.now()
-      }
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Performance and unknown discriminator tracking
-   */
-  recordRaydiumAnalysisMetric(discriminator, elapsedMs, result, success) {
-    if (!this.raydiumMetrics) {
-      this.raydiumMetrics = {
-        discriminatorStats: new Map(),
-        performanceStats: {
-          totalAnalyses: 0,
-          successfulAnalyses: 0,
-          averageLatency: 0,
-          maxLatency: 0
-        }
-      };
-    }
-    
-    // Update discriminator stats
-    if (!this.raydiumMetrics.discriminatorStats.has(discriminator)) {
-      this.raydiumMetrics.discriminatorStats.set(discriminator, {
-        count: 0,
-        successCount: 0,
-        avgLatency: 0,
-        results: new Map()
-      });
-    }
-    
-    const discStats = this.raydiumMetrics.discriminatorStats.get(discriminator);
-    discStats.count++;
-    if (success) discStats.successCount++;
-    discStats.avgLatency = ((discStats.avgLatency * (discStats.count - 1)) + elapsedMs) / discStats.count;
-    
-    if (!discStats.results.has(result)) {
-      discStats.results.set(result, 0);
-    }
-    discStats.results.set(result, discStats.results.get(result) + 1);
-    
-    // Update performance stats
-    const perfStats = this.raydiumMetrics.performanceStats;
-    perfStats.totalAnalyses++;
-    if (success) perfStats.successfulAnalyses++;
-    perfStats.averageLatency = ((perfStats.averageLatency * (perfStats.totalAnalyses - 1)) + elapsedMs) / perfStats.totalAnalyses;
-    perfStats.maxLatency = Math.max(perfStats.maxLatency, elapsedMs);
-    
-    // Performance alerts
-    if (elapsedMs > 100) {
-      console.log(`    🚨 LATENCY ALERT: Raydium analysis took ${elapsedMs.toFixed(1)}ms (target: <100ms)`);
-    }
-  }
-
-  recordUnknownDiscriminator(discriminator, accountCount, dataLength, signature) {
-    if (!this.unknownDiscriminators) {
-      this.unknownDiscriminators = [];
-    }
-    
-    this.unknownDiscriminators.push({
-      discriminator,
-      accountCount,
-      dataLength,
-      signature: signature || 'unknown',
-      timestamp: Date.now()
-    });
-    
-    console.log(`    📊 UNKNOWN DISCRIMINATOR: 0x${discriminator} recorded (total unknown: ${this.unknownDiscriminators.length})`);
-  }
-
-  isKnownQuoteToken(address) {
-    return ['So11111111111111111111111111111111111111112', 
-            'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-            'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'].includes(address);
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Get performance metrics for monitoring
-   */
-  getRaydiumAnalysisMetrics() {
-    return {
-      discriminatorStats: this.raydiumMetrics?.discriminatorStats || new Map(),
-      performanceStats: this.raydiumMetrics?.performanceStats || {},
-      unknownDiscriminators: this.unknownDiscriminators || [],
-      performanceTargets: {
-        maxAnalysisTime: 100,     // ms
-        maxValidationTime: 50,    // ms  
-        minSuccessRate: 0.90,     // 90%
-        targetThroughput: 1000    // analyses/minute
-      }
     };
   }
 
@@ -5164,7 +3882,10 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       // Check if we have transaction info
       if (candidate.transactionId) {
         try {
-          const tx = await this.getTransactionDetails({ signature: candidate.transactionId });
+          const tx = await this.rpcManager.call('getTransaction', [
+            candidate.transactionId,
+            { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
+          ]);
           
           if (tx && tx.transaction && tx.transaction.message) {
             // Get the fee payer (usually the deployer)
@@ -5210,7 +3931,10 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
       
       for (const sigInfo of recentTxSample) {
         try {
-          const tx = await this.getTransactionDetails(sigInfo);
+          const tx = await this.rpcManager.call('getTransaction', [
+            sigInfo.signature,
+            { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
+          ]);
           
           if (!tx || !tx.transaction) continue;
           
@@ -5462,8 +4186,14 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
    */
   async getTransactionWithInstructions(signature) {
     try {
-      // Use the new getTransactionDetails method with retry logic
-      const response = await this.getTransactionDetails({ signature });
+      // Simple RPC call without blocking logs
+      const response = await this.rpcManager.call('getTransaction', [signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+        encoding: 'jsonParsed'
+      }], {
+        priority: 'high'
+      });
       
       return response;
       
@@ -6135,7 +4865,7 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
   async analyzeRaydiumWithLayout(discriminatorHex, instructionType, instructionData, accounts, accountKeys, startTime) {
     // TOKEN MINT EXTRACTION with discriminator-aware logic
     console.log(`    🔍 EXTRACTING TOKEN MINTS:`);
-    const extractionResult = this.extractRaydiumTokenMintsAdvanced(accounts, accountKeys, discriminatorHex);
+    const extractionResult = this.extractRaydiumTokenMintsDebug(accounts, accountKeys, discriminatorHex);
     
     if (!extractionResult) {
       const elapsedMs = performance.now() - startTime;
@@ -6253,6 +4983,24 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
   }
 
   /**
+   * RENAISSANCE-GRADE: Unknown discriminator tracking
+   */
+  recordUnknownDiscriminator(data) {
+    if (!this.unknownDiscriminators) {
+      this.unknownDiscriminators = [];
+    }
+    
+    this.unknownDiscriminators.push(data);
+    
+    console.log(`    📊 UNKNOWN DISCRIMINATOR RECORDED: 0x${data.discriminator} (total: ${this.unknownDiscriminators.length})`);
+    
+    // Keep only last 100 unknown discriminators
+    if (this.unknownDiscriminators.length > 100) {
+      this.unknownDiscriminators = this.unknownDiscriminators.slice(-100);
+    }
+  }
+
+  /**
    * Get unknown discriminator analysis data
    */
   getUnknownDiscriminatorReport() {
@@ -6288,372 +5036,6 @@ export class LiquidityPoolCreationDetectorService extends EventEmitter {
         .map(([disc, data]) => ({ discriminator: disc, ...data }))
         .sort((a, b) => b.count - a.count)
     };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Advanced transaction deduplication with collision analysis
-   */
-  deduplicateTransactionsAdvanced(transactions) {
-    const signatureMap = new Map();
-    const duplicates = [];
-    const collisionMap = new Map();
-    
-    transactions.forEach(tx => {
-      const signature = tx.signature;
-      if (signatureMap.has(signature)) {
-        duplicates.push(signature);
-        
-        // Track collision sources
-        const existing = signatureMap.get(signature);
-        const collision = `${existing.source}_vs_${tx.source}`;
-        collisionMap.set(collision, (collisionMap.get(collision) || 0) + 1);
-      } else {
-        signatureMap.set(signature, tx);
-      }
-    });
-    
-    return {
-      uniqueTransactions: Array.from(signatureMap.values()),
-      duplicates,
-      collisionMap
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Program distribution analysis
-   */
-  async analyzeProgramDistribution(transactions) {
-    const distribution = {};
-    const unknownPrograms = new Set();
-    
-    for (const tx of transactions) {
-      // Get transaction details to analyze instructions
-      try {
-        const txDetails = await this.getTransactionDetails(tx);
-        
-        if (txDetails?.transaction?.message?.instructions) {
-          const accountKeys = txDetails.transaction.message.accountKeys || [];
-          const instructions = txDetails.transaction.message.instructions;
-          
-          instructions.forEach(instruction => {
-            // Handle different instruction formats
-            let programId;
-            if (instruction.programId) {
-              programId = instruction.programId.toString();
-            } else if (typeof instruction.programIdIndex === 'number' && accountKeys[instruction.programIdIndex]) {
-              programId = accountKeys[instruction.programIdIndex].toString();
-            }
-            
-            if (programId) {
-              distribution[programId] = (distribution[programId] || 0) + 1;
-              
-              if (!this.isKnownProgram(programId)) {
-                unknownPrograms.add(programId);
-              }
-            }
-          });
-        }
-      } catch (error) {
-        // Skip failed transactions
-        console.log(`    ⚠️ Failed to analyze transaction ${tx.signature?.slice(0,8)}...`);
-      }
-    }
-    
-    return {
-      distribution,
-      unknownPrograms: Array.from(unknownPrograms),
-      totalInstructions: Object.values(distribution).reduce((a, b) => a + b, 0)
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Enhanced transaction processing with robust error handling
-   */
-  async processTransactionWithRouting(transaction, processIndex) {
-    if (!transaction.signature) {
-      console.log(`⚠️ Transaction ${processIndex}: Missing signature`);
-      return null;
-    }
-    
-    console.log(`🔍 TRANSACTION DEBUG: { signature: '${transaction.signature}', processed: ${processIndex} }`);
-    
-    try {
-      // ROBUST TRANSACTION FETCHING with retry logic
-      const txDetails = await this.getTransactionDetails(transaction);
-      
-      if (!txDetails) {
-        console.log(`⚠️ Transaction ${processIndex}: Failed to fetch details after all retries`);
-        return null;
-      }
-      
-      // VALIDATE TRANSACTION STRUCTURE
-      if (!txDetails.transaction || !txDetails.transaction.message) {
-        console.log(`⚠️ Transaction ${processIndex}: Invalid transaction structure`);
-        return null;
-      }
-      
-      // Process each instruction with program routing
-      const instructions = txDetails.transaction?.message?.instructions || [];
-      const accountKeys = txDetails.transaction?.message?.accountKeys || [];
-      
-      console.log(`  🔬 Parsing ${instructions.length} binary instructions`);
-      
-      if (instructions.length === 0) {
-        console.log(`  ⚠️ Transaction ${processIndex}: No instructions found`);
-        return null;
-      }
-      
-      // PROCESS INSTRUCTIONS with enhanced routing
-      for (let i = 0; i < instructions.length; i++) {
-        const instruction = instructions[i];
-        
-        // Get program ID from instruction
-        let programIdString;
-        if (instruction.programId) {
-          programIdString = instruction.programId.toString();
-        } else if (typeof instruction.programIdIndex === 'number' && accountKeys[instruction.programIdIndex]) {
-          if (instruction.programIdIndex >= accountKeys.length) {
-            console.log(`    ⚠️ Invalid program ID index ${instruction.programIdIndex} (max: ${accountKeys.length - 1})`);
-            continue;
-          }
-          const programId = accountKeys[instruction.programIdIndex];
-          programIdString = programId?.toString() || programId;
-        }
-        
-        // ENHANCED LOGGING: Show every program ID we encounter
-        console.log(`    🔍 INSTRUCTION ${i}: program=${programIdString?.slice(0,12)}...`);
-        
-        // Route to appropriate analyzer based on program ID
-        const routingResult = await this.routeInstructionToAnalyzer(
-          programIdString,
-          instruction,
-          accountKeys,
-          i,
-          transaction.signature
-        );
-        
-        if (routingResult && routingResult.candidateGenerated) {
-          console.log(`    ✅ ROUTED: ${routingResult.dex} analysis - candidate generated`);
-          return routingResult;
-        } else if (routingResult) {
-          console.log(`    ✅ ROUTED: ${routingResult.dex} analysis - no candidate`);
-          // Continue to check other instructions for known DEX programs
-        }
-      }
-      
-      console.log(`  📊 Binary parsing complete: 0 candidates from ${instructions.length} instructions`);
-      return null;
-      
-    } catch (error) {
-      console.log(`❌ Transaction processing error: ${error.message}`);
-      console.log(`   Stack: ${error.stack?.split('\n')[0]}`);
-      return null;
-    }
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Instruction routing with comprehensive program detection
-   */
-  async routeInstructionToAnalyzer(programId, instruction, accountKeys, instructionIndex, signature) {
-    if (!programId) {
-      console.log(`    ⚠️ Missing program ID for instruction ${instructionIndex}`);
-      return null;
-    }
-    
-    // PRODUCTION PROGRAM ROUTING MAP
-    const PROGRAM_ROUTING_MAP = {
-      '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': {
-        dex: 'Raydium',
-        analyzer: 'analyzeRaydiumInstructionDebug',
-        priority: 'high'
-      },
-      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P': {
-        dex: 'PumpFun', 
-        analyzer: 'analyzePumpFunInstructionDebug',
-        priority: 'critical'
-      },
-      'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': {
-        dex: 'Orca',
-        analyzer: 'analyzeOrcaInstructionDebug', 
-        priority: 'medium'
-      }
-    };
-    
-    const routing = PROGRAM_ROUTING_MAP[programId];
-    
-    if (routing) {
-      console.log(`    🎯 ROUTING TO ${routing.dex.toUpperCase()} ANALYSIS`);
-      
-      try {
-        // Extract instruction data and normalize accounts
-        const instructionData = Buffer.from(instruction.data || '', 'base64');
-        const discriminatorHex = instructionData.length > 0 ? 
-          instructionData[0].toString(16).padStart(2, '0') : 'empty';
-        
-        // Normalize accounts - handle both index and address formats
-        let normalizedAccounts = instruction.accounts;
-        if (instruction.accounts && instruction.accounts.length > 0) {
-          if (typeof instruction.accounts[0] === 'string') {
-            normalizedAccounts = instruction.accounts.map(addr => {
-              const index = accountKeys.findIndex(key => 
-                (typeof key === 'string' ? key : key.pubkey) === addr
-              );
-              return index >= 0 ? index : 0;
-            });
-          }
-        }
-        
-        // Call the appropriate analyzer
-        const result = await this[routing.analyzer](
-          discriminatorHex,
-          instructionData, 
-          normalizedAccounts,
-          accountKeys,
-          instructionIndex,
-          {}, // analysisMetrics
-          signature
-        );
-        
-        if (result) {
-          console.log(`    ✅ CANDIDATE GENERATED: ${routing.dex} (${performance.now()}ms)`);
-          return {
-            dex: routing.dex,
-            candidateGenerated: true,
-            candidate: result
-          };
-        } else {
-          console.log(`    ❌ NO CANDIDATE: ${routing.dex} analysis returned null`);
-          return {
-            dex: routing.dex, 
-            candidateGenerated: false
-          };
-        }
-        
-      } catch (error) {
-        console.log(`    ❌ ${routing.dex} analysis failed: ${error.message}`);
-        return null;
-      }
-    } else {
-      // Handle unknown programs
-      const programName = this.getProgramName(programId) || `${programId.slice(0,8)}...`;
-      console.log(`    ⚡ UNKNOWN PROGRAM: ${programName} (using fallback parsing)`);
-      
-      return {
-        dex: 'Unknown',
-        candidateGenerated: false
-      };
-    }
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Raydium routing failure debugging
-   */
-  async debugRaydiumRoutingFailure(sampleTransactions) {
-    console.log('🚨 DEBUGGING RAYDIUM ROUTING FAILURE');
-    
-    for (let i = 0; i < Math.min(3, sampleTransactions.length); i++) {
-      const tx = sampleTransactions[i];
-      console.log(`🔍 RAYDIUM SAMPLE ${i + 1}: ${tx.signature?.slice(0,8)}...`);
-      
-      try {
-        const txDetails = await this.getTransactionDetails(tx);
-        
-        if (!txDetails) {
-          console.log(`  ❌ Failed to fetch transaction details`);
-          continue;
-        }
-        
-        const instructions = txDetails.transaction?.message?.instructions || [];
-        const accountKeys = txDetails.transaction?.message?.accountKeys || [];
-        
-        console.log(`  📊 Instructions: ${instructions.length}`);
-        console.log(`  📊 Account keys: ${accountKeys.length}`);
-        
-        instructions.forEach((instruction, idx) => {
-          let programIdString;
-          if (instruction.programId) {
-            programIdString = instruction.programId.toString();
-          } else if (typeof instruction.programIdIndex === 'number' && accountKeys[instruction.programIdIndex]) {
-            const programId = accountKeys[instruction.programIdIndex];
-            programIdString = programId?.toString() || programId;
-          }
-          
-          console.log(`    Instruction ${idx}: ${programIdString}`);
-          
-          if (programIdString === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8') {
-            console.log(`    ✅ FOUND RAYDIUM PROGRAM ID!`);
-            const instructionData = Buffer.from(instruction.data || '', 'base64');
-            const discriminator = instructionData.length > 0 ? 
-              instructionData[0].toString(16).padStart(2, '0') : 'empty';
-            console.log(`    📊 Discriminator: 0x${discriminator}`);
-            console.log(`    📊 Data length: ${instructionData.length}`);
-            console.log(`    📊 Account count: ${instruction.accounts.length}`);
-          }
-        });
-        
-      } catch (error) {
-        console.log(`  ❌ Debug analysis failed: ${error.message}`);
-      }
-    }
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Transaction validation batch processing
-   */
-  validateTransactionBatch(transactions, source) {
-    let valid = 0;
-    const total = transactions.length;
-    
-    transactions.forEach(tx => {
-      if (tx.signature && tx.signature.length === 88) { // Valid Solana signature length
-        valid++;
-      }
-    });
-    
-    return { valid, total, source };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Pipeline health calculation
-   */
-  calculatePipelineHealth(routingStats, validationResults) {
-    const totalRouted = Object.values(routingStats).reduce((a, b) => a + b, 0);
-    const totalFetched = Object.values(validationResults).reduce((result, batch) => result + batch.total, 0);
-    
-    const routingEfficiency = totalFetched > 0 ? (totalRouted / totalFetched) : 0;
-    const raydiumHealth = routingStats.raydium > 0 ? 1.0 : 0.0;
-    
-    return {
-      overall: (routingEfficiency + raydiumHealth) / 2,
-      routingEfficiency,
-      raydiumHealth,
-      status: raydiumHealth > 0 ? 'healthy' : 'critical'
-    };
-  }
-
-  /**
-   * RENAISSANCE-GRADE: Enhanced program name mapping
-   */
-  getProgramName(programId) {
-    const PROGRAM_NAMES = {
-      '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': 'Raydium_AMM_V4',
-      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P': 'PumpFun',
-      'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': 'Orca_Whirlpool',
-      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA': 'Token_Program',
-      '11111111111111111111111111111111111111111112': 'System_Program',
-      'ComputeBudget111111111111111111111111111111': 'ComputeBudget_Program',
-      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL': 'AssociatedToken_Program'
-    };
-    
-    return PROGRAM_NAMES[programId] || null;
-  }
-
-  isKnownProgram(programId) {
-    return this.getProgramName(programId) !== null;
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 

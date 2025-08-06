@@ -1,0 +1,15 @@
+{
+  "discriminatorSummary": {},
+  "accountLayoutPatterns": {},
+  "tokenExtractionRules": {},
+  "validationFindings": {
+    "missingDiscriminators": [],
+    "incorrectAccountLayouts": [],
+    "recommendations": [
+      "Implement dynamic discriminator detection for all discovered variants",
+      "Replace static account layouts with position-flexible extraction",
+      "Add heuristic fallbacks for unknown account structures",
+      "Implement address frequency analysis for pool identification"
+    ]
+  }
+}
