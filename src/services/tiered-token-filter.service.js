@@ -80,11 +80,13 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         this.lastQueueCleanup = Date.now();
         
         this.stats = {
-            processed: 0,
+            partialFailures: 0,            processed: 0,
             freshGemsDetected: 0,
             establishedPassed: 0,
             technicalRejections: 0,
             organicRejections: 0,
+            endpointRotations: 0,
+            rateLimitHits: 0,
             securityRejections: 0
         };
     }
@@ -119,8 +121,8 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
     /**
      * Validate token with retry logic to handle RPC propagation delays
      */
-    async validateTokenWithRetry(tokenMint, validationType = 'both', maxRetries = 3) {
-        const delays = [100, 200, 400]; // Progressive delays in ms
+    async validateTokenWithRetry(tokenMint, validationType = 'both', maxRetries = 5) {
+        const delays = [100, 500, 1500, 4000, 8000]; // Progressive delays in ms
         
         // Prevent duplicate requests
         const queueKey = `${tokenMint}-${validationType}`;
@@ -137,16 +139,21 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         // Trigger queue cleanup if needed
         this.cleanupValidationQueue();
         
+        // Initialize data object outside retry loop
+        const data = {};
+        let hasSuccess = false;
+        
         try {
             for (let i = 0; i < maxRetries; i++) {
                 try {
                     // Add delay before each attempt (except first)
                     if (i > 0) {
-                        await new Promise(resolve => setTimeout(resolve, delays[i-1]));
                         // Rotate RPC endpoint on retry
                         if (this.rpcManager?.rotateEndpoint) {
                             await this.rpcManager.rotateEndpoint();
+                            this.stats.endpointRotations++;
                         }
+                        await new Promise(resolve => setTimeout(resolve, delays[Math.min(i-1, delays.length-1)]));
                     }
                     
                     // Prepare promises based on validation type
@@ -172,8 +179,6 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                     const results = await Promise.allSettled(promises);
                     
                     // Process results
-                    const data = {};
-                    let hasSuccess = false;
                     
                     for (const result of results) {
                         if (result.status === 'fulfilled' && result.value.result) {
@@ -192,14 +197,30 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                     }
                     
                 } catch (error) {
-                    console.log(`🔄 Token validation retry ${i + 1}/${maxRetries} for ${tokenMint}: ${error.message}`);
+                    // Handle rate limiting specifically
+                    if (error.status === 429 || error.code === "RATE_LIMITED") {
+                        const rateLimitDelay = Math.min(2000 * Math.pow(2, i), 30000);
+                        console.log(`⏳ Rate limited, waiting ${rateLimitDelay}ms before retry ${i + 1}/${maxRetries}`);
+                        await new Promise(resolve => setTimeout(resolve, rateLimitDelay));
+                        this.stats.rateLimitHits = (this.stats.rateLimitHits || 0) + 1;
+                        continue; // Skip normal retry delay for rate limits
+                    }
+                    console.log(`🔄 RPC error detected, rotating endpoint: ${error.message}`);
+                    console.log(`🔄 Token validation retry ${i + 1}/5 (${delays[Math.min(i-1, delays.length-1)]}ms delay) for ${tokenMint}: ${error.message}`);
                     if (i === maxRetries - 1) {
                         return { success: false, error: `All retries failed: ${error.message}` };
                     }
                 }
             }
             
-            return { success: false, error: 'Max retries reached without success' };
+            // Check if we have partial data
+            if (!hasSuccess && !data.supply && !data.accounts) {
+                return { success: false, error: 'Max retries reached without success' };
+            }
+            
+            // Return partial success
+            this.stats.partialFailures++;
+            return { success: true, data: data, partial: true };
             
         } finally {
             // Always clean up queue entry
@@ -237,6 +258,12 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             }
 
             console.log(`  🔍 Processing token: ${tokenAddress}`);
+            
+            // Check if token is graduating (pump.fun to DEX transition)
+            if (tokenCandidate.lpValueUSD > 80000 && tokenCandidate.lpValueUSD < 90000) {
+                // Token is graduating - wait 2 seconds for RPC consistency
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
             
             // Get comprehensive token metrics with fallback methods
             const tokenMetrics = await this.gatherComprehensiveMetricsFixed(tokenCandidate);
@@ -331,7 +358,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                 lpValueUSD: parseFloat(tokenCandidate.lpValueUSD || tokenCandidate.liquidityUSD || 0),
                 largestHolderPercentage: parseFloat(tokenCandidate.largestHolderPercentage || 50),
                 uniqueWallets: parseInt(tokenCandidate.uniqueWallets || 10),
-                buyToSellRatio: parseFloat(tokenCandidate.buyToSellRatio || 1.0),
+                buyToSellRatio: this.calculateSafeBuyToSellRatio(tokenCandidate.buyToSellRatio),
                 avgTransactionSpread: tokenCandidate.avgTransactionSpread || 60,
                 transactionSizeVariation: tokenCandidate.transactionSizeVariation || 0.5,
                 volumeToLiquidityRatio: 0.1,
@@ -342,6 +369,16 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             
             // Try to get token metadata with multiple methods
             const metadata = await this.fetchTokenMetadataRobust(tokenMint, tokenCandidate);
+            
+            // Use cached data if fresh fetch partially failed
+            if (metadata?.partial) {
+                const cachedData = this.getCachedMetadata(tokenMint);
+                if (cachedData) {
+                    console.log(`📋 Using cached data due to partial RPC failure`);
+                    return { ...cachedData, ...metadata, cached: true };
+                }
+            }
+            
             if (metadata) {
                 metrics = { ...metrics, ...metadata };
             }
@@ -349,9 +386,9 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             // Calculate volume to liquidity ratio if we have the data
             if (metrics.lpValueUSD > 0 && tokenCandidate.volume24h) {
                 const volume24h = parseFloat(tokenCandidate.volume24h || 0);
-            if (metrics.lpValueUSD > 0 && volume24h > 0) {
-                metrics.volumeToLiquidityRatio = volume24h / metrics.lpValueUSD;
-            }
+                if (metrics.lpValueUSD > 0 && volume24h > 0) {
+                    metrics.volumeToLiquidityRatio = volume24h / metrics.lpValueUSD;
+                }
             }
             
             return metrics;
@@ -413,28 +450,42 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         
         // Method 2: Try getTokenSupply with retry logic
         const supplyResult = await this.validateTokenWithRetry(tokenMint, 'supply');
-        if (supplyResult.success && supplyResult.data?.supply) {
-            metadata.supply = parseInt(supplyResult.data.supply.amount);
-            metadata.decimals = parseInt(supplyResult.data.supply.decimals) || 9;
+        if (supplyResult?.success && supplyResult.data?.supply) {
+            const amount = supplyResult.data.supply.amount;
+            const decimals = supplyResult.data.supply.decimals;
+            const uiAmount = supplyResult.data.supply.uiAmount;
+            
+            // Safe integer parsing with NaN protection
+            metadata.supply = (amount && !isNaN(parseInt(amount))) ? parseInt(amount) : 0;
+            metadata.decimals = (decimals && !isNaN(parseInt(decimals))) ? parseInt(decimals) : 9;
             metadata.isInitialized = true;
-            console.log(`  ✅ Got token supply: ${supplyResult.data.supply.uiAmount}`);
+            
+            console.log(`  ✅ Got token supply: ${uiAmount || 'unknown'}`);
         } else {
-            console.log(`  ⚠️ getTokenSupply failed after retries: ${supplyResult.error}`);
+            const errorMsg = supplyResult?.error || 'Invalid supply result structure';
+            console.log(`  ⚠️ getTokenSupply failed after retries: ${errorMsg}`);
         }
         
         // Method 3: Try to get holder distribution with retry logic
         const accountsResult = await this.validateTokenWithRetry(tokenMint, 'accounts');
         if (accountsResult.success && accountsResult.data?.accounts?.value) {
             const largestAccounts = accountsResult.data.accounts;
-            if (largestAccounts.value && largestAccounts.value.length > 0) {
+            // Verify value is actually an array
+            if (Array.isArray(largestAccounts.value) && largestAccounts.value.length > 0) {
                 const metadataSupply = parseInt(metadata.supply) || 0;
-            const calculatedSupply = 
-                    largestAccounts.value.reduce((sum, acc) => sum + parseInt(acc.amount), 0);
+                const calculatedSupply = 
+                    largestAccounts.value.reduce((sum, acc) => {
+                        const amount = parseInt(acc?.amount || '0');
+                        return sum + (isNaN(amount) ? 0 : amount);
+                    }, 0);
                 const totalSupply = metadataSupply || calculatedSupply;
                 
-                if (totalSupply > 0) {
+                if (totalSupply > 0 && largestAccounts.value[0]) {
                     const largestHolder = largestAccounts.value[0];
-                    metadata.largestHolderPercentage = (Number(largestHolder.amount) / totalSupply) * 100;
+                    const holderAmount = parseInt(largestHolder?.amount || '0');
+                    if (!isNaN(holderAmount)) {
+                        metadata.largestHolderPercentage = (holderAmount / totalSupply) * 100;
+                    }
                     metadata.uniqueWallets = Math.max(largestAccounts.value.length, 
                         tokenCandidate.uniqueWallets || 10);
                     console.log(`  ✅ Got holder distribution: ${largestAccounts.value.length} holders`);
@@ -587,28 +638,83 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         }
     }
 
+    /**
+     * Calculate buy-to-sell ratio with division by zero protection
+     * Fresh tokens with only buys get capped at 100 instead of Infinity
+     */
+    calculateSafeBuyToSellRatio(ratio) {
+        // Handle NaN as input directly
+        if (ratio !== ratio) { // NaN check
+            return 100; // Cap at 100 for invalid calculations
+        }
+        
+        // Handle various input formats
+        if (!ratio && ratio !== 0) return 1.0; // Default for missing data
+        
+        const ratioNum = parseFloat(ratio);
+        
+        // Handle NaN, Infinity, or invalid values
+        if (isNaN(ratioNum) || !isFinite(ratioNum)) {
+            return 100; // Cap at 100 for fresh tokens with no sells
+        }
+        
+        // Cap extremely high ratios at 100
+        if (ratioNum > 100) {
+            return 100;
+        }
+        
+        // Ensure non-negative
+        return Math.max(0, ratioNum);
+    }
+
     // Copy other evaluation methods from original...
     async evaluateFreshGem(tokenMetrics) {
         try {
             // Use existing risk modules if available
             if (this.scamProtectionEngine && this.liquidityRiskAnalyzer && this.marketCapRiskFilter) {
-                const [scamResult, liquidityResult, marketCapResult] = await Promise.all([
-                    this.scamProtectionEngine.analyzeToken(tokenMetrics.address, tokenMetrics),
-                    this.liquidityRiskAnalyzer.validateExitLiquidity(tokenMetrics.address, tokenMetrics),
-                    this.marketCapRiskFilter.filterByMarketCap(tokenMetrics, "fresh_gem")
+                // Add timeout protection to prevent infinite hangs
+                const moduleTimeout = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Risk module timeout')), 5000);
+                });
+
+                const modulePromises = Promise.all([
+                    this.scamProtectionEngine.analyzeToken(tokenMetrics.address, tokenMetrics).catch(e => null),
+                    this.liquidityRiskAnalyzer.validateExitLiquidity(tokenMetrics.address, tokenMetrics).catch(e => null),
+                    this.marketCapRiskFilter.filterByMarketCap(tokenMetrics, "fresh_gem").catch(e => null)
                 ]);
+
+                const [scamResult, liquidityResult, marketCapResult] = await Promise.race([
+                    modulePromises,
+                    moduleTimeout
+                ]).catch(error => {
+                    console.log('⚠️ Risk modules failed/timeout, using fallback logic');
+                    return [null, null, null];
+                });
+                
+                // Check if any modules returned null and trigger fallback
+                if (!scamResult || !liquidityResult || !marketCapResult) {
+                    console.log('⚠️ One or more risk modules failed, using fallback logic');
+                    return this.evaluateFreshGemFallback(tokenMetrics);
+                }
+                
+                // Validate results and combine safely
+                const scamSafe = scamResult && typeof scamResult.isScam === 'boolean' ? !scamResult.isScam : false;
+                const liquiditySafe = liquidityResult && typeof liquidityResult.hasExitLiquidity === 'boolean' ? liquidityResult.hasExitLiquidity : false;
+                const marketCapSafe = marketCapResult && typeof marketCapResult.passed === 'boolean' ? marketCapResult.passed : false;
                 
                 // Keep unique organic activity analysis
                 const organicCheck = this.checkOrganicActivity(tokenMetrics);
                 
                 // Combine results
-                const passed = !scamResult.isScam && liquidityResult.hasExitLiquidity && marketCapResult.passed && organicCheck.passed;
-                const overallScore = passed ? (scamResult.confidence + (liquidityResult.slippage || 0) + organicCheck.score) / 3 : 0;
+                const passed = scamSafe && liquiditySafe && marketCapSafe && organicCheck.passed;
+                const scamConfidence = scamResult?.confidence || 0;
+                const liquiditySlippage = liquidityResult?.slippage || 0;
+                const overallScore = passed ? (scamConfidence + liquiditySlippage + organicCheck.score) / 3 : 0;
                 
                 return {
                     passed,
                     score: overallScore / 100, // Normalize to 0-1
-                    securityScore: (100 - scamResult.confidence) / 100,
+                    securityScore: (100 - scamConfidence) / 100,
                     organicScore: organicCheck.score,
                     reason: passed ? "fresh_gem_approved" : "fresh_gem_rejected",
                     failureType: !passed ? "integrated_analysis" : null,
@@ -619,7 +725,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             // Fallback to internal logic if modules not available
             return this.evaluateFreshGemFallback(tokenMetrics);
         } catch (error) {
-            console.error("Risk module integration failed:", error);
+            console.error("⚠️ Risk module integration failed, using fallback:", error.message);
             return this.evaluateFreshGemFallback(tokenMetrics);
         }
     }
@@ -631,7 +737,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         if (isPumpFun) {
             adjustedMetrics = {
                 ...tokenMetrics,
-                buyToSellRatio: tokenMetrics.buyToSellRatio * 1.5,
+                buyToSellRatio: this.calculateSafeBuyToSellRatio(tokenMetrics.buyToSellRatio * 1.5),
                 uniqueWallets: Math.max(tokenMetrics.uniqueWallets, 15)
             };
             console.log("🎯 Pump.fun token detected - applying adjusted criteria");
@@ -651,37 +757,45 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             score: overallScore || 0,
             securityScore: securityScore || 0,
             organicScore: organicScore || 0,
-            reason: passed ? "fresh_gem_approved" : "fresh_gem_rejected",
+            reason: passed ? "fresh_gem_approved_fallback" : "fresh_gem_rejected_fallback",
             failureType: !securityCheck.passed ? "security" : (!organicCheck.passed ? "organic" : null)
         };
     }
     
     checkFreshGemSecurity(tokenMetrics) {
         const criteria = this.FRESH_GEM_CRITERIA.security;
-        let score = 0;
+        let score = 0.5; // Start with base score
         let passed = true;
 
         if (!tokenMetrics.hasMintAuthority) {
-            score += 0.25;
+            score += 0.15;
         } else {
-            passed = false;
+            score -= 0.15;  // Penalty, not rejection
         }
 
         if (!tokenMetrics.hasFreezeAuthority) {
-            score += 0.25;
+            score += 0.15;
         } else {
-            passed = false;
+            score -= 0.15;  // Penalty, not rejection
         }
 
         if (tokenMetrics.largestHolderPercentage <= criteria.topHolderMaxPercent) {
-            score += 0.25;
+            score += 0.15;
         } else {
-            passed = false;
+            score -= 0.10;  // Smaller penalty for concentration
         }
 
         if (tokenMetrics.lpValueUSD >= criteria.lpValueMinUSD) {
-            score += 0.25;
+            score += 0.15;
         } else {
+            passed = false;  // Keep liquidity as hard requirement
+        }
+
+        // Ensure score stays in valid range
+        score = Math.max(0, Math.min(1, score));
+        
+        // Only fail if score is too low or liquidity insufficient
+        if (score < 0.3) {
             passed = false;
         }
 
@@ -728,13 +842,31 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
         try {
             // Use existing risk modules if available
             if (this.scamProtectionEngine && this.marketCapRiskFilter) {
-                const [scamResult, marketCapResult] = await Promise.all([
-                    this.scamProtectionEngine.analyzeToken(tokenMetrics.address, tokenMetrics),
-                    this.marketCapRiskFilter.filterByMarketCap(tokenMetrics, "established")
+                // Add timeout protection to prevent infinite hangs
+                const moduleTimeout = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Risk module timeout')), 5000);
+                });
+
+                const modulePromises = Promise.all([
+                    this.scamProtectionEngine.analyzeToken(tokenMetrics.address, tokenMetrics).catch(e => null),
+                    this.marketCapRiskFilter.filterByMarketCap(tokenMetrics, "established").catch(e => null)
                 ]);
+
+                const [scamResult, marketCapResult] = await Promise.race([
+                    modulePromises,
+                    moduleTimeout
+                ]).catch(error => {
+                    console.log('⚠️ Risk modules failed/timeout, using fallback logic');
+                    return [null, null];
+                });
                 
-                const passed = !scamResult.isScam && marketCapResult.passed;
-                const score = passed ? (100 - scamResult.confidence) / 100 : 0;
+                // Validate results and combine safely
+                const scamSafe = scamResult && typeof scamResult.isScam === 'boolean' ? !scamResult.isScam : false;
+                const marketCapSafe = marketCapResult && typeof marketCapResult.passed === 'boolean' ? marketCapResult.passed : false;
+                
+                const passed = scamSafe && marketCapSafe;
+                const scamConfidence = scamResult?.confidence || 0;
+                const score = passed ? (100 - scamConfidence) / 100 : 0;
                 
                 return {
                     passed,
@@ -742,7 +874,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                     securityScore: score,
                     organicScore: score,
                     tier: passed ? "established" : "rejected",
-                    reason: passed ? "established_token_approved" : marketCapResult.reason || scamResult.reasons.join(", ")
+                    reason: passed ? "established_token_approved" : marketCapResult?.reason || scamResult?.reasons?.join(", ") || "risk_module_failure"
                 };
             }
             
@@ -781,7 +913,7 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
             passed,
             score: score || 0,
             tier: passed ? "established" : "rejected",
-            reason: failureReasons.length > 0 ? failureReasons.join(", ") : "established_token_approved"
+            reason: failureReasons.length > 0 ? failureReasons.join(", ") + "_fallback" : "established_token_approved_fallback"
         };
     }
 
@@ -961,7 +1093,9 @@ class TieredTokenFilterServiceFixed extends EventEmitter {
                 establishedPassed: this.stats.establishedPassed,
                 freshGemRate: freshGemRate.toFixed(2) + '%',
                 establishedRate: establishedRate.toFixed(2) + '%',
-                totalPassRate: totalPassRate.toFixed(2) + '%'
+                totalPassRate: totalPassRate.toFixed(2) + '%',
+                rateLimitHits: this.stats.rateLimitHits || 0,
+                partialFailures: this.stats.partialFailures || 0
             }
         };
     }
