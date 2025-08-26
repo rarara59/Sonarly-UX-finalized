@@ -3,6 +3,8 @@
  * Ensures all required environment variables and settings are properly configured
  */
 
+import os from 'os';
+
 export class EnvironmentValidator {
   constructor() {
     // Required variables for all environments
@@ -111,11 +113,17 @@ export class EnvironmentValidator {
       this.validateTradingVars(errors);
     }
     
+    // Validate RPC endpoints (required for system operation)
+    this.validateRpcEndpoints(errors);
+    
     // Check recommended variables
     this.checkRecommendedVars(warnings);
     
     // Validate constraints
     this.validateConstraints(errors);
+    
+    // Validate timing relationships
+    this.validateTimingRelationships(errors);
     
     // Validate file paths
     this.validateFilePaths(errors, isProduction);
@@ -201,6 +209,69 @@ export class EnvironmentValidator {
   }
   
   /**
+   * Validate RPC endpoints - at least one must be configured
+   */
+  validateRpcEndpoints(errors) {
+    // Check for at least one valid RPC endpoint
+    const rpcEndpoints = [
+      'HELIUS_RPC_URL',
+      'CHAINSTACK_RPC_URL',
+      'PUBLIC_RPC_URL',
+      'RPC_ENDPOINT'
+    ];
+    
+    let hasValidEndpoint = false;
+    const missingEndpoints = [];
+    
+    for (const endpoint of rpcEndpoints) {
+      const url = process.env[endpoint];
+      // Check if URL exists and is not empty
+      if (!url || !url.trim()) {
+        missingEndpoints.push(endpoint);
+        continue;
+      }
+      
+      // Check if it's not a placeholder or invalid value
+      if (url !== 'undefined' && url !== 'null' && 
+          !url.includes('YOUR_') && !url.includes('test_key_') && 
+          !url.includes('<') && !url.includes('${')) {
+        hasValidEndpoint = true;
+        break;
+      }
+    }
+    
+    // In testing mode, allow test keys but still require at least one endpoint
+    if (!hasValidEndpoint && process.env.NODE_ENV === 'testing') {
+      for (const endpoint of rpcEndpoints) {
+        const url = process.env[endpoint];
+        // Allow test keys in testing mode
+        if (url && url.trim() && url !== 'undefined' && url !== 'null') {
+          // Even with test_key_, it's still a valid endpoint for testing
+          if (url.includes('test_key_') || url.includes('test-')) {
+            hasValidEndpoint = true;
+            break;
+          }
+        }
+      }
+    }
+    
+    // Debug logging
+    if (process.env.DEBUG_VALIDATION) {
+      console.log('RPC Validation Debug:');
+      console.log('  hasValidEndpoint:', hasValidEndpoint);
+      console.log('  missingEndpoints:', missingEndpoints);
+      console.log('  NODE_ENV:', process.env.NODE_ENV);
+    }
+    
+    if (!hasValidEndpoint) {
+      errors.push(`Missing required RPC endpoints. At least one of the following must be configured: ${rpcEndpoints.join(', ')}`);
+      if (missingEndpoints.includes('HELIUS_RPC_URL')) {
+        errors.push('HELIUS_RPC_URL is not configured');
+      }
+    }
+  }
+  
+  /**
    * Check recommended variables
    */
   checkRecommendedVars(warnings) {
@@ -241,6 +312,52 @@ export class EnvironmentValidator {
         errors.push(`${varName} must be one of: ${constraint.valid.join(', ')}, got: ${value}`);
       }
     });
+  }
+  
+  /**
+   * Validate timing relationships between configuration values
+   */
+  validateTimingRelationships(errors) {
+    // Health monitoring timing relationships
+    const healthInterval = parseInt(process.env.RPC_HEALTH_INTERVAL_MS, 10) || 30000;
+    const healthJitter = parseInt(process.env.RPC_HEALTH_JITTER_MS, 10) || 0;
+    const healthProbeTimeout = parseInt(process.env.RPC_HEALTH_PROBE_TIMEOUT_MS, 10) || 5000;
+    
+    // Validate health timing relationships
+    if (healthJitter > healthInterval) {
+      errors.push(`RPC_HEALTH_JITTER_MS (${healthJitter}ms) must be ≤ RPC_HEALTH_INTERVAL_MS (${healthInterval}ms)`);
+    }
+    if (healthProbeTimeout >= healthInterval) {
+      errors.push(`RPC_HEALTH_PROBE_TIMEOUT_MS (${healthProbeTimeout}ms) must be < RPC_HEALTH_INTERVAL_MS (${healthInterval}ms)`);
+    }
+    
+    // Request/Queue timing relationships
+    const requestTimeout = parseInt(process.env.RPC_DEFAULT_TIMEOUT_MS, 10) || 5000;
+    const queueDeadline = parseInt(process.env.RPC_QUEUE_DEADLINE_MS, 10) || 10000;
+    
+    if (requestTimeout >= queueDeadline) {
+      errors.push(`RPC_DEFAULT_TIMEOUT_MS (${requestTimeout}ms) must be < RPC_QUEUE_DEADLINE_MS (${queueDeadline}ms)`);
+    }
+    
+    // Keep-alive configuration validation
+    const keepAliveEnabled = process.env.RPC_KEEP_ALIVE_ENABLED !== 'false';
+    const keepAliveSockets = parseInt(process.env.RPC_KEEP_ALIVE_SOCKETS, 10) || 50;
+    const keepAliveTimeout = parseInt(process.env.RPC_KEEP_ALIVE_TIMEOUT_MS, 10) || 60000;
+    
+    if (keepAliveEnabled) {
+      if (keepAliveSockets < 1 || keepAliveSockets > 1000) {
+        errors.push(`RPC_KEEP_ALIVE_SOCKETS must be between 1 and 1000, got: ${keepAliveSockets}`);
+      }
+      if (keepAliveTimeout < 1000 || keepAliveTimeout > 5 * 60 * 1000) {
+        errors.push(`RPC_KEEP_ALIVE_TIMEOUT_MS must be between 1000ms and 5 minutes, got: ${keepAliveTimeout}ms`);
+      }
+    }
+    
+    // Circuit breaker timing
+    const breakerCooldown = parseInt(process.env.RPC_BREAKER_COOLDOWN_MS, 10) || 30000;
+    if (breakerCooldown < requestTimeout) {
+      errors.push(`RPC_BREAKER_COOLDOWN_MS (${breakerCooldown}ms) should be >= RPC_DEFAULT_TIMEOUT_MS (${requestTimeout}ms)`);
+    }
   }
   
   /**
@@ -292,7 +409,7 @@ export class EnvironmentValidator {
   validatePerformance(warnings) {
     // Check worker process count
     const workers = parseInt(process.env.WORKER_PROCESSES);
-    const cpuCount = require('os').cpus().length;
+    const cpuCount = os.cpus().length;
     
     if (workers && workers > cpuCount * 2) {
       warnings.push(`WORKER_PROCESSES (${workers}) is more than 2x CPU count (${cpuCount})`);

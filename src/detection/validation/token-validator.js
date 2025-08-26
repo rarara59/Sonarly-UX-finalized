@@ -6,12 +6,87 @@
  */
 
 export class TokenValidator {
+  // Program ID filter for instant rejection
+  static PROGRAM_FILTER = new Set([
+    '11111111111111111111111111111111', // System Program
+    'BPFLoaderUpgradeab1e11111111111111111111111', // BPF Loader
+    '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun
+    'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX', // Serum/SRM program
+    '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM v4
+    'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', // Orca Whirlpool
+    '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM', // Raydium Authority
+    '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium Authority V4
+  ]);
+
+  // LRU Cache implementation
+  static createLRUCache(maxSize, ttlMs) {
+    const cache = new Map();
+    const timeouts = new Map();
+    
+    const evictOldest = () => {
+      if (cache.size >= maxSize) {
+        const firstKey = cache.keys().next().value;
+        cache.delete(firstKey);
+        if (timeouts.has(firstKey)) {
+          clearTimeout(timeouts.get(firstKey));
+          timeouts.delete(firstKey);
+        }
+      }
+    };
+    
+    return {
+      get(key) {
+        const item = cache.get(key);
+        if (item) {
+          // Move to end (LRU)
+          cache.delete(key);
+          cache.set(key, item);
+          return item.value;
+        }
+        return null;
+      },
+      
+      set(key, value, customTTL = ttlMs) {
+        evictOldest();
+        
+        // Clear existing timeout
+        if (timeouts.has(key)) {
+          clearTimeout(timeouts.get(key));
+        }
+        
+        // Set new value
+        cache.set(key, { value, timestamp: Date.now() });
+        
+        // Set expiration
+        const timeout = setTimeout(() => {
+          cache.delete(key);
+          timeouts.delete(key);
+        }, customTTL);
+        
+        timeouts.set(key, timeout);
+      },
+      
+      size: () => cache.size,
+      clear: () => {
+        for (const timeout of timeouts.values()) {
+          clearTimeout(timeout);
+        }
+        cache.clear();
+        timeouts.clear();
+      }
+    };
+  }
+
   constructor(rpcPool, circuitBreaker = null, performanceMonitor = null) {
     this.rpcPool = rpcPool;
     this.circuitBreaker = circuitBreaker;
     this.monitor = performanceMonitor;
     
-    // LRU cache for token validation results
+    // High-performance LRU cache
+    this.tokenCache = TokenValidator.createLRUCache(10000, 10 * 60 * 1000); // 10k entries, 10min TTL
+    this.failureCache = TokenValidator.createLRUCache(5000, 30 * 1000); // 5k entries, 30s TTL for failures
+    
+    // Legacy cache for backward compatibility
     this.cache = new Map();
     this.maxCacheSize = 10000;
     
@@ -30,7 +105,17 @@ export class TokenValidator {
       'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'  // Token-2022 Program
     ]);
     
-    // Performance tracking
+    // Performance metrics
+    this.metrics = {
+      cacheHits: 0,
+      cacheMisses: 0,
+      programFiltered: 0,
+      rpcCalls: 0,
+      avgLatency: 0,
+      totalValidations: 0
+    };
+    
+    // Performance tracking (legacy)
     this.stats = {
       totalValidations: 0,
       cacheHits: 0,
@@ -354,5 +439,171 @@ export class TokenValidator {
   // Clear cache (useful for testing)
   clearCache() {
     this.cache.clear();
+  }
+
+  // NEW: Fast token pair validation method
+  async validateTokenPair(coinMint, pcMint) {
+    const startTime = performance.now();
+    this.metrics.totalValidations++;
+    
+    try {
+      // Stage 1: Program ID filter (instant rejection)
+      if (TokenValidator.PROGRAM_FILTER.has(coinMint)) {
+        this.metrics.programFiltered++;
+        console.debug(`🚫 Coin mint is program ID: ${coinMint.slice(0,8)}...`);
+        this.recordLatency(startTime);
+        return { coinValid: false, pcValid: null, reason: 'coin_is_program' };
+      }
+      
+      if (TokenValidator.PROGRAM_FILTER.has(pcMint)) {
+        this.metrics.programFiltered++;
+        console.debug(`🚫 PC mint is program ID: ${pcMint.slice(0,8)}...`);
+        this.recordLatency(startTime);
+        return { coinValid: null, pcValid: false, reason: 'pc_is_program' };
+      }
+      
+      // Stage 2: Cache lookup
+      const coinCacheKey = `token:${coinMint}`;
+      const pcCacheKey = `token:${pcMint}`;
+      
+      let coinResult = this.tokenCache.get(coinCacheKey) || this.failureCache.get(coinCacheKey);
+      let pcResult = this.tokenCache.get(pcCacheKey) || this.failureCache.get(pcCacheKey);
+      
+      const needsFetch = [];
+      if (!coinResult) needsFetch.push({ mint: coinMint, key: coinCacheKey, type: 'coin' });
+      if (!pcResult) needsFetch.push({ mint: pcMint, key: pcCacheKey, type: 'pc' });
+      
+      // Stage 3: Batch RPC call for missing tokens
+      if (needsFetch.length > 0) {
+        this.metrics.rpcCalls++;
+        this.metrics.cacheMisses++;
+        
+        const mintsToFetch = needsFetch.map(item => item.mint);
+        console.debug(`🔍 Fetching ${mintsToFetch.length} token accounts via RPC`);
+        
+        const resp = await this.rpcPool.call('getMultipleAccounts', [mintsToFetch, {
+          commitment: 'processed',
+          encoding: 'base64'
+        }], { timeout: 100 });
+        
+        const accounts = resp?.value || [];
+        
+        // Process results
+        for (let i = 0; i < needsFetch.length; i++) {
+          const { mint, key, type } = needsFetch[i];
+          const account = accounts[i];
+          const result = this.validateTokenAccount(account, mint);
+          
+          // Cache the result
+          if (result.valid) {
+            this.tokenCache.set(key, result);
+          } else {
+            // Cache failures for shorter time to avoid hammering
+            this.failureCache.set(key, result);
+          }
+          
+          // Assign to appropriate result
+          if (type === 'coin') {
+            coinResult = result;
+          } else {
+            pcResult = result;
+          }
+        }
+      } else {
+        this.metrics.cacheHits++;
+        console.debug(`💨 Cache hit for both tokens`);
+      }
+      
+      this.recordLatency(startTime);
+      
+      return {
+        coinValid: coinResult?.valid || false,
+        pcValid: pcResult?.valid || false,
+        coinData: coinResult,
+        pcData: pcResult,
+        source: needsFetch.length > 0 ? 'rpc' : 'cache'
+      };
+      
+    } catch (error) {
+      this.recordLatency(startTime);
+      console.error('Token pair validation error:', error.message);
+      
+      // Cache the error to avoid immediate retry
+      const errorResult = { valid: false, reason: 'rpc_error', error: error.message };
+      this.failureCache.set(`token:${coinMint}`, errorResult);
+      this.failureCache.set(`token:${pcMint}`, errorResult);
+      
+      return { coinValid: false, pcValid: false, error: error.message };
+    }
+  }
+
+  // Helper method to validate individual token account
+  validateTokenAccount(account, mint) {
+    if (!account) {
+      return { valid: false, reason: 'account_not_found', mint };
+    }
+    
+    // Handle different response formats
+    const accountData = account.account || account;
+    const owner = accountData?.owner;
+    const data = Array.isArray(accountData?.data) ? accountData.data[0] : accountData?.data;
+    
+    if (!owner) {
+      return { valid: false, reason: 'no_owner', mint };
+    }
+    
+    // Check if owned by token program
+    if (!this.tokenProgramIds.has(owner)) {
+      return { valid: false, reason: 'invalid_owner', owner, mint };
+    }
+    
+    if (!data) {
+      return { valid: false, reason: 'no_data', mint };
+    }
+    
+    try {
+      const dataLength = Buffer.from(data, 'base64').length;
+      
+      // SPL Token mint accounts are 82 bytes
+      if (dataLength === 82) {
+        return { valid: true, confidence: 0.95, dataLength, mint, source: 'spl_token' };
+      }
+      
+      // Token-2022 can have variable sizes due to extensions
+      if (dataLength >= 82) {
+        return { valid: true, confidence: 0.90, dataLength, mint, source: 'token_2022' };
+      }
+      
+      return { valid: false, reason: 'unexpected_data_length', dataLength, mint };
+      
+    } catch (error) {
+      return { valid: false, reason: 'data_parse_error', error: error.message, mint };
+    }
+  }
+
+  // Performance tracking
+  recordLatency(startTime) {
+    const latency = performance.now() - startTime;
+    if (this.metrics.avgLatency === 0) {
+      this.metrics.avgLatency = latency;
+    } else {
+      this.metrics.avgLatency = (this.metrics.avgLatency * 0.9) + (latency * 0.1);
+    }
+    
+    if (this.monitor) {
+      this.monitor.recordLatency('tokenValidator', latency, true);
+    }
+  }
+
+  // Get performance metrics
+  getMetrics() {
+    return {
+      ...this.metrics,
+      cacheHitRate: this.metrics.totalValidations > 0 
+        ? ((this.metrics.cacheHits / this.metrics.totalValidations) * 100).toFixed(1) + '%'
+        : '0%',
+      cacheSize: this.tokenCache.size(),
+      failureCacheSize: this.failureCache.size()
+    };
   }
 }

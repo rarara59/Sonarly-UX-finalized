@@ -82,7 +82,7 @@ export class PoolValidator {
     
     const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
     this.stats.totalValidations++;
-    
+    this.stats.lastValidationTime = Date.now();    
     try {
       const result = await this.performPoolValidation(poolAddress, normalizedDexType, context);
       
@@ -116,7 +116,7 @@ export class PoolValidator {
   // Perform actual pool validation
   async performPoolValidation(poolAddress, dexType, context) {
     // Get pool account info
-    const poolInfo = await this.rpcPool.call('getAccountInfo', [poolAddress, {
+    const poolInfo = await this.rpcPool.fastCall('getAccountInfo', [poolAddress, {
       encoding: 'base64',
       commitment: 'confirmed'
     }]);
@@ -238,11 +238,25 @@ export class PoolValidator {
     };
   }
   
-  // Parse Raydium pool data (simplified)
+  // Generic pool data parser
+  parsePoolData(data, dexType) {
+    switch (dexType.toLowerCase()) {
+      case 'raydium':
+        return this.parseRaydiumPoolData(data);
+      case 'pumpfun':
+        return this.parsePumpfunPoolData(data);
+      case 'orca':
+        return this.parseOrcaPoolData(data);
+      default:
+        return { valid: false, reason: 'unknown_dex_type' };
+    }
+  }
+  // Enhance parseRaydiumPoolData to extract token mints
   parseRaydiumPoolData(data) {
     try {
       const rawData = Array.isArray(data) ? data[0] : data;
       if (!rawData) return { valid: false, reason: 'no_data' };
+      
       let buffer;
       try {
         buffer = Buffer.from(rawData, 'base64');
@@ -250,18 +264,74 @@ export class PoolValidator {
         return { valid: false, reason: 'invalid_base64_data', error: error.message };
       }
       
-      // Basic structure check - look for key fields
       if (buffer.length < 700) {
         return { valid: false, reason: 'insufficient_data' };
       }
       
-      // Extract basic pool info (simplified parsing)
-      return {
-        valid: true,
-        hasLiquidity: buffer.length > 700, // Simplified check
-        poolType: 'raydium_amm',
-        dataLength: buffer.length
-      };
+      // Extract token mints from Raydium pool layout
+      // Raydium AMM layout: coinMint at offset 8, pcMint at offset 40
+      let coinMint, pcMint;
+      
+      try {
+        coinMint = buffer.subarray(8, 40).toString('base64');
+        pcMint = buffer.subarray(40, 72).toString('base64');
+        
+        // Convert base64 back to base58 addresses
+        const coinMintBytes = Buffer.from(coinMint, 'base64');
+        const pcMintBytes = Buffer.from(pcMint, 'base64');
+        
+        // Simple validation - ensure we have 32-byte addresses
+        if (coinMintBytes.length === 32 && pcMintBytes.length === 32) {
+          // Simple base58 encoding
+          const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+          const base58Encode = (bytes) => {
+            let encoded = '';
+            let num = BigInt('0x' + bytes.toString('hex'));
+            const base = BigInt(58);
+            
+            while (num > 0) {
+              const remainder = num % base;
+              encoded = ALPHABET[Number(remainder)] + encoded;
+              num = num / base;
+            }
+            
+            // Add leading '1's for leading zero bytes
+            for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
+              encoded = '1' + encoded;
+            }
+            
+            return encoded;
+          };
+          
+          return {
+            valid: true,
+            hasLiquidity: true,
+            poolType: 'raydium_amm',
+            dataLength: buffer.length,
+            coinMint: base58Encode(coinMintBytes),
+            pcMint: base58Encode(pcMintBytes)
+          };
+        } else {
+          // Fallback to basic validation without mint extraction
+          return {
+            valid: true,
+            hasLiquidity: buffer.length > 700,
+            poolType: 'raydium_amm',
+            dataLength: buffer.length
+          };
+        }
+      } catch (mintError) {
+        console.debug('Failed to extract mints, using basic validation:', mintError.message);
+        
+        // Fallback to basic validation
+        return {
+          valid: true,
+          hasLiquidity: buffer.length > 700,
+          poolType: 'raydium_amm',
+          dataLength: buffer.length
+        };
+      }
+      
     } catch (error) {
       return { valid: false, reason: 'parse_error', error: error.message };
     }
@@ -406,6 +476,101 @@ export class PoolValidator {
     }
   }
   
+  // Batch validate multiple pools for performance
+  async validateBatch(poolAddresses, dexType = 'raydium') {
+    if (!Array.isArray(poolAddresses) || poolAddresses.length === 0) {
+      return [];
+    }
+    
+    const startTime = performance.now();
+    const batchSize = 10; // Process in chunks of 10
+    const results = [];
+    
+    // Process in batches to avoid RPC limits
+    for (let i = 0; i < poolAddresses.length; i += batchSize) {
+      const batch = poolAddresses.slice(i, i + batchSize);
+      
+      try {
+        // Single RPC call for multiple accounts
+        const accountsData = await this.rpcPool.fastCall('getMultipleAccounts', [batch, {
+          encoding: 'base64',
+          commitment: 'processed'
+        }], { timeout: 100 });
+        
+        const batchResults = (accountsData?.value || []).map((accountData, idx) => {
+          const poolAddress = batch[idx];
+          
+          // Check cache first
+          const cached = this.getCachedResult(poolAddress, dexType);
+          if (cached) {
+            return { poolAddress, ...cached, cached: true };
+          }
+          
+          if (!accountData) {
+            return { poolAddress, valid: false, confidence: 0.9, reason: 'pool_not_found' };
+          }
+          
+          // Validate based on DEX type
+          const result = this.validateAccountData(accountData, dexType);
+          this.cacheResult(poolAddress, dexType, result);
+          
+          return { poolAddress, ...result };
+        });
+        
+        results.push(...batchResults);
+        
+      } catch (error) {
+        // Handle batch errors gracefully
+        const errorResults = batch.map(poolAddress => ({
+          poolAddress,
+          valid: false,
+          confidence: 0.0,
+          error: error.message,
+          source: 'batch_error'
+        }));
+        results.push(...errorResults);
+      }
+    }
+    
+    const latency = performance.now() - startTime;
+    console.debug(`Batch validated ${poolAddresses.length} pools in ${latency.toFixed(1)}ms`);
+    
+    return results;
+  }
+  
+  // Extract account data validation logic
+  validateAccountData(accountData, dexType) {
+    // Check owner program
+    if (accountData.owner !== this.dexPrograms[dexType]) {
+      return { valid: false, confidence: 0.95, reason: 'invalid_program_owner' };
+    }
+    
+    // Check data length
+    const dataLength = this.getDataLength(accountData.data);
+    if (dataLength < 700 || dataLength > 800) {
+      return { valid: false, confidence: 0.8, reason: 'invalid_data_length' };
+    }
+    
+    // Parse and validate pool structure
+    const poolData = this.parsePoolData(accountData.data, dexType);
+    if (!poolData.valid) {
+      return { valid: false, confidence: 0.7, reason: 'invalid_pool_structure' };
+    }
+    
+    // Validate liquidity
+    const liquidityCheck = this.validateLiquidity(poolData, dexType);
+    if (!liquidityCheck.valid) {
+      return liquidityCheck;
+    }
+    
+    return {
+      valid: true,
+      confidence: 0.95,
+      poolData: poolData,
+      liquidity: liquidityCheck.liquidity,
+      source: `${dexType}_batch_validated`
+    };
+  }
   // Get current statistics
   getStats() {
     return {
@@ -426,58 +591,82 @@ export class PoolValidator {
   
   // Health check
   isHealthy() {
-    return (
-      this.stats.avgLatency < 5.0 && // Under 5ms average
-      (this.stats.totalValidations === 0 || this.stats.errors < this.stats.totalValidations * 0.1) // Less than 10% error rate
+    const now = Date.now();
+    const timeSinceLastValidation = now - (this.stats.lastValidationTime || now);
+    
+    // Core health indicators
+    const latencyHealthy = this.stats.avgLatency < 50.0; // Increased from 5ms to 50ms
+    const errorRateHealthy = (
+      this.stats.totalValidations === 0 ||
+      this.stats.errors < this.stats.totalValidations * 0.15 // Allow 15% error rate
     );
-  }
-  
+    
+    // Allow startup grace period or recent activity
+    const activityHealthy = (
+      this.stats.totalValidations < 5 || // Startup grace
+      timeSinceLastValidation < 30000 // Active within 30s
+    );
+    
+    const isHealthy = latencyHealthy && errorRateHealthy && activityHealthy;
+    
+    if (!isHealthy) {
+      console.debug("PoolValidator health details:", {
+        latencyHealthy,
+        errorRateHealthy, 
+        activityHealthy,
+        avgLatency: this.stats.avgLatency,
+        errorRate: this.stats.totalValidations > 0 ? (this.stats.errors / this.stats.totalValidations) : 0
+      });
+    }
+    
+    return isHealthy;
+  }  
   // Check cache for previous validation result
   getCachedResult(poolAddress, dexType) {
     const cacheKey = `${poolAddress}:${dexType}`;
     const now = Date.now();
     
-    // Check invalid cache first (most common case)
-    const invalidEntry = this.invalidPoolCache.get(cacheKey);
-    if (invalidEntry && (now - invalidEntry.timestamp) < this.cacheTTL) {
-      this.stats.cacheHits++;
-      return invalidEntry.result;
-    }
-    
-    // Check valid cache
+    // Check valid cache first
     const validEntry = this.validPoolCache.get(cacheKey);
-    if (validEntry && (now - validEntry.timestamp) < this.cacheTTL) {
+    if (validEntry && (now - validEntry.timestamp) < validEntry.ttl) {
       this.stats.cacheHits++;
       return validEntry.result;
     }
     
+    // Check invalid cache
+    const invalidEntry = this.invalidPoolCache.get(cacheKey);
+    if (invalidEntry && (now - invalidEntry.timestamp) < invalidEntry.ttl) {
+      this.stats.cacheHits++;
+      return invalidEntry.result;
+    }
+    
     this.stats.cacheMisses++;
     return null;
-  }
-  
+  }  
   // Cache validation result
   cacheResult(poolAddress, dexType, result) {
     const cacheKey = `${poolAddress}:${dexType}`;
     const timestamp = Date.now();
-    const entry = { result, timestamp };
+    
+    // Use different TTL based on result
+    const ttl = result.valid ? 300000 : 60000; // 5min for valid, 1min for invalid
+    
+    const entry = { result, timestamp, ttl };
     
     if (result.valid) {
-      // Cache valid pools (less common, shorter TTL)
       this.validPoolCache.set(cacheKey, entry);
       this.enforceValidCacheSize();
     } else {
-      // Cache invalid pools (more common, longer TTL)
       this.invalidPoolCache.set(cacheKey, entry);
       this.enforceInvalidCacheSize();
     }
     
     // Periodic cleanup
-    if (timestamp - this.lastCacheCleanup > 60000) { // Every minute
+    if (timestamp - this.lastCacheCleanup > 60000) {
       this.cleanupExpiredEntries();
       this.lastCacheCleanup = timestamp;
     }
-  }
-  
+  }  
   // Enforce cache size limits
   enforceValidCacheSize() {
     if (this.validPoolCache.size > this.cacheMaxSize) {

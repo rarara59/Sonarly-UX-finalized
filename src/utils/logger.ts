@@ -1,7 +1,34 @@
-// Minimal logger to bypass winston issues
+// src/utils/logger.js - Fixed interface
 export const logger = {
-  info: (msg: string) => console.log(msg),
-  error: (msg: string, ...args: any[]) => console.error(msg, ...args),
-  warn: (msg: string) => console.warn(msg),
-  debug: (msg: string) => console.log(msg)
+  info: (data, msg) => {
+    if (typeof data === 'string') {
+      console.log(data);
+    } else {
+      console.log(`INFO: ${msg || 'No message'}`, data);
+    }
+  },
+  
+  error: (data, msg) => {
+    if (typeof data === 'string') {
+      console.error(data);
+    } else {
+      console.error(`ERROR: ${msg || 'No message'}`, data);
+    }
+  },
+  
+  warn: (data, msg) => {
+    if (typeof data === 'string') {
+      console.warn(data);
+    } else {
+      console.warn(`WARN: ${msg || 'No message'}`, data);
+    }
+  },
+  
+  debug: (data, msg) => {
+    if (typeof data === 'string') {
+      console.log(data);
+    } else {
+      console.log(`DEBUG: ${msg || 'No message'}`, data);
+    }
+  }
 };

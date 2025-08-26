@@ -4,6 +4,8 @@
  * 200 lines - Parallel DEX polling with connection pooling
  */
 
+import { logger, generateRequestId } from '../../utils/logger.js';
+
 export class TransactionFetcher {
   constructor(rpcPool, circuitBreaker, performanceMonitor = null) {
     if (!rpcPool) throw new Error('rpcPool is required');
@@ -55,7 +57,15 @@ export class TransactionFetcher {
   
   // Main method: Parallel polling across all DEXs
   async pollAllDexs() {
+    const requestId = generateRequestId();
     const startTime = performance.now();
+    
+    logger.info({
+      request_id: requestId,
+      component: 'transaction-fetcher',
+      event: 'dex.poll_all.start',
+      dexes: ['raydium', 'pumpfun', 'orca']
+    });
     
     try {
       // Parallel fetch from all DEXs
@@ -83,6 +93,19 @@ export class TransactionFetcher {
         this.monitor.recordThroughput('transactionFetcher', uniqueTransactions.length, fetchTime);
       }
       
+      logger.info({
+        request_id: requestId,
+        component: 'transaction-fetcher',
+        event: 'dex.poll_all.end',
+        latency_ms: fetchTime,
+        outcome: 'success',
+        transactions_fetched: uniqueTransactions.length,
+        raydium_count: raydiumTxs.length,
+        pumpfun_count: pumpfunTxs.length,
+        orca_count: orcaTxs.length,
+        duplicates_filtered: this.stats.duplicatesFiltered
+      });
+      
       return uniqueTransactions;
       
     } catch (error) {
@@ -93,13 +116,31 @@ export class TransactionFetcher {
         this.monitor.recordLatency('transactionFetcher', fetchTime, false);
       }
       
-      console.error('Transaction fetch error:', error);
+      logger.error({
+        request_id: requestId,
+        component: 'transaction-fetcher',
+        event: 'dex.poll_all.error',
+        latency_ms: fetchTime,
+        outcome: 'failure',
+        error: error.message,
+        stack: error.stack
+      });
       throw error;
     }
   }
   
   // Poll specific DEX for transactions
   async pollDex(dexName) {
+    const requestId = generateRequestId();
+    const startTime = Date.now();
+    
+    logger.info({
+      request_id: requestId,
+      component: 'transaction-fetcher',
+      event: 'dex.poll.start',
+      dex: dexName
+    });
+    
     // Rate limiting to prevent HTTP 429 errors
     const now = Date.now();
     const timeSinceLastCall = now - this.lastCallTime;
@@ -109,7 +150,15 @@ export class TransactionFetcher {
     this.lastCallTime = Date.now();
     
     const config = this.pollingConfig[dexName];
-    if (!config) return [];
+    if (!config) {
+      logger.warn({
+        request_id: requestId,
+        component: 'transaction-fetcher',
+        event: 'dex.poll.unknown_dex',
+        dex: dexName
+      });
+      return [];
+    }
     
     try {
       const params = [
@@ -144,10 +193,32 @@ export class TransactionFetcher {
         dexName
       );
       
-      return transactions.filter(tx => tx !== null);
+      const filteredTransactions = transactions.filter(tx => tx !== null);
+      
+      logger.info({
+        request_id: requestId,
+        component: 'transaction-fetcher',
+        event: 'dex.poll.end',
+        dex: dexName,
+        latency_ms: Date.now() - startTime,
+        outcome: 'success',
+        transactions_fetched: filteredTransactions.length,
+        signatures_received: response.length
+      });
+      
+      return filteredTransactions;
       
     } catch (error) {
-      console.error(`Error polling ${dexName}:`, error);
+      logger.error({
+        request_id: requestId,
+        component: 'transaction-fetcher',
+        event: 'dex.poll.error',
+        dex: dexName,
+        latency_ms: Date.now() - startTime,
+        outcome: 'failure',
+        error: error.message,
+        stack: error.stack
+      });
       return [];
     }
   }
@@ -181,7 +252,14 @@ export class TransactionFetcher {
       }));
       
     } catch (error) {
-      console.error(`Error fetching transaction details for ${dexName}:`, error);
+      logger.error({
+        component: 'transaction-fetcher',
+        event: 'transaction_details.error',
+        dex: dexName,
+        signatures_count: signatures.length,
+        error: error.message,
+        stack: error.stack
+      });
       return [];
     }
   }
@@ -210,7 +288,12 @@ export class TransactionFetcher {
         });
         results.push(result);
       } catch (error) {
-        console.warn(`Failed to fetch transaction ${signature}:`, error.message);
+        logger.warn({
+          component: 'transaction-fetcher',
+          event: 'transaction_fetch.failure',
+          signature,
+          error: error.message
+        });
         results.push(null);
       }
     }
@@ -286,9 +369,17 @@ export class TransactionFetcher {
         // Remove oldest half of signatures instead of clearing all
         const signatures = Array.from(this.seenSignatures);
         const keepCount = Math.floor(signatures.length / 2);
+        const originalSize = this.seenSignatures.size;
         this.seenSignatures.clear();
         signatures.slice(-keepCount).forEach(sig => this.seenSignatures.add(sig));
-        console.log('Cleared signature cache to prevent memory leak');
+        
+        logger.info({
+          component: 'transaction-fetcher',
+          event: 'signature_cache.cleanup',
+          original_size: originalSize,
+          new_size: this.seenSignatures.size,
+          cleared_count: originalSize - this.seenSignatures.size
+        });
       }
     }, this.signatureCleanupInterval);
   }

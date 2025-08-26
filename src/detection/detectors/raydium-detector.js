@@ -4,8 +4,10 @@
  * Extracted from proven 3000+ line detection system
  */
 
+import { logger, generateRequestId } from '../../utils/logger.js';
+
 export class RaydiumDetector {
-  constructor(signalBus, tokenValidator, poolValidator, circuitBreaker, performanceMonitor = null) {
+  constructor(signalBus, tokenValidator, poolValidator, circuitBreaker, rpcPool = null, performanceMonitor = null) {
     if (!signalBus) throw new Error('SignalBus is required');
     if (!poolValidator) throw new Error('PoolValidator is required');
     if (!tokenValidator) throw new Error('TokenValidator is required');
@@ -15,6 +17,8 @@ export class RaydiumDetector {
     this.tokenValidator = tokenValidator;
     this.poolValidator = poolValidator;
     this.circuitBreaker = circuitBreaker;
+    this.rpcPool = rpcPool || poolValidator?.rpcPool; // Use poolValidator's rpcPool if not provided
+    this.monitor = performanceMonitor;
     this.performanceMonitor = performanceMonitor;
     
     // Raydium AMM V4 program ID
@@ -146,88 +150,173 @@ export class RaydiumDetector {
       'dd'  // route
     ]);
     
-    console.log('🚀 Renaissance Raydium Detector initialized with production integrations');
+    logger.info({
+      component: 'raydium-detector',
+      event: 'detector.init.complete',
+      dex: 'raydium',
+      request_id: generateRequestId()
+    }, 'Renaissance Raydium Detector initialized with production integrations');
   }
 
   /**
    * MAIN METHOD: Analyze Raydium instruction for LP creation
    * Target: <15ms per transaction
    */
-  async analyzeTransaction(transaction) {
+  async analyzeTransaction(tx) {
     const startTime = performance.now();
-    this.metrics.totalTransactions++;
     
     try {
-      if (!transaction?.transaction?.message?.instructions) {
-        return [];
+      const { transaction, meta } = tx || {};
+      if (!transaction?.message || !meta) return;
+      
+      // Constants
+      const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+      
+      // 1) Find instructions that target Raydium AMM v4
+      const ix = transaction.message.instructions || [];
+      const rayIxs = ix.filter(i => {
+        const programId = transaction.message.accountKeys[i.programIdIndex];
+        const programIdStr = programId?.toBase58?.() || String(programId);
+        return programIdStr === RAYDIUM_AMM_V4;
+      });
+      
+      if (rayIxs.length === 0) return;
+      
+      // 2) Collect candidate accounts referenced by those Raydium instructions
+      const keyList = transaction.message.accountKeys.map(k => (k?.toBase58 ? k.toBase58() : String(k)));
+      const candidateAddrs = new Set();
+      
+      for (const i of rayIxs) {
+        for (const n of (i.accounts || [])) {
+          const addr = keyList[n];
+          if (addr && addr.length === 44) { // Valid Solana address length
+            candidateAddrs.add(addr);
+          }
+        }
       }
-
-      const instructions = transaction.transaction.message.instructions || [];
-      const accountKeys = transaction.transaction.message.accountKeys || [];
-      const candidates = [];
-
-      console.log(`🔍 Analyzing ${instructions.length} instructions for Raydium LP creation`);
-
-      // Process instructions sequentially for accuracy (parallel can miss dependencies)
-      for (let i = 0; i < instructions.length; i++) {
-        const instruction = instructions[i];
+      
+      if (candidateAddrs.size === 0) return;
+      
+      // 3) Batch fetch and keep pool-shaped, Raydium-owned accounts
+      const addrs = Array.from(candidateAddrs);
+      logger.debug({
+        component: 'raydium-detector',
+        event: 'pool.candidates.check',
+        dex: 'raydium',
+        candidate_count: addrs.length,
+        request_id: generateRequestId()
+      }, `Checking ${addrs.length} candidate accounts for Raydium pools`);
+      
+      const resp = await this.rpcPool.call('getMultipleAccounts', [addrs, { 
+        commitment: 'processed',
+        encoding: 'base64'
+      }], { timeout: 120 });
+      
+      const values = resp?.value || [];
+      const poolCandidates = [];
+      
+      for (let idx = 0; idx < addrs.length; idx++) {
+        const account = values[idx];
+        if (!account) continue;
         
-        // Quick program ID check with circuit breaker protection
-        let programId;
+        // Handle different response formats
+        const accountData = account.account || account;
+        const owner = accountData?.owner;
+        const data = Array.isArray(accountData?.data) ? accountData.data[0] : accountData?.data;
+        
+        if (!data || !owner) continue;
+        
         try {
-          programId = await this.circuitBreaker.execute('programIdCheck', async () => {
-            return instruction.programId || this.extractAddress(accountKeys[instruction.programIdIndex]);
-          });
+          const dataLength = Buffer.from(data, 'base64').length;
+          
+          // Raydium pool heuristic: owner=RAYDIUM_AMM_V4 and size ~700–900 bytes
+          if (owner === RAYDIUM_AMM_V4 && dataLength >= 700 && dataLength <= 900) {
+            poolCandidates.push({ 
+              poolAddress: addrs[idx],
+              dataLength: dataLength
+            });
+            logger.debug({
+              component: 'raydium-detector',
+              event: 'pool.candidate.found',
+              dex: 'raydium',
+              pool_address: addrs[idx],
+              data_length: dataLength,
+              request_id: generateRequestId()
+            }, `Found potential pool: ${addrs[idx].slice(0,8)}... (${dataLength} bytes)`);
+          }
         } catch (error) {
-          continue; // Skip if circuit breaker blocks
-        }
-        
-        if (programId !== this.RAYDIUM_PROGRAM_ID) {
-          continue;
-        }
-
-        const candidate = await this.parseRaydiumInstruction(
-          instruction, 
-          accountKeys, 
-          i, 
-          transaction.transaction.signatures[0],
-          transaction.blockTime || Math.floor(Date.now() / 1000)
-        );
-
-        if (candidate) {
-          candidates.push(candidate);
-          
-          // Emit via signal bus immediately for speed
-          this.signalBus.emit('raydiumLpDetected', {
-            candidate,
-            timestamp: Date.now(),
-            source: 'raydium_detector'
-          });
-          
-          console.log(`🎯 Raydium LP detected: ${candidate.tokenAddress} / ${candidate.quoteName}`);
+          logger.warn({
+            component: 'raydium-detector',
+            event: 'account.parse.error',
+            dex: 'raydium',
+            pool_address: addrs[idx],
+            error: error.message,
+            request_id: generateRequestId()
+          }, `Error parsing account data for ${addrs[idx].slice(0,8)}...`);
         }
       }
-
-      const elapsedMs = performance.now() - startTime;
-      this.updateMetrics(elapsedMs, candidates.length);
-
-      // SLA monitoring
-      if (elapsedMs > 15) {
-        this.metrics.slaViolations++;
-        console.warn(`🚨 RAYDIUM DETECTOR SLA VIOLATION: ${elapsedMs.toFixed(1)}ms (target: <15ms)`);
-        
-        if (this.performanceMonitor) {
-          this.performanceMonitor.recordSlaViolation('raydiumDetector', elapsedMs, 15);
-        }
+      
+      if (poolCandidates.length === 0) {
+        logger.debug({
+          component: 'raydium-detector',
+          event: 'pool.candidates.none_found',
+          dex: 'raydium',
+          account_count: addrs.length,
+          request_id: generateRequestId()
+        }, `No valid pool candidates found in ${addrs.length} accounts`);
+        return;
       }
-
-      return candidates;
-
+      
+      // 4) Emit candidates with ONLY poolAddress; let PoolValidator resolve mints/liquidity
+      for (const candidate of poolCandidates) {
+        logger.info({
+          component: 'raydium-detector',
+          event: 'token.detected',
+          dex: 'raydium',
+          opportunity_id: generateRequestId(),
+          pool_address: candidate.poolAddress,
+          confidence_score: 0.85,
+          request_id: generateRequestId()
+        }, `Pool candidate detected: ${candidate.poolAddress.slice(0,8)}...`);
+        
+        this.signalBus.emit('raydiumLpDetected', { 
+          candidate: { 
+            poolAddress: candidate.poolAddress,
+            source: 'raydium_v4',
+            timestamp: Date.now()
+          }, 
+          txid: transaction.signatures?.[0] || 'unknown'
+        });
+      }
+      
+      // Performance tracking
+      const latency = performance.now() - startTime;
+      if (this.monitor) {
+        this.monitor.recordLatency('raydiumDetector', latency, true);
+      }
+      
+      logger.debug({
+        component: 'raydium-detector',
+        event: 'analysis.complete',
+        dex: 'raydium',
+        latency_ms: latency,
+        request_id: generateRequestId()
+      }, `Raydium detector completed in ${latency.toFixed(1)}ms`);
+      
     } catch (error) {
-      const elapsedMs = performance.now() - startTime;
-      this.updateMetrics(elapsedMs, 0);
-      console.error('❌ Raydium transaction analysis failed:', error.message);
-      return [];
+      const latency = performance.now() - startTime;
+      logger.error({
+        component: 'raydium-detector',
+        event: 'analysis.error',
+        dex: 'raydium',
+        error: error.message,
+        latency_ms: latency,
+        request_id: generateRequestId()
+      }, 'Raydium detector error');
+      
+      if (this.monitor) {
+        this.monitor.recordLatency('raydiumDetector', latency, false);
+      }
     }
   }
 
@@ -266,18 +355,40 @@ export class RaydiumDetector {
 
       // Validate account count
       if (instruction.accounts.length < discriminatorInfo.minAccounts) {
-        console.log(`⚠️ Insufficient accounts: ${instruction.accounts.length} < ${discriminatorInfo.minAccounts}`);
+        logger.warn({
+          component: 'raydium-detector',
+          event: 'instruction.insufficient_accounts',
+          dex: 'raydium',
+          account_count: instruction.accounts.length,
+          min_required: discriminatorInfo.minAccounts,
+          discriminator: discriminatorHex,
+          request_id: generateRequestId()
+        }, `Insufficient accounts: ${instruction.accounts.length} < ${discriminatorInfo.minAccounts}`);
         return null;
       }
 
       // Extract token mints using discriminator-specific layout
       const layout = this.ACCOUNT_LAYOUTS[discriminatorHex];
       if (!layout) {
-        console.warn(`⚠️ No layout found for discriminator: ${discriminatorHex}`);
+        logger.warn({
+          component: 'raydium-detector',
+          event: 'instruction.no_layout',
+          dex: 'raydium',
+          discriminator: discriminatorHex,
+          request_id: generateRequestId()
+        }, `No layout found for discriminator: ${discriminatorHex}`);
         return null;
       }
 
-      console.log(`🔍 Processing ${discriminatorInfo.type} instruction with ${instruction.accounts.length} accounts`);
+      logger.debug({
+        component: 'raydium-detector',
+        event: 'instruction.processing',
+        dex: 'raydium',
+        instruction_type: discriminatorInfo.type,
+        account_count: instruction.accounts.length,
+        discriminator: discriminatorHex,
+        request_id: generateRequestId()
+      }, `Processing ${discriminatorInfo.type} instruction with ${instruction.accounts.length} accounts`);
 
       // CRITICAL: This now includes full token validation
       const tokenPair = await this.extractTokenPair(instruction.accounts, accountKeys, layout);
@@ -331,12 +442,28 @@ export class RaydiumDetector {
         source: 'raydium_detector_v1'
       };
 
-      console.log(`✅ Raydium LP candidate created: ${candidate.tokenAddress} (conf: ${candidate.confidence.toFixed(2)})`);
+      logger.info({
+        component: 'raydium-detector',
+        event: 'token.detected',
+        dex: 'raydium',
+        opportunity_id: generateRequestId(),
+        pool_address: candidate.poolAddress,
+        token_address: candidate.tokenAddress,
+        confidence_score: candidate.confidence,
+        instruction_type: candidate.instructionType,
+        request_id: generateRequestId()
+      }, `Raydium LP candidate created: ${candidate.tokenAddress} (conf: ${candidate.confidence.toFixed(2)})`);
 
       return candidate;
 
     } catch (error) {
-      console.error(`❌ Raydium instruction parsing failed: ${error.message}`);
+      logger.error({
+        component: 'raydium-detector',
+        event: 'instruction.parse.error',
+        dex: 'raydium',
+        error: error.message,
+        request_id: generateRequestId()
+      }, 'Raydium instruction parsing failed');
       return null;
     }
   }
@@ -405,7 +532,14 @@ export class RaydiumDetector {
         return null;
       }
 
-      console.log(`🔍 Validating token pair: ${coinMint} / ${pcMint}`);
+      logger.debug({
+        component: 'raydium-detector',
+        event: 'token_pair.validation.start',
+        dex: 'raydium',
+        coin_mint: coinMint,
+        pc_mint: pcMint,
+        request_id: generateRequestId()
+      }, `Validating token pair: ${coinMint} / ${pcMint}`);
 
       // CRITICAL: Parallel token validation using circuit breaker
       const validationPromises = [
@@ -442,13 +576,29 @@ export class RaydiumDetector {
         } else {
           allValid = false;
           this.metrics.validationFailures++;
-          console.warn(`⚠️ Token validation failed for ${tokenType}: ${tokenValidation[tokenType].address}`);
+          logger.warn({
+            component: 'raydium-detector',
+            event: 'token.validation.failed',
+            dex: 'raydium',
+            token_type: tokenType,
+            token_address: tokenValidation[tokenType].address,
+            request_id: generateRequestId()
+          }, `Token validation failed for ${tokenType}`);
         }
       }
 
       // Require both coin and PC tokens to be valid
       if (!tokenValidation.coin.valid || !tokenValidation.pc.valid) {
-        console.log(`❌ Token validation failed - coin:${tokenValidation.coin.valid}, pc:${tokenValidation.pc.valid}`);
+        logger.warn({
+          component: 'raydium-detector',
+          event: 'token_pair.validation.failed',
+          dex: 'raydium',
+          coin_valid: tokenValidation.coin.valid,
+          pc_valid: tokenValidation.pc.valid,
+          coin_mint: tokenValidation.coin.address,
+          pc_mint: tokenValidation.pc.address,
+          request_id: generateRequestId()
+        }, 'Token validation failed - both coin and PC tokens must be valid');
         return null;
       }
 
@@ -456,7 +606,14 @@ export class RaydiumDetector {
 
       const poolValidation = await this.validatePoolWithCircuitBreaker(ammId, 'raydium');
       if (!poolValidation.valid) {
-        console.log(`❌ Pool validation failed: ${poolValidation.reason}`);
+        logger.warn({
+          component: 'raydium-detector',
+          event: 'pool.validation.failed',
+          dex: 'raydium',
+          pool_address: ammId,
+          reason: poolValidation.reason,
+          request_id: generateRequestId()
+        }, 'Pool validation failed');
         return null;
       }
 
@@ -478,7 +635,17 @@ export class RaydiumDetector {
         quoteName = 'Unknown';
       }
 
-      console.log(`✅ Token pair validated: ${memeToken} (${quoteName === 'Unknown' ? 'MEME' : 'MEME'}) / ${quoteToken} (${quoteName})`);
+      logger.info({
+        component: 'raydium-detector',
+        event: 'token_pair.validation.success',
+        dex: 'raydium',
+        meme_token: memeToken,
+        quote_token: quoteToken,
+        quote_name: quoteName,
+        pool_address: ammId,
+        confidence: allValid ? 'high' : 'medium',
+        request_id: generateRequestId()
+      }, `Token pair validated: ${memeToken} (MEME) / ${quoteToken} (${quoteName})`);
 
       return {
         memeToken,
@@ -492,7 +659,13 @@ export class RaydiumDetector {
       };
 
     } catch (error) {
-      console.error(`❌ Token pair extraction failed: ${error.message}`);
+      logger.error({
+        component: 'raydium-detector',
+        event: 'token_pair.extraction.error',
+        dex: 'raydium',
+        error: error.message,
+        request_id: generateRequestId()
+      }, 'Token pair extraction failed');
       this.metrics.validationFailures++;
       return null;
     }
@@ -511,7 +684,15 @@ export class RaydiumDetector {
       });
     } catch (error) {
       this.metrics.circuitBreakerTrips++;
-      console.warn(`⚠️ Circuit breaker blocked ${tokenType} validation: ${tokenAddress}`);
+      logger.warn({
+        component: 'raydium-detector',
+        event: 'circuit_breaker.blocked',
+        dex: 'raydium',
+        token_type: tokenType,
+        token_address: tokenAddress,
+        error: error.message,
+        request_id: generateRequestId()
+      }, `Circuit breaker blocked ${tokenType} validation`);
       
       // Return fallback validation result
       return {
@@ -559,9 +740,23 @@ export class RaydiumDetector {
 
     // Alert on performance degradation
     if (elapsedMs > 25) {
-      console.error(`🚨 CRITICAL: Raydium detector severely degraded: ${elapsedMs.toFixed(1)}ms`);
+      logger.error({
+        component: 'raydium-detector',
+        event: 'performance.critical_degradation',
+        dex: 'raydium',
+        latency_ms: elapsedMs,
+        threshold_ms: 25,
+        request_id: generateRequestId()
+      }, `CRITICAL: Raydium detector severely degraded: ${elapsedMs.toFixed(1)}ms`);
     } else if (elapsedMs > 15) {
-      console.warn(`⚠️ WARNING: Raydium detector slow: ${elapsedMs.toFixed(1)}ms (target: <15ms)`);
+      logger.warn({
+        component: 'raydium-detector',
+        event: 'performance.slow',
+        dex: 'raydium',
+        latency_ms: elapsedMs,
+        target_ms: 15,
+        request_id: generateRequestId()
+      }, `WARNING: Raydium detector slow: ${elapsedMs.toFixed(1)}ms (target: <15ms)`);
     }
   }
 
@@ -623,7 +818,12 @@ export class RaydiumDetector {
       circuitBreakerTrips: 0
     };
     
-    console.log('📊 Raydium detector metrics reset');
+    logger.info({
+      component: 'raydium-detector',
+      event: 'metrics.reset',
+      dex: 'raydium',
+      request_id: generateRequestId()
+    }, 'Raydium detector metrics reset');
   }
 
   /**
@@ -636,7 +836,12 @@ export class RaydiumDetector {
       this.signalBus.removeAllListeners('raydiumLpDetected');
     }
     
-    console.log('🛑 Raydium detector shutdown complete');
+    logger.info({
+      component: 'raydium-detector',
+      event: 'detector.shutdown.complete',
+      dex: 'raydium',
+      request_id: generateRequestId()
+    }, 'Raydium detector shutdown complete');
   }
 }
 
