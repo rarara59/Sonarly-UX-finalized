@@ -1,0 +1,7 @@
+2025-08-29T13:43:03.987Z [INFO] SystemOrchestrator: Components registered with factory
+✅ Components registered
+✅ Adapter imported
+2025-08-29T13:43:03.997Z [INFO] ComponentFactory: Component created {"componentType":"rpc-connection-pool","useFakes":true,"instanceKey":"rpc-connection-pool_fake"}
+✅ Fake component created
+✅ Fake component works: 363295738
+   Is fake result: false

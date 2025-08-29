@@ -1,0 +1,6 @@
+✅ System orchestrator imported
+2025-08-29T13:42:30.746Z [INFO] SystemOrchestrator: Starting trading system...
+2025-08-29T13:42:30.747Z [ERROR] SystemOrchestrator: System startup failed {"error":"Configuration invalid: HELIUS_RPC_URL: Required when USE_FAKES=false"}
+2025-08-29T13:42:30.747Z [INFO] SystemOrchestrator: Shutting down trading system...
+2025-08-29T13:42:30.747Z [INFO] SystemOrchestrator: Trading system shut down complete
+❌ System test failed: Configuration invalid: HELIUS_RPC_URL: Required when USE_FAKES=false

@@ -511,6 +511,21 @@ class RpcConnectionPool extends EventEmitter {
   }
   
   /**
+   * Health check for system monitoring
+   */
+  async healthCheck() {
+    try {
+      const slot = await this.call('getSlot', [], { 
+        timeout: 1000,
+        allowFailover: false 
+      });
+      return slot > 0;
+    } catch (error) {
+      return false;
+    }
+  }
+  
+  /**
    * Comprehensive cleanup and destroy
    */
   async destroy() {
@@ -595,4 +610,5 @@ class RpcConnectionPool extends EventEmitter {
   }
 }
 
+export { RpcConnectionPool };
 export default RpcConnectionPool;

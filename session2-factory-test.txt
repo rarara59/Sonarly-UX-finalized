@@ -1,0 +1,8 @@
+✅ Orchestrator imported
+2025-08-29T13:41:17.755Z [INFO] SystemOrchestrator: Components registered with factory
+✅ Components registered
+2025-08-29T13:41:17.769Z [INFO] ComponentFactory: Component created {"componentType":"rpc-connection-pool","useFakes":false,"instanceKey":"rpc-connection-pool_real"}
+✅ Real component created via factory
+{"level":"warn","message":"High latency detected","latency":135,"endpointIndex":0,"timestamp":"2025-08-29T13:41:17.904Z"}
+✅ Component works through factory: SUCCESS
+   Slot: 363301979
