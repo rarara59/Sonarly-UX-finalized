@@ -1,6 +1,9 @@
 // File: system/config-manager.js
 // Environment-based configuration management
 
+import dotenv from 'dotenv';
+dotenv.config();
+
 export class ConfigManager {
   constructor() {
     this.config = new Map();

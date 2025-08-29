@@ -19,7 +19,13 @@ async function verifyRpcPool() {
   try {
     // Create pool instance
     console.log('📦 Creating RPC Connection Pool...');
-    pool = new RpcConnectionPool();
+    pool = new RpcConnectionPool({
+      endpoints: [
+        process.env.CHAINSTACK_RPC_URL,
+        process.env.HELIUS_RPC_URL,
+        process.env.PUBLIC_RPC_URL
+      ].filter(Boolean)
+    });
     
     console.log('✅ Pool created with endpoints:');
     pool.config.endpoints.forEach((endpoint, index) => {

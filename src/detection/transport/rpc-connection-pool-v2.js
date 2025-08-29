@@ -27,9 +27,9 @@ const ENDPOINT_CONFIGS = {
   },
   chainstack: {
     pattern: /chainstack|p2pify/i,
-    rpsLimit: 10,  // Reduced to match actual plan limits
+    rpsLimit: 35,
     weight: 30,
-    maxConcurrent: 20,  // Reduced concurrent connections
+    maxConcurrent: 80,
     timeout: 1500,
     priority: 0  // Highest priority due to best latency
   },
@@ -520,15 +520,9 @@ class RpcConnectionPoolV2 extends EventEmitter {
       
       // Intelligent circuit breaker logic
       if (this.config.breakerEnabled) {
-        // Don't open circuit for rate limiting - just back off
-        if (errorType === 'rate_limit') {
-          // Temporarily reduce rate limit
-          endpoint.rateLimit.tokens = Math.max(0, endpoint.rateLimit.tokens - 5);
-          return true; // Retry with backoff
-        }
-        
-        // Don't open circuit for timeout during high load
-        if (errorType === 'timeout' && this.globalInFlight > this.config.maxGlobalInFlight * 0.8) {
+        // Don't open circuit for rate limiting or timeout errors during high load
+        if (errorType === 'rate_limit' || 
+            (errorType === 'timeout' && this.globalInFlight > this.config.maxGlobalInFlight * 0.8)) {
           return true; // Retry
         }
         
@@ -536,7 +530,7 @@ class RpcConnectionPoolV2 extends EventEmitter {
         endpoint.breaker.lastFailure = Date.now();
         endpoint.breaker.consecutiveSuccesses = 0;
         
-        // Open circuit if too many non-rate-limit failures
+        // Open circuit if too many failures
         if (endpoint.breaker.failures >= 5) {
           endpoint.breaker.state = 'OPEN';
           this.emit('breaker-open', endpoint.index);
@@ -553,10 +547,9 @@ class RpcConnectionPoolV2 extends EventEmitter {
     const message = error.message.toLowerCase();
     
     if (message.includes('timeout')) return 'timeout';
-    if (message.includes('rate') || message.includes('429') || message.includes('rps limit')) return 'rate_limit';
+    if (message.includes('rate') || message.includes('429')) return 'rate_limit';
     if (message.includes('econnrefused') || message.includes('enotfound')) return 'network';
     if (message.includes('503') || message.includes('502')) return 'server';
-    if (message.includes('no available endpoints')) return 'no_endpoints';
     
     return 'unknown';
   }

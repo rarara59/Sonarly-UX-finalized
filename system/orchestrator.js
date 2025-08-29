@@ -25,16 +25,17 @@ export class SystemOrchestrator {
     componentFactory.register(
       'rpc-connection-pool',
       async (config, logger) => {
-        const { RpcConnectionPool } = await import('../src/detection/transport/rpc-connection-pool.js');
+        const RpcModule = await import('../src/detection/transport/rpc-connection-pool.js');
+        const RpcConnectionPool = RpcModule.default || RpcModule.RpcConnectionPoolV2;
         const poolConfig = {
           endpoints: [
-            config.get('HELIUS_RPC_URL'),
             config.get('CHAINSTACK_RPC_URL'),
+            config.get('HELIUS_RPC_URL'),
             config.get('PUBLIC_RPC_URL')
           ].filter(Boolean),
-          rpsLimit: parseInt(config.get('RPC_DEFAULT_RPS_LIMIT')) || 50,
-          concurrency: parseInt(config.get('RPC_DEFAULT_CONCURRENCY_LIMIT')) || 10,
-          timeout: parseInt(config.get('RPC_DEFAULT_TIMEOUT_MS')) || 2000,
+          maxGlobalInFlight: parseInt(config.get('RPC_MAX_IN_FLIGHT_GLOBAL')) || 200,
+          queueMaxSize: parseInt(config.get('RPC_QUEUE_MAX_SIZE')) || 1000,
+          queueDeadline: parseInt(config.get('RPC_QUEUE_DEADLINE_MS')) || 5000,
           breakerEnabled: config.get('RPC_BREAKER_ENABLED') === 'true',
           keepAliveEnabled: config.get('RPC_KEEP_ALIVE_ENABLED') === 'true'
         };
