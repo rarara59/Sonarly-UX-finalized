@@ -1,681 +1,598 @@
 /**
- * Renaissance RPC Connection Pool
- * File: src/detection/transport/rpc-connection-pool.js
- * 
- * Target: Passes all Phase 2 checkpoints
- * - P2.1: Weight distribution working ✅
- * - P2.2: Concurrency caps enforced ✅
- * - P2.3: RPS limits respected ✅ 
- * - P2.4: Timeout handling proper ✅
- * - P2.5: Fallback logic functional ✅
- * - P2.6: Health status accurate ✅
- * 
- * Renaissance Principles:
- * - Simple, reliable, fast
- * - No over-engineering
- * - Null-safe throughout
- * - Production-ready error handling
+ * RPC Connection Pool for Solana Trading System
+ * Simple, robust implementation with failover, circuit breaking, and memory safety
+ * Optimized for meme coin trading with <30ms latency requirement
  */
 
-import { logger } from '../../utils/logger-simple.js';
-import fetch from 'node-fetch';
-import { Agent as HttpAgent } from 'http';
-import { Agent as HttpsAgent } from 'https';
-import {
-  getDefaultEndpoints,
-  createStartupConfigLog,
-  createRpcPayload,
-  canMakeRequest,
-  determineOutcome,
-  envInt,
-  envBool
-} from './rpc-pool-utils.js';
+import https from 'https';
+import http from 'http';
+import { EventEmitter } from 'events';
+import dotenv from 'dotenv';
 
-export class RpcConnectionPool {
-  constructor(endpoints = null, options = {}) {
-    // Support both old (performanceMonitor) and new (options) patterns
-    if (options && typeof options.recordLatency === 'function') {
-      // Old pattern: second param is performanceMonitor
-      this.monitor = options;
-      this.fetchFn = fetch; // Use default fetch
-    } else {
-      // New pattern: second param is options object
-      this.monitor = options.performanceMonitor || null;
-      this.fetchFn = options.fetch || fetch; // Allow fetch injection for testing
+dotenv.config();
+
+class RpcConnectionPool extends EventEmitter {
+  constructor(config = {}) {
+    super();
+    
+    // Load configuration with all safety checks
+    this.config = {
+      // RPC Endpoints (filter out null/undefined)
+      endpoints: (config.endpoints || [
+        process.env.HELIUS_RPC_URL,
+        process.env.CHAINSTACK_RPC_URL,
+        process.env.PUBLIC_RPC_URL
+      ]).filter(Boolean),
+      
+      // Global Defaults
+      rpsLimit: parseInt(process.env.RPC_DEFAULT_RPS_LIMIT) || 50,
+      concurrency: parseInt(process.env.RPC_DEFAULT_CONCURRENCY_LIMIT) || 10,
+      timeout: parseInt(process.env.RPC_DEFAULT_TIMEOUT_MS) || 2000,
+      rateWindow: parseInt(process.env.RPC_RATE_WINDOW_MS) || 1000,
+      maxInFlight: parseInt(process.env.RPC_MAX_IN_FLIGHT_GLOBAL) || 200,
+      
+      // Queue Config
+      queueMaxSize: parseInt(process.env.RPC_QUEUE_MAX_SIZE) || 1000,
+      queueDeadline: parseInt(process.env.RPC_QUEUE_DEADLINE_MS) || 5000,
+      
+      // Circuit Breaker
+      breakerEnabled: process.env.RPC_BREAKER_ENABLED === 'true',
+      breakerThreshold: parseInt(process.env.RPC_BREAKER_FAILURE_THRESHOLD) || 5,
+      breakerCooldown: parseInt(process.env.RPC_BREAKER_COOLDOWN_MS) || 60000,
+      breakerHalfOpenProbes: parseInt(process.env.RPC_BREAKER_HALF_OPEN_PROBES) || 1,
+      
+      // Health Monitoring
+      healthInterval: parseInt(process.env.RPC_HEALTH_INTERVAL_MS) || 30000,
+      healthProbeTimeout: parseInt(process.env.RPC_HEALTH_PROBE_TIMEOUT_MS) || 1000,
+      
+      // Connection Management
+      keepAliveEnabled: process.env.RPC_KEEP_ALIVE_ENABLED === 'true',
+      keepAliveSockets: parseInt(process.env.RPC_KEEP_ALIVE_SOCKETS) || 50,
+      keepAliveTimeout: parseInt(process.env.RPC_KEEP_ALIVE_TIMEOUT_MS) || 60000,
+      
+      // Logging
+      logLevel: process.env.LOG_LEVEL || 'info',
+      logJson: process.env.LOG_JSON === 'true',
+      traceRequestIds: process.env.TRACE_REQUEST_IDS === 'true',
+      
+      ...config
+    };
+    
+    // Validate endpoints exist
+    if (!this.config.endpoints || this.config.endpoints.length === 0) {
+      throw new Error('No RPC endpoints configured');
     }
     
-    // ADD THESE LINES:
-    this.fetch = this.fetchFn; // Alias for consistency
-    this.logger = options?.logger || logger; // Use injected logger or fallback to import
+    // Initialize state
+    this.currentIndex = 0;
+    this.requestId = 0;
+    this.inFlightRequests = new Map();
+    this.isDestroyed = false;
     
-    // Initialize endpoints with health tracking
-    this.endpoints = new Map();
-    this.initializeEndpoints(endpoints || getDefaultEndpoints());
+    // Circuit breaker state for each endpoint
+    this.circuitBreakers = new Map();
+    this.config.endpoints.forEach((endpoint, index) => {
+      this.circuitBreakers.set(index, {
+        state: 'CLOSED',
+        failures: 0,
+        lastFailure: 0,
+        halfOpenProbes: 0
+      });
+    });
     
-    // CRITICAL: Never allow null currentEndpoint
-    this.currentEndpoint = this.selectBestEndpoint();
-    if (!this.currentEndpoint) {
-      throw new Error('No valid endpoints available during initialization');
+    // Stats tracking
+    this.stats = {
+      calls: 0,
+      failures: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      p95Latency: 0,
+      latencies: []
+    };
+    
+    // Rate limiting
+    this.rateLimiter = {
+      requests: [],
+      window: this.config.rateWindow
+    };
+    
+    // HTTP agents for connection pooling
+    this.agents = new Map();
+    if (this.config.keepAliveEnabled) {
+      this.config.endpoints.forEach((endpoint, index) => {
+        const url = new URL(endpoint);
+        const AgentClass = url.protocol === 'https:' ? https.Agent : http.Agent;
+        this.agents.set(index, new AgentClass({
+          keepAlive: true,
+          maxSockets: this.config.keepAliveSockets,
+          timeout: this.config.keepAliveTimeout
+        }));
+      });
     }
     
-    // Request tracking with overflow protection
-    this.requestCounter = 0;
-    this.activeRequests = 0;
-    
-    // Configuration from environment
-    this.maxConcurrentRequests = envInt('RPC_DEFAULT_CONCURRENCY_LIMIT', 10);
-    this.globalMaxInFlight = envInt('RPC_MAX_IN_FLIGHT_GLOBAL', 200);
-    
-    // HTTP agents with keep-alive
-    this.httpAgent = null;
-    this.httpsAgent = null;
-    this.initializeHttpAgents();
-    
-    // Simple binary health checking
-    this.healthCheckInterval = envInt('RPC_HEALTH_INTERVAL_MS', 30000);
+    // Health monitoring
     this.healthTimer = null;
     this.startHealthMonitoring();
     
-    // Statistics tracking
-    this.stats = {
-      totalRequests: 0,
-      successfulRequests: 0,
-      failedRequests: 0,
-      failovers: 0,
-      avgLatency: 0
-    };
-    
-    // Log startup configuration
-    const configSummary = createStartupConfigLog(this.endpoints);
-    this.logger.info(configSummary, 'RPC connection pool initialized');
+    // Memory cleanup timer
+    this.cleanupTimer = setInterval(() => this.cleanupMemory(), 60000);
   }
   
-  // Initialize HTTP agents with keep-alive
-  initializeHttpAgents() {
-    const keepAliveEnabled = envBool('RPC_KEEP_ALIVE_ENABLED', true);
-    const maxSockets = envInt('RPC_KEEP_ALIVE_SOCKETS', 50);
-    const timeout = envInt('RPC_KEEP_ALIVE_TIMEOUT_MS', 60000);
-    
-    if (keepAliveEnabled) {
-      this.httpAgent = new HttpAgent({
-        keepAlive: true,
-        maxSockets,
-        timeout
-      });
-      
-      this.httpsAgent = new HttpsAgent({
-        keepAlive: true,
-        maxSockets,
-        timeout
-      });
-      
-      this.logger.info({
-        keep_alive: {
-          enabled: true,
-          max_sockets: maxSockets,
-          timeout_ms: timeout
-        }
-      }, 'HTTP keep-alive agents initialized');
-    }
-  }
-  
-  // Initialize endpoints with health status
-  initializeEndpoints(endpointConfigs) {
-    Object.entries(endpointConfigs).forEach(([name, config]) => {
-      this.endpoints.set(name, {
-        name,
-        url: config.url,
-        priority: config.priority || 1,
-        maxRequestsPerSecond: config.maxRequestsPerSecond || 50,
-        timeout: config.timeout || 500,
-        weight: config.weight || 100,
-        concurrencyLimit: config.concurrencyLimit || 10,
-        
-        // Health tracking (simple binary)
-        healthy: true,
-        consecutiveFailures: 0,
-        lastSuccess: Date.now(),
-        lastFailure: null,
-        
-        // Rate limiting
-        requestsThisSecond: 0,
-        lastSecondReset: Date.now(),
-        activeRequests: 0,
-        
-        // Performance tracking with initialization
-        totalRequests: 0,
-        successfulRequests: 0,
-        totalLatency: 0,
-        avgLatency: 0
-      });
-    });
-  }
-  
-  // Generate request ID with overflow protection
-  generateRequestId() {
-    this.requestCounter = (this.requestCounter + 1) % Number.MAX_SAFE_INTEGER;
-    return `req_${Date.now()}_${this.requestCounter}`;
-  }
-  
-  // Main RPC call method
+  /**
+   * Main RPC call method with all safety patterns
+   */
   async call(method, params = [], options = {}) {
-    const startTime = performance.now();
-    const requestId = this.generateRequestId();
-    const timeout = options.timeout || 500; // Default timeout
-    let actualEndpointUsed = null;
-    
-    // Global concurrency check
-    if (this.activeRequests >= this.globalMaxInFlight) {
-      const error = new Error('Global request limit exceeded');
-      this.logRpcCall(requestId, method, 0, 'rate_limited', null, error);
-      throw error;
+    // Prevent calls after destroy
+    if (this.isDestroyed) {
+      throw new Error('RPC pool has been destroyed');
     }
     
-    this.activeRequests++;
-    this.stats.totalRequests++;
+    // Generate request ID with overflow protection
+    const requestId = this.getNextRequestId();
+    const startTime = Date.now();
+    
+    // Check rate limits
+    if (!this.checkRateLimit()) {
+      this.logError('Rate limit exceeded', { requestId });
+      throw new Error('Rate limit exceeded');
+    }
+    
+    // Check global concurrency
+    if (this.inFlightRequests.size >= this.config.maxInFlight) {
+      this.logError('Max in-flight requests reached', { requestId });
+      throw new Error('Max in-flight requests reached');
+    }
+    
+    // Find available endpoint
+    const endpointIndex = this.selectEndpoint();
+    if (endpointIndex === null) {
+      this.logError('No available endpoints', { requestId });
+      throw new Error('All endpoints are unavailable');
+    }
+    
+    const endpoint = this.config.endpoints[endpointIndex];
     
     try {
-      const result = await this.executeCallWithFailover(method, params, timeout, requestId);
+      // Track in-flight request
+      const abortController = new AbortController();
+      this.inFlightRequests.set(requestId, {
+        startTime,
+        endpoint,
+        abortController
+      });
       
-      const latency = performance.now() - startTime;
-      this.updateSuccessMetrics(latency);
+      // Create timeout promise
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          abortController.abort();
+          reject(new Error(`Request timeout after ${this.config.timeout}ms`));
+        }, this.config.timeout);
+      });
       
-      // Note: Actual endpoint logging now happens in executeCallWithFailover
-      // This is just the overall call success log
-      this.logger.debug({
-        request_id: requestId,
+      // Create request promise
+      const requestPromise = this.executeRequest(
+        endpoint,
         method,
-        latency_ms: Math.round(latency * 100) / 100,
-        outcome: 'success'
-      }, 'RPC call completed successfully');
+        params,
+        requestId,
+        endpointIndex,
+        abortController.signal
+      );
       
-      if (this.monitor) {
-        this.monitor.recordLatency('rpcConnection', latency, true);
-      }
+      // Race between request and timeout
+      const result = await Promise.race([requestPromise, timeoutPromise]);
+      
+      // Record success
+      this.recordSuccess(endpointIndex, Date.now() - startTime);
       
       return result;
       
     } catch (error) {
-      const latency = performance.now() - startTime;
-      const outcome = determineOutcome(false, error);
+      // Record failure with error safety
+      this.recordFailure(endpointIndex, error);
       
-      this.stats.failedRequests++;
-      
-      // Log final failure (actual endpoint logging happened in executeCallWithFailover)
-      this.logger.error({
-        request_id: requestId,
-        method,
-        latency_ms: Math.round(latency * 100) / 100,
-        error: error.message,
-        outcome
-      }, 'RPC call failed after all attempts');
-      
-      if (this.monitor) {
-        this.monitor.recordLatency('rpcConnection', latency, false);
+      // Try failover if enabled
+      if (options.allowFailover !== false) {
+        return this.failover(method, params, { 
+          ...options, 
+          allowFailover: false,
+          excludeEndpoint: endpointIndex 
+        });
       }
       
       throw error;
+      
     } finally {
-      this.activeRequests--;
+      // Clean up in-flight request
+      this.inFlightRequests.delete(requestId);
     }
   }
   
-  // Execute call with automatic failover
-  async executeCallWithFailover(method, params, timeout, requestId) {
-    const maxAttempts = Math.min(this.endpoints.size, 3); // Limit failover attempts
-    let lastError;
-    
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // CRITICAL FIX: Use weighted endpoint selection
-      const endpoint = attempt === 0 ? this.selectBestEndpoint() : this.selectNextBestEndpoint();
+  /**
+   * Execute HTTP request to RPC endpoint
+   */
+  async executeRequest(endpoint, method, params, requestId, endpointIndex, signal) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(endpoint);
+      const data = JSON.stringify({
+        jsonrpc: '2.0',
+        id: requestId,
+        method,
+        params
+      });
       
-      try {
-        // Check endpoint availability
-        if (!endpoint || !endpoint.healthy) {
-          throw new Error(`Endpoint ${endpoint?.name || 'unknown'} marked unhealthy`);
-        }
-        
-        // Check concurrency limits (P2.2) - don't mark as endpoint failure  
-        if (endpoint.activeRequests >= endpoint.concurrencyLimit) {
-          // This is a local pool condition, not an endpoint failure
-          const error = new Error(`Concurrency limit exceeded for endpoint ${endpoint.name}`);
-          error.isPoolCondition = true;
-          throw error;
-        }
-        // Note: RPS checking now happens in makeHttpRequest
-        
-        // Make the actual request
-        const startTime = performance.now();
-        const result = await this.makeHttpRequest(endpoint, method, params, timeout, requestId);
-        const endpointLatency = performance.now() - startTime;
-        
-        // Update endpoint success metrics with latency (P2.6 Fix)
-        this.updateEndpointSuccess(endpoint, endpointLatency);
-        
-        return result;
-        
-      } catch (error) {
-        lastError = error;
-        
-        // P2.6 Fix: Only mark as endpoint failure for actual endpoint problems
-        if (this.isEndpointFailure(error)) {
-          this.updateEndpointFailure(endpoint);
-        }
-        
-        // Try next endpoint (P2.5 - Fallback logic)
-        // Only failover for actual endpoint failures, not pool conditions
-        if (!this.isEndpointFailure(error)) {
-          throw error; // Don't failover for RPS limits, concurrency limits, etc.
-        }
-        
-        // Continue with failover for endpoint failures
-        if (attempt < maxAttempts - 1) {
-          this.stats.failovers++;
-          
-          this.logger.info({
-            request_id: requestId,
-            failover_from: endpoint.name,
-            attempt: attempt + 2,
-            reason: error.message
-          }, 'Failing over to next endpoint');
-          
-          continue; // Try next endpoint
-        }
-        
-        // No more endpoints to try
-        break;
-      }
-    }
-    
-    throw new Error(`All RPC endpoints failed. Last error: ${lastError?.message || 'Unknown error'}`);
-  }
-  
-  // Make HTTP request with proper error handling
-  async makeHttpRequest(endpoint, method, params, timeout, requestId) {
-    // CRITICAL FIX: Check RPS limit before making request
-    if (!canMakeRequest(endpoint)) {
-      const error = new Error(`Rate limit exceeded for endpoint ${endpoint.name}`);
-      error.isPoolCondition = true; // Don't mark endpoint as unhealthy
-      this.logRpcCall(requestId, method, 0, 'rps_limit', endpoint.name, error);
-      throw error;
-    }
-    
-    const payload = createRpcPayload(method, params, this.requestCounter);
-    
-    // Set up abort controller for timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-    
-    try {
-      // Increment request counter AFTER RPS check
-      endpoint.requestsThisSecond++;
-      endpoint.activeRequests++;
-      endpoint.totalRequests++;
-      
-      // Select appropriate agent based on URL scheme
-      const agent = endpoint.url.startsWith('https:') ? this.httpsAgent : this.httpAgent;
-      
-      const response = await this.fetchFn(endpoint.url, {
+      const options = {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data)
         },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-        agent // Use keep-alive agent
+        signal
+      };
+      
+      // Use keep-alive agent if available
+      if (this.agents.has(endpointIndex)) {
+        options.agent = this.agents.get(endpointIndex);
+      }
+      
+      const protocol = url.protocol === 'https:' ? https : http;
+      const req = protocol.request(options, (res) => {
+        let responseData = '';
+        
+        res.on('data', (chunk) => {
+          responseData += chunk;
+        });
+        
+        res.on('end', () => {
+          try {
+            const response = JSON.parse(responseData);
+            
+            if (response.error) {
+              reject(new Error(response.error.message || 'RPC error'));
+            } else {
+              // Ensure proper number parsing (prevent string concatenation bugs)
+              if (response.result && typeof response.result === 'string') {
+                const parsed = parseInt(response.result);
+                if (!isNaN(parsed)) {
+                  response.result = parsed;
+                }
+              }
+              resolve(response.result);
+            }
+          } catch (parseError) {
+            reject(new Error('Invalid JSON response'));
+          }
+        });
       });
       
-      clearTimeout(timeoutId);
+      req.on('error', (error) => {
+        reject(error);
+      });
       
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+      
+      // Handle abort signal
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          req.destroy();
+          reject(new Error('Request aborted'));
+        });
       }
       
-      const data = await response.json();
-      
-      if (data.error) {
-        throw new Error(`RPC Error: ${data.error.message} (${data.error.code})`);
-      }
-      
-      endpoint.successfulRequests++;
-      return data.result;
-      
-    } catch (error) {
-      clearTimeout(timeoutId);
-      
-      if (error.name === 'AbortError') {
-        throw new Error(`Request timeout after ${timeout}ms`);
-      }
-      
-      throw error;
-    } finally {
-      endpoint.activeRequests--;
-    }
+      req.write(data);
+      req.end();
+    });
   }
   
-  // Get current endpoint (never returns null)
-  getCurrentEndpoint() {
-    const endpoint = this.endpoints.get(this.currentEndpoint);
-    if (!endpoint) {
-      // CRITICAL: Recovery from null currentEndpoint
-      this.currentEndpoint = this.selectBestEndpoint();
-      if (!this.currentEndpoint) {
-        throw new Error('No endpoints available');
+  /**
+   * Select next available endpoint with circuit breaker check
+   */
+  selectEndpoint() {
+    const maxAttempts = this.config.endpoints.length;
+    
+    for (let i = 0; i < maxAttempts; i++) {
+      const index = (this.currentIndex + i) % this.config.endpoints.length;
+      const breaker = this.circuitBreakers.get(index);
+      
+      if (!breaker) continue;
+      
+      // Check circuit breaker state
+      if (breaker.state === 'CLOSED') {
+        this.currentIndex = (index + 1) % this.config.endpoints.length;
+        return index;
       }
-      return this.endpoints.get(this.currentEndpoint);
-    }
-    return endpoint;
-  }
-  
-  // Select best endpoint with weight-based distribution (P2.1 Fix)
-  selectBestEndpoint() {
-    // Try healthy endpoints first
-    const healthyEndpoints = Array.from(this.endpoints.values())
-      .filter(ep => ep.healthy);
-    
-    if (healthyEndpoints.length > 0) {
-      return this.selectWeightedEndpoint(healthyEndpoints);
-    }
-    
-    // Fallback: Use any endpoint, mark as healthy (recovery mechanism)
-    const allEndpoints = Array.from(this.endpoints.values())
-      .sort((a, b) => a.priority - b.priority);
-    
-    if (allEndpoints.length > 0) {
-      // Reset health status for recovery
-      allEndpoints[0].healthy = true;
-      allEndpoints[0].consecutiveFailures = 0;
       
-      this.logger.warn({
-        endpoint: allEndpoints[0].name,
-        action: 'force_recovery'
-      }, 'No healthy endpoints available, forcing recovery of best endpoint');
+      if (breaker.state === 'HALF_OPEN') {
+        if (breaker.halfOpenProbes < this.config.breakerHalfOpenProbes) {
+          breaker.halfOpenProbes++;
+          this.currentIndex = (index + 1) % this.config.endpoints.length;
+          return index;
+        }
+      }
       
-      return allEndpoints[0]; // Return object, not name
-    }
-    
-    return null; // Only if no endpoints configured at all
-  }
-  
-  // Weighted random selection based on endpoint weights (P2.1 Implementation)
-  selectWeightedEndpoint(endpoints) {
-    if (endpoints.length === 1) {
-      return endpoints[0]; // Return object, not name
-    }
-    
-    // Calculate total weight
-    const totalWeight = endpoints.reduce((sum, ep) => sum + ep.weight, 0);
-    
-    if (totalWeight === 0) {
-      // Fallback to priority if all weights are 0
-      const sortedByPriority = endpoints.sort((a, b) => a.priority - b.priority);
-      return sortedByPriority[0]; // Return object, not name
-    }
-    
-    // Weighted random selection
-    const random = Math.random() * totalWeight;
-    let runningWeight = 0;
-    
-    for (const endpoint of endpoints) {
-      runningWeight += endpoint.weight;
-      if (random <= runningWeight) {
-        return endpoint; // Return object, not name
+      if (breaker.state === 'OPEN') {
+        // Check if cooldown period has passed
+        const now = Date.now();
+        if (now - breaker.lastFailure > this.config.breakerCooldown) {
+          breaker.state = 'HALF_OPEN';
+          breaker.halfOpenProbes = 1;
+          this.currentIndex = (index + 1) % this.config.endpoints.length;
+          return index;
+        }
       }
     }
     
-    // Fallback (should never reach here, but safety first)
-    return endpoints[0]; // Return object, not name
+    return null; // No available endpoints
   }
   
-  // Public method for testing - exposes weighted endpoint selection
-  testSelectWeightedEndpoint(endpoints) {
-    return this.selectWeightedEndpoint(endpoints);
-  }
-  
-  // Select next best endpoint for failover
-  selectNextBestEndpoint() {
-    // Get all healthy endpoints except the one we just tried
-    const healthyEndpoints = Array.from(this.endpoints.values())
-      .filter(ep => ep.healthy);
-    
-    // If we have healthy endpoints, use weighted selection again
-    if (healthyEndpoints.length > 0) {
-      return this.selectWeightedEndpoint(healthyEndpoints);
+  /**
+   * Failover to next available endpoint
+   */
+  async failover(method, params, options) {
+    const nextEndpoint = this.selectEndpoint();
+    if (nextEndpoint === null) {
+      throw new Error('Failover failed: no available endpoints');
     }
     
-    return null;
+    this.logInfo('Attempting failover', { 
+      endpoint: this.config.endpoints[nextEndpoint],
+      method 
+    });
+    
+    return this.call(method, params, options);
   }
   
-  // Determine if error represents actual endpoint failure (P2.6 Fix)
-  isEndpointFailure(error) {
-    // Local pool conditions are NOT endpoint failures
-    if (error.isPoolCondition) {
+  /**
+   * Record successful request
+   */
+  recordSuccess(endpointIndex, latency) {
+    this.stats.calls++;
+    this.stats.totalLatency += latency;
+    this.stats.avgLatency = this.stats.totalLatency / this.stats.calls;
+    
+    // Track latencies for p95 calculation
+    this.stats.latencies.push(latency);
+    if (this.stats.latencies.length > 1000) {
+      this.stats.latencies.shift(); // Keep only last 1000
+    }
+    
+    // Calculate p95
+    if (this.stats.latencies.length > 0) {
+      const sorted = [...this.stats.latencies].sort((a, b) => a - b);
+      const p95Index = Math.floor(sorted.length * 0.95);
+      this.stats.p95Latency = sorted[p95Index];
+    }
+    
+    // Reset circuit breaker on success
+    const breaker = this.circuitBreakers.get(endpointIndex);
+    if (breaker) {
+      if (breaker.state === 'HALF_OPEN') {
+        breaker.state = 'CLOSED';
+        breaker.failures = 0;
+        breaker.halfOpenProbes = 0;
+        this.logInfo('Circuit breaker closed', { endpointIndex });
+      }
+      breaker.failures = Math.max(0, breaker.failures - 1);
+    }
+    
+    // Log if latency exceeds target
+    if (latency > 30) {
+      this.logWarn('High latency detected', { latency, endpointIndex });
+    }
+  }
+  
+  /**
+   * Record failed request with circuit breaker logic
+   */
+  recordFailure(endpointIndex, error) {
+    this.stats.failures++;
+    
+    const breaker = this.circuitBreakers.get(endpointIndex);
+    if (breaker && this.config.breakerEnabled) {
+      breaker.failures++;
+      breaker.lastFailure = Date.now();
+      
+      if (breaker.failures >= this.config.breakerThreshold) {
+        if (breaker.state !== 'OPEN') {
+          breaker.state = 'OPEN';
+          this.logWarn('Circuit breaker opened', { 
+            endpointIndex, 
+            failures: breaker.failures 
+          });
+        }
+      }
+    }
+    
+    // Safe error message handling
+    const errorMessage = error && error.message ? error.message : 'Unknown error';
+    this.logError('Request failed', { endpointIndex, error: errorMessage });
+  }
+  
+  /**
+   * Check rate limit
+   */
+  checkRateLimit() {
+    const now = Date.now();
+    const windowStart = now - this.config.rateWindow;
+    
+    // Remove old requests outside window
+    this.rateLimiter.requests = this.rateLimiter.requests.filter(
+      time => time > windowStart
+    );
+    
+    if (this.rateLimiter.requests.length >= this.config.rpsLimit) {
       return false;
     }
     
-    const message = (error.message || '').toLowerCase();
-    
-    // Local throttling conditions - NOT endpoint failures
-    if (message.includes('rate limit exceeded for endpoint')) return false;
-    if (message.includes('concurrency limit exceeded for endpoint')) return false;
-    if (message.includes('marked unhealthy')) return false;
-    
-    // Actual endpoint failures
-    if (message.includes('timeout')) return true;
-    if (message.includes('http ')) return true;
-    if (message.includes('network')) return true;
-    if (message.includes('connection')) return true;
-    if (message.includes('rpc error')) return true;
-    if (message.includes('abort')) return true;
-    
-    // Default to endpoint failure for unknown errors (conservative)
+    this.rateLimiter.requests.push(now);
     return true;
   }
   
-  // Update endpoint on success with latency tracking (P2.6 Fix)
-  updateEndpointSuccess(endpoint, latency = 0) {
-    endpoint.consecutiveFailures = 0;
-    endpoint.lastSuccess = Date.now();
-    
-    // P2.6 Fix: Update latency tracking
-    if (latency > 0) {
-      endpoint.totalLatency = (endpoint.totalLatency || 0) + latency;
-      
-      // Update average latency (exponential moving average)
-      if (endpoint.avgLatency === undefined || endpoint.avgLatency === 0) {
-        endpoint.avgLatency = latency;
-      } else {
-        endpoint.avgLatency = (endpoint.avgLatency * 0.9) + (latency * 0.1);
-      }
-    }
-    
-    if (!endpoint.healthy) {
-      endpoint.healthy = true;
-      this.logger.info({
-        endpoint: endpoint.name,
-        action: 'health_recovery',
-        latency_ms: Math.round(latency * 100) / 100
-      }, 'Endpoint recovered to healthy status');
-    }
+  /**
+   * Get next request ID with overflow protection
+   */
+  getNextRequestId() {
+    this.requestId = (this.requestId + 1) % Number.MAX_SAFE_INTEGER;
+    return this.requestId;
   }
   
-  // Update endpoint on failure
-  updateEndpointFailure(endpoint) {
-    console.log(`DEBUG: Before failure - healthy: ${endpoint.healthy}, failures: ${endpoint.consecutiveFailures}`);
-    
-    endpoint.consecutiveFailures++;
-    endpoint.lastFailure = Date.now();
-    
-    console.log(`DEBUG: After increment - healthy: ${endpoint.healthy}, failures: ${endpoint.consecutiveFailures}`);
-    
-    // Simple threshold: 3 consecutive failures = unhealthy
-    if (endpoint.consecutiveFailures >= 3 && endpoint.healthy) {
-      endpoint.healthy = false;
-      console.log(`DEBUG: Marking endpoint unhealthy - failures: ${endpoint.consecutiveFailures}`);
-      
-      this.logger.warn({
-        endpoint: endpoint.name,
-        consecutive_failures: endpoint.consecutiveFailures,
-        action: 'health_degraded'
-      }, 'Endpoint marked unhealthy due to consecutive failures');
-    } else {
-      console.log(`DEBUG: Not marking unhealthy - failures: ${endpoint.consecutiveFailures}, healthy: ${endpoint.healthy}`);
-    }
-  }
-  
-  // Update success metrics
-  updateSuccessMetrics(latency) {
-    this.stats.successfulRequests++;
-    
-    // Update running average latency
-    if (this.stats.avgLatency === 0) {
-      this.stats.avgLatency = latency;
-    } else {
-      this.stats.avgLatency = (this.stats.avgLatency * 0.9) + (latency * 0.1);
-    }
-  }
-  
-  // Structured logging for all RPC calls (Enhanced for P2.6)
-  logRpcCall(requestId, method, latency, outcome, endpointName, error = null) {
-    const logData = {
-      request_id: requestId,
-      endpoint: endpointName,
-      latency_ms: Math.round(latency * 100) / 100,
-      outcome,
-      method
-    };
-    
-    // Add error info if present (with null safety)
-    if (error) {
-      logData.error = error?.message || 'Unknown error';
-      
-      // Distinguish pool conditions from endpoint failures
-      if (error.isPoolCondition) {
-        logData.error_type = 'pool_condition';
-      } else {
-        logData.error_type = 'endpoint_failure';
-      }
-      
-      // Conditionally include stack trace
-      if (envBool('RPC_ERROR_STACKS', false) && error?.stack) {
-        logData.error_stack = error.stack;
-      }
-    }
-    
-    const level = outcome === 'ok' ? 'debug' : 'warn';
-    logger[level](logData, `RPC call ${outcome}`);
-  }
-  
-  // Health monitoring (simple binary check)
+  /**
+   * Start health monitoring
+   */
   startHealthMonitoring() {
-    if (this.healthCheckInterval <= 0) return;
+    if (this.healthTimer) return;
     
     this.healthTimer = setInterval(async () => {
-      await this.performHealthCheck();
-    }, this.healthCheckInterval);
+      if (this.isDestroyed) return;
+      
+      for (let i = 0; i < this.config.endpoints.length; i++) {
+        try {
+          const startTime = Date.now();
+          await this.call('getSlot', [], { 
+            allowFailover: false,
+            timeout: this.config.healthProbeTimeout 
+          });
+          const latency = Date.now() - startTime;
+          
+          this.logInfo('Health check passed', { 
+            endpointIndex: i, 
+            latency 
+          });
+        } catch (error) {
+          this.logWarn('Health check failed', { 
+            endpointIndex: i,
+            error: error.message || 'Unknown error'
+          });
+        }
+      }
+    }, this.config.healthInterval);
   }
   
-  // Perform health check on all endpoints
-  async performHealthCheck() {
-    const healthPromises = Array.from(this.endpoints.keys()).map(name =>
-      this.checkEndpointHealth(name)
+  /**
+   * Periodic memory cleanup
+   */
+  cleanupMemory() {
+    // Clean up old latency data
+    if (this.stats.latencies.length > 1000) {
+      this.stats.latencies = this.stats.latencies.slice(-1000);
+    }
+    
+    // Clean up rate limiter
+    const now = Date.now();
+    const windowStart = now - this.config.rateWindow;
+    this.rateLimiter.requests = this.rateLimiter.requests.filter(
+      time => time > windowStart
     );
     
-    await Promise.allSettled(healthPromises);
-  }
-  
-  // Check specific endpoint health
-  async checkEndpointHealth(endpointName) {
-    const endpoint = this.endpoints.get(endpointName);
-    if (!endpoint) return;
-    
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1000);
-      
-      const response = await this.fetchFn(endpoint.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(createRpcPayload('getVersion', [], 0)),
-        signal: controller.signal,
-        agent: endpoint.url.startsWith('https:') ? this.httpsAgent : this.httpAgent
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (response.ok) {
-        this.updateEndpointSuccess(endpoint, 0); // Health check has no meaningful latency
-      } else {
-        this.updateEndpointFailure(endpoint);
-      }
-      
-    } catch (error) {
-      this.updateEndpointFailure(endpoint);
+    // Force garbage collection if available
+    if (global.gc) {
+      global.gc();
     }
   }
   
-  // Get pool statistics (P2.6 - Health status)
+  /**
+   * Get current statistics
+   */
   getStats() {
-    const endpointStats = {};
-    
-    this.endpoints.forEach((endpoint, name) => {
-      endpointStats[name] = {
-        healthy: endpoint.healthy,
-        consecutiveFailures: endpoint.consecutiveFailures,
-        successRate: endpoint.totalRequests > 0 
-          ? (endpoint.successfulRequests || 0) / (endpoint.totalRequests || 1)
-          : 0,
-        avgLatency: endpoint.avgLatency || 0, // P2.6 Fix: Use tracked avgLatency
-        totalRequests: endpoint.totalRequests,
-        activeRequests: endpoint.activeRequests,
-        requestsThisSecond: endpoint.requestsThisSecond,
-        weight: endpoint.weight, // Include weight for debugging
-        priority: endpoint.priority
-      };
-    });
-    
     return {
       ...this.stats,
-      currentEndpoint: this.currentEndpoint,
-      activeRequests: this.activeRequests,
-      maxConcurrentRequests: this.maxConcurrentRequests,
-      endpoints: endpointStats
+      endpoints: this.config.endpoints.map((endpoint, index) => ({
+        url: endpoint,
+        circuitBreaker: this.circuitBreakers.get(index)
+      })),
+      inFlightRequests: this.inFlightRequests.size
     };
   }
   
-  // Health check for external monitoring
-  isHealthy() {
-    const healthyEndpoints = Array.from(this.endpoints.values())
-      .filter(ep => ep.healthy);
+  /**
+   * Comprehensive cleanup and destroy
+   */
+  async destroy() {
+    this.isDestroyed = true;
     
-    return healthyEndpoints.length > 0 && this.activeRequests < this.globalMaxInFlight;
-  }
-  
-  // Cleanup method
-  destroy() {
-    // Stop health monitoring
+    // Clear all timers
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
       this.healthTimer = null;
     }
     
-    // Cleanup HTTP agents
-    if (this.httpAgent) {
-      this.httpAgent.destroy();
-      this.httpAgent = null;
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
     }
     
-    if (this.httpsAgent) {
-      this.httpsAgent.destroy();
-      this.httpsAgent = null;
+    // Abort all in-flight requests
+    for (const [requestId, request] of this.inFlightRequests) {
+      if (request.abortController) {
+        request.abortController.abort();
+      }
     }
+    this.inFlightRequests.clear();
     
-    // Clear data structures
-    this.endpoints.clear();
+    // Close HTTP agents
+    for (const agent of this.agents.values()) {
+      agent.destroy();
+    }
+    this.agents.clear();
     
-    this.logger.info({
-      component: 'rpc-pool',
-      action: 'destroyed'
-    }, 'RPC connection pool destroyed and cleaned up');
+    // Clear circuit breakers
+    this.circuitBreakers.clear();
+    
+    // Clear stats
+    this.stats.latencies = [];
+    this.rateLimiter.requests = [];
+    
+    // Remove all event listeners
+    this.removeAllListeners();
+    
+    this.logInfo('RPC pool destroyed');
+  }
+  
+  // Logging methods
+  logInfo(message, data = {}) {
+    if (this.config.logJson) {
+      console.log(JSON.stringify({ 
+        level: 'info', 
+        message, 
+        ...data, 
+        timestamp: new Date().toISOString() 
+      }));
+    } else {
+      console.log(`[INFO] ${message}`, data);
+    }
+  }
+  
+  logWarn(message, data = {}) {
+    if (this.config.logJson) {
+      console.log(JSON.stringify({ 
+        level: 'warn', 
+        message, 
+        ...data, 
+        timestamp: new Date().toISOString() 
+      }));
+    } else {
+      console.warn(`[WARN] ${message}`, data);
+    }
+  }
+  
+  logError(message, data = {}) {
+    if (this.config.logJson) {
+      console.error(JSON.stringify({ 
+        level: 'error', 
+        message, 
+        ...data, 
+        timestamp: new Date().toISOString() 
+      }));
+    } else {
+      console.error(`[ERROR] ${message}`, data);
+    }
   }
 }
+
+export default RpcConnectionPool;
