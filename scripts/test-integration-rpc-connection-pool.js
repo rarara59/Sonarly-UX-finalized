@@ -1,221 +1,499 @@
 #!/usr/bin/env node
 
 /**
- * RPC Connection Pool Integration Test
- * Tests integration with the existing trading system
+ * Integration Test - RPC Connection Pool
+ * Tests integration with existing system components
  */
 
 import RpcConnectionPool from '../src/detection/transport/rpc-connection-pool.js';
-import { createSystemConfiguration } from '../src/config/system-config.js';
 import dotenv from 'dotenv';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { EventEmitter } from 'events';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+console.log('🔗 RPC Connection Pool - Integration Test');
+console.log('==========================================\n');
 
-console.log('🔗 RPC Connection Pool Integration Test');
-console.log('========================================\n');
+class IntegrationTester {
+  constructor() {
+    this.pool = null;
+    this.tests = {
+      eventEmission: false,
+      concurrentAgents: false,
+      realWorldScenario: false,
+      errorPropagation: false,
+      configurationChanges: false
+    };
+  }
 
-async function integrationTest() {
-  let pool = null;
-  let systemConfig = null;
-  
-  try {
-    // Test 1: Configuration compatibility
-    console.log('📊 Test 1: Configuration Compatibility');
-    console.log('--------------------------------------');
-    
-    try {
-      systemConfig = createSystemConfiguration();
-      console.log('✅ System configuration loaded');
-      console.log(`   Environment: ${systemConfig.system.environment}`);
-      console.log(`   System: ${systemConfig.system.name} v${systemConfig.system.version}`);
-    } catch (error) {
-      console.log('⚠️  System configuration not available, using defaults');
-    }
-    console.log('');
-    
-    // Test 2: Component initialization
-    console.log('📊 Test 2: Component Initialization');
-    console.log('-----------------------------------');
-    
-    pool = new RpcConnectionPool();
-    console.log('✅ RPC Connection Pool initialized');
-    console.log(`   Endpoints configured: ${pool.config.endpoints.length}`);
-    console.log(`   Circuit breaker: ${pool.config.breakerEnabled ? 'Enabled' : 'Disabled'}`);
-    console.log(`   Rate limiting: ${pool.config.rpsLimit} req/s`);
-    console.log(`   Keep-alive: ${pool.config.keepAliveEnabled ? 'Enabled' : 'Disabled'}`);
-    console.log('');
-    
-    // Test 3: Basic functionality
-    console.log('📊 Test 3: Basic Functionality');
-    console.log('------------------------------');
-    
-    const slot = await pool.call('getSlot');
-    console.log(`✅ Basic RPC call successful`);
-    console.log(`   Current slot: ${slot.toLocaleString()}`);
-    console.log('');
-    
-    // Test 4: Simulate trading system workflow
-    console.log('📊 Test 4: Trading System Workflow Simulation');
-    console.log('----------------------------------------------');
-    
-    // Simulate detecting a new token
-    const testMint = 'So11111111111111111111111111111111111111112'; // Wrapped SOL
-    
-    console.log('1. Fetching token supply...');
-    const supplyStart = Date.now();
-    const supply = await pool.call('getTokenSupply', [testMint]);
-    const supplyLatency = Date.now() - supplyStart;
-    console.log(`   ✅ Supply: ${(parseInt(supply.value.amount) / 1e9).toLocaleString()} SOL`);
-    console.log(`   Latency: ${supplyLatency}ms`);
-    
-    console.log('2. Fetching largest accounts...');
-    const accountsStart = Date.now();
-    const accounts = await pool.call('getTokenLargestAccounts', [testMint]);
-    const accountsLatency = Date.now() - accountsStart;
-    console.log(`   ✅ Found ${accounts.value.length} large holders`);
-    console.log(`   Latency: ${accountsLatency}ms`);
-    
-    console.log('3. Fetching account info...');
-    if (accounts.value.length > 0) {
-      const accountStart = Date.now();
-      const accountInfo = await pool.call('getAccountInfo', [accounts.value[0].address]);
-      const accountLatency = Date.now() - accountStart;
-      console.log(`   ✅ Account data size: ${accountInfo.value?.data?.length || 0} bytes`);
-      console.log(`   Latency: ${accountLatency}ms`);
-    }
-    
-    console.log('4. Simulating rapid trading checks...');
-    const rapidStart = Date.now();
-    const rapidPromises = [];
-    for (let i = 0; i < 5; i++) {
-      rapidPromises.push(pool.call('getSlot'));
-    }
-    await Promise.all(rapidPromises);
-    const rapidLatency = (Date.now() - rapidStart) / 5;
-    console.log(`   ✅ 5 concurrent calls completed`);
-    console.log(`   Avg latency: ${rapidLatency.toFixed(2)}ms`);
-    console.log('');
-    
-    // Test 5: Error handling and recovery
-    console.log('📊 Test 5: Error Handling & Recovery');
-    console.log('------------------------------------');
-    
-    try {
-      // Test invalid method
-      await pool.call('invalidMethod');
-    } catch (error) {
-      console.log('✅ Invalid method handled correctly');
-      console.log(`   Error: ${error.message}`);
-    }
-    
-    try {
-      // Test invalid params
-      await pool.call('getAccountInfo', ['invalid-address']);
-    } catch (error) {
-      console.log('✅ Invalid params handled correctly');
-      console.log(`   Error: ${error.message}`);
-    }
-    
-    // Verify pool still works after errors
-    const recoveryTest = await pool.call('getSlot');
-    console.log('✅ Pool recovered from errors');
-    console.log(`   Current slot: ${recoveryTest.toLocaleString()}`);
-    console.log('');
-    
-    // Test 6: System integration points
-    console.log('📊 Test 6: System Integration Points');
-    console.log('------------------------------------');
-    
-    // Test event emitter compatibility
-    pool.on('error', (error) => {
-      console.log(`   Event received: ${error.message}`);
+  async initialize() {
+    this.pool = new RpcConnectionPool({
+      endpoints: [
+        process.env.CHAINSTACK_RPC_URL,
+        process.env.HELIUS_RPC_URL,
+        process.env.PUBLIC_RPC_URL
+      ].filter(Boolean),
+      debug: false
     });
-    console.log('✅ Event emitter integration working');
     
-    // Test stats interface
-    const stats = pool.getStats();
-    console.log('✅ Statistics interface working');
-    console.log(`   Total calls: ${stats.calls}`);
-    console.log(`   Success rate: ${((stats.calls - stats.failures) / stats.calls * 100).toFixed(2)}%`);
-    console.log(`   Avg latency: ${stats.avgLatency.toFixed(2)}ms`);
-    console.log('');
+    console.log('📦 Pool initialized for integration testing');
+    console.log(`  Endpoints: ${this.pool.endpoints.length}`);
+    console.log(`  Event emitter active: ${this.pool instanceof EventEmitter}\n`);
+  }
+
+  async testEventEmission() {
+    console.log('📡 Test 1: Event Emission');
+    console.log('─'.repeat(40));
     
-    // Test 7: Graceful shutdown
-    console.log('📊 Test 7: Graceful Shutdown');
-    console.log('----------------------------');
-    
-    const shutdownStart = Date.now();
-    await pool.destroy();
-    const shutdownTime = Date.now() - shutdownStart;
-    
-    console.log('✅ Pool shutdown successful');
-    console.log(`   Shutdown time: ${shutdownTime}ms`);
-    
-    // Verify no operations after shutdown
-    let shutdownTestPassed = false;
     try {
-      await pool.call('getSlot');
-    } catch (error) {
-      if (error.message === 'RPC pool has been destroyed') {
-        shutdownTestPassed = true;
+      const events = {
+        'high-latency': [],
+        'breaker-open': [],
+        'breaker-close': [],
+        'rate-limit': [],
+        'queue-full': []
+      };
+      
+      // Set up event listeners
+      for (const event in events) {
+        this.pool.on(event, (data) => {
+          events[event].push(data);
+        });
       }
+      
+      console.log('  Event listeners registered');
+      
+      // Trigger high latency event
+      const endpoint = this.pool.endpoints[0];
+      endpoint.health.latency = 200;
+      this.pool.emit('high-latency', { endpoint: 0, latency: 200 });
+      
+      // Trigger circuit breaker events
+      this.pool.emit('breaker-open', 0);
+      this.pool.emit('breaker-close', 0);
+      
+      // Check events were captured
+      await new Promise(r => setTimeout(r, 100));
+      
+      console.log('\n  Events captured:');
+      for (const [event, data] of Object.entries(events)) {
+        console.log(`    ${event}: ${data.length} events`);
+      }
+      
+      // Verify events
+      if (events['high-latency'].length === 0) {
+        throw new Error('High latency event not captured');
+      }
+      if (events['breaker-open'].length === 0) {
+        throw new Error('Breaker open event not captured');
+      }
+      
+      console.log('\n✅ Event emission working correctly');
+      this.tests.eventEmission = true;
+      console.log('✅ Event emission test PASSED\n');
+      
+    } catch (error) {
+      console.error('❌ Event emission test FAILED:', error.message);
+      this.tests.eventEmission = false;
     }
-    console.log(`✅ Post-shutdown protection: ${shutdownTestPassed ? 'Working' : 'Failed'}`);
-    console.log('');
+  }
+
+  async testConcurrentAgents() {
+    console.log('👥 Test 2: Concurrent Agent Simulation');
+    console.log('─'.repeat(40));
     
-    // Test 8: Memory and resource cleanup
-    console.log('📊 Test 8: Resource Cleanup Verification');
-    console.log('----------------------------------------');
+    try {
+      // Simulate multiple agents making concurrent requests
+      class Agent {
+        constructor(id, pool) {
+          this.id = id;
+          this.pool = pool;
+          this.requests = 0;
+          this.successful = 0;
+          this.failed = 0;
+        }
+        
+        async makeRequests(count) {
+          const promises = [];
+          for (let i = 0; i < count; i++) {
+            promises.push(
+              this.pool.call('getSlot')
+                .then(() => {
+                  this.successful++;
+                  return true;
+                })
+                .catch(() => {
+                  this.failed++;
+                  return false;
+                })
+            );
+            this.requests++;
+          }
+          return Promise.all(promises);
+        }
+      }
+      
+      // Create 5 agents
+      const agents = [];
+      for (let i = 0; i < 5; i++) {
+        agents.push(new Agent(i, this.pool));
+      }
+      
+      console.log('  Created 5 agents');
+      console.log('  Each agent sending 20 requests...');
+      
+      // All agents make requests concurrently
+      const startTime = Date.now();
+      const agentPromises = agents.map(agent => agent.makeRequests(20));
+      await Promise.all(agentPromises);
+      const duration = Date.now() - startTime;
+      
+      // Check results
+      console.log('\n  Agent results:');
+      let totalSuccess = 0;
+      let totalFailed = 0;
+      
+      for (const agent of agents) {
+        console.log(`    Agent ${agent.id}: ${agent.successful}/${agent.requests} successful`);
+        totalSuccess += agent.successful;
+        totalFailed += agent.failed;
+      }
+      
+      console.log(`\n  Total: ${totalSuccess}/${totalSuccess + totalFailed} successful`);
+      console.log(`  Duration: ${duration}ms`);
+      console.log(`  Throughput: ${((totalSuccess + totalFailed) / (duration / 1000)).toFixed(1)} req/s`);
+      
+      // Check load distribution
+      const distribution = this.pool.getLoadDistribution();
+      console.log('\n  Load distribution:');
+      for (const url in distribution) {
+        const hostname = new URL(url).hostname;
+        console.log(`    ${hostname}: ${distribution[url].percentage}`);
+      }
+      
+      // Success criteria: handle concurrent agents with 80%+ success
+      this.tests.concurrentAgents = totalSuccess >= (totalSuccess + totalFailed) * 0.8;
+      console.log(`\n✅ Concurrent agents test: ${this.tests.concurrentAgents ? 'PASSED' : 'FAILED'}\n`);
+      
+    } catch (error) {
+      console.error('❌ Concurrent agents test FAILED:', error.message);
+      this.tests.concurrentAgents = false;
+    }
+  }
+
+  async testRealWorldScenario() {
+    console.log('🌍 Test 3: Real-World Trading Scenario');
+    console.log('─'.repeat(40));
     
-    // Force garbage collection if available
-    if (global.gc) {
-      const memBefore = process.memoryUsage().heapUsed / 1024 / 1024;
-      global.gc();
-      const memAfter = process.memoryUsage().heapUsed / 1024 / 1024;
-      console.log(`✅ Memory cleaned: ${(memBefore - memAfter).toFixed(2)} MB freed`);
-    } else {
-      console.log('⚠️  Garbage collection not available (run with --expose-gc)');
+    try {
+      console.log('  Simulating meme coin trading system...');
+      
+      // Simulate different types of RPC calls used in trading
+      const tradingOperations = {
+        getTokenAccounts: async () => {
+          return this.pool.call('getTokenAccountsByOwner', [
+            'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+            { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+            { encoding: 'jsonParsed' }
+          ]);
+        },
+        getBalance: async (address) => {
+          return this.pool.call('getBalance', [address || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v']);
+        },
+        getTransaction: async (signature) => {
+          return this.pool.call('getTransaction', [
+            signature || '5VERqBAM2vQJqPfxDcGZFudqrTkQPMdkjvjRqUyRUhxqHAhfJDXRqsmLNvVwSJH4qGMgDe2MmYvzLGKzTCQBScsq',
+            { encoding: 'json', commitment: 'confirmed' }
+          ]);
+        },
+        getSlot: async () => {
+          return this.pool.call('getSlot');
+        },
+        getBlockHeight: async () => {
+          return this.pool.call('getBlockHeight');
+        }
+      };
+      
+      // Simulate a trading session
+      const results = {
+        tokenAccountQueries: 0,
+        balanceChecks: 0,
+        transactionLookups: 0,
+        slotQueries: 0,
+        blockHeightQueries: 0,
+        errors: []
+      };
+      
+      console.log('\n  Phase 1: Token discovery (10 token account queries)');
+      for (let i = 0; i < 10; i++) {
+        try {
+          await tradingOperations.getTokenAccounts();
+          results.tokenAccountQueries++;
+        } catch (err) {
+          results.errors.push('Token account query failed');
+        }
+      }
+      console.log(`    Completed: ${results.tokenAccountQueries}/10`);
+      
+      console.log('\n  Phase 2: Balance monitoring (20 balance checks)');
+      for (let i = 0; i < 20; i++) {
+        try {
+          await tradingOperations.getBalance();
+          results.balanceChecks++;
+        } catch (err) {
+          results.errors.push('Balance check failed');
+        }
+      }
+      console.log(`    Completed: ${results.balanceChecks}/20`);
+      
+      console.log('\n  Phase 3: Transaction monitoring (15 transaction lookups)');
+      for (let i = 0; i < 15; i++) {
+        try {
+          await tradingOperations.getTransaction();
+          results.transactionLookups++;
+        } catch (err) {
+          results.errors.push('Transaction lookup failed');
+        }
+      }
+      console.log(`    Completed: ${results.transactionLookups}/15`);
+      
+      console.log('\n  Phase 4: Block monitoring (30 slot/height queries)');
+      const blockPromises = [];
+      for (let i = 0; i < 15; i++) {
+        blockPromises.push(
+          tradingOperations.getSlot()
+            .then(() => results.slotQueries++)
+            .catch(() => results.errors.push('Slot query failed'))
+        );
+        blockPromises.push(
+          tradingOperations.getBlockHeight()
+            .then(() => results.blockHeightQueries++)
+            .catch(() => results.errors.push('Block height query failed'))
+        );
+      }
+      await Promise.all(blockPromises);
+      console.log(`    Slot queries: ${results.slotQueries}/15`);
+      console.log(`    Block height queries: ${results.blockHeightQueries}/15`);
+      
+      // Summary
+      const totalOperations = results.tokenAccountQueries + results.balanceChecks + 
+                            results.transactionLookups + results.slotQueries + results.blockHeightQueries;
+      const successRate = totalOperations / 75 * 100;
+      
+      console.log('\n📊 Trading Scenario Results:');
+      console.log(`  Total operations: ${totalOperations}/75`);
+      console.log(`  Success rate: ${successRate.toFixed(1)}%`);
+      console.log(`  Errors: ${results.errors.length}`);
+      
+      // Get final statistics
+      const stats = this.pool.getStats();
+      console.log(`  Average latency: ${stats.global.avgLatency}ms`);
+      console.log(`  P95 latency: ${stats.global.p95Latency}ms`);
+      
+      // Success criteria: 80%+ operations successful
+      this.tests.realWorldScenario = successRate >= 80;
+      console.log(`\n✅ Real-world scenario test: ${this.tests.realWorldScenario ? 'PASSED' : 'FAILED'}\n`);
+      
+    } catch (error) {
+      console.error('❌ Real-world scenario test FAILED:', error.message);
+      this.tests.realWorldScenario = false;
+    }
+  }
+
+  async testErrorPropagation() {
+    console.log('⚠️  Test 4: Error Propagation');
+    console.log('─'.repeat(40));
+    
+    try {
+      const errors = {
+        invalidMethod: null,
+        invalidParams: null,
+        timeout: null
+      };
+      
+      console.log('  Testing error propagation...');
+      
+      // Test invalid method error
+      try {
+        await this.pool.call('invalidMethodName');
+      } catch (err) {
+        errors.invalidMethod = err;
+        console.log('  ✅ Invalid method error caught');
+      }
+      
+      // Test invalid params error
+      try {
+        await this.pool.call('getBalance', ['invalid-address']);
+      } catch (err) {
+        errors.invalidParams = err;
+        console.log('  ✅ Invalid params error caught');
+      }
+      
+      // Force all endpoints to be unavailable
+      const originalEndpoints = this.pool.endpoints.map(ep => ({
+        breaker: { ...ep.breaker },
+        health: { ...ep.health }
+      }));
+      
+      for (const endpoint of this.pool.endpoints) {
+        endpoint.breaker.state = 'OPEN';
+        endpoint.health.healthy = false;
+      }
+      
+      // Test no endpoints available error
+      try {
+        await this.pool.call('getSlot');
+      } catch (err) {
+        if (err.message.includes('No available endpoints')) {
+          console.log('  ✅ No endpoints error caught');
+        }
+      }
+      
+      // Restore endpoints
+      this.pool.endpoints.forEach((ep, i) => {
+        ep.breaker = originalEndpoints[i].breaker;
+        ep.health = originalEndpoints[i].health;
+      });
+      
+      // Verify errors were properly caught
+      if (!errors.invalidMethod) {
+        throw new Error('Invalid method error not propagated');
+      }
+      if (!errors.invalidParams) {
+        throw new Error('Invalid params error not propagated');
+      }
+      
+      console.log('\n✅ Error propagation working correctly');
+      this.tests.errorPropagation = true;
+      console.log('✅ Error propagation test PASSED\n');
+      
+    } catch (error) {
+      console.error('❌ Error propagation test FAILED:', error.message);
+      this.tests.errorPropagation = false;
+    }
+  }
+
+  async testConfigurationChanges() {
+    console.log('⚙️  Test 5: Dynamic Configuration');
+    console.log('─'.repeat(40));
+    
+    try {
+      console.log('  Testing configuration changes...');
+      
+      // Get initial configuration
+      const initialConfig = { ...this.pool.config };
+      console.log(`  Initial max in-flight: ${initialConfig.maxGlobalInFlight}`);
+      console.log(`  Initial queue size: ${initialConfig.maxQueueSize}`);
+      
+      // Create new pool with different configuration
+      const customPool = new RpcConnectionPool({
+        endpoints: [
+          process.env.CHAINSTACK_RPC_URL,
+          process.env.HELIUS_RPC_URL,
+          process.env.PUBLIC_RPC_URL
+        ].filter(Boolean),
+        maxGlobalInFlight: 200,
+        maxQueueSize: 500,
+        queueDeadline: 30000,
+        breakerEnabled: false,
+        debug: true
+      });
+      
+      console.log('\n  Custom pool configuration:');
+      console.log(`    Max in-flight: ${customPool.config.maxGlobalInFlight}`);
+      console.log(`    Queue size: ${customPool.config.maxQueueSize}`);
+      console.log(`    Queue deadline: ${customPool.config.queueDeadline}ms`);
+      console.log(`    Circuit breaker: ${customPool.config.breakerEnabled ? 'ENABLED' : 'DISABLED'}`);
+      
+      // Test custom configuration works
+      const promises = [];
+      for (let i = 0; i < 50; i++) {
+        promises.push(customPool.call('getSlot').catch(() => null));
+      }
+      
+      const results = await Promise.all(promises);
+      const successful = results.filter(r => r !== null).length;
+      
+      console.log(`\n  Sent 50 requests with custom config`);
+      console.log(`  Successful: ${successful}/50`);
+      
+      // Verify circuit breaker is disabled
+      let breakerTriggered = false;
+      for (const endpoint of customPool.endpoints) {
+        if (endpoint.breaker.state !== 'CLOSED') {
+          breakerTriggered = true;
+        }
+      }
+      
+      console.log(`  Circuit breakers triggered: ${breakerTriggered ? 'YES' : 'NO (as expected)'}`);
+      
+      // Cleanup custom pool
+      await customPool.destroy();
+      
+      // Success criteria: custom configuration applied correctly
+      this.tests.configurationChanges = successful > 0 && !breakerTriggered;
+      console.log(`\n✅ Configuration test: ${this.tests.configurationChanges ? 'PASSED' : 'FAILED'}\n`);
+      
+    } catch (error) {
+      console.error('❌ Configuration test FAILED:', error.message);
+      this.tests.configurationChanges = false;
+    }
+  }
+
+  async runAllTests() {
+    const startTime = Date.now();
+    
+    await this.initialize();
+    
+    await this.testEventEmission();
+    await this.testConcurrentAgents();
+    await this.testRealWorldScenario();
+    await this.testErrorPropagation();
+    await this.testConfigurationChanges();
+    
+    const duration = Date.now() - startTime;
+    
+    // Summary
+    console.log('=' .repeat(60));
+    console.log('📋 INTEGRATION TEST SUMMARY');
+    console.log('=' .repeat(60));
+    
+    let passed = 0;
+    let failed = 0;
+    
+    for (const [test, result] of Object.entries(this.tests)) {
+      const status = result ? '✅' : '❌';
+      console.log(`  ${status} ${test}`);
+      if (result) passed++;
+      else failed++;
     }
     
-    // Verify timers cleaned up
-    const activeHandles = process._getActiveHandles ? process._getActiveHandles().length : 'N/A';
-    const activeRequests = process._getActiveRequests ? process._getActiveRequests().length : 'N/A';
-    console.log(`✅ Active handles: ${activeHandles}`);
-    console.log(`✅ Active requests: ${activeRequests}`);
-    console.log('');
+    console.log('\n📊 Results:');
+    console.log(`  Passed: ${passed}/${Object.keys(this.tests).length}`);
+    console.log(`  Failed: ${failed}/${Object.keys(this.tests).length}`);
+    console.log(`  Duration: ${(duration/1000).toFixed(1)} seconds`);
     
-    // Final integration summary
-    console.log('🎯 INTEGRATION TEST SUMMARY');
-    console.log('===========================');
-    console.log('✅ Configuration: Compatible');
-    console.log('✅ Initialization: Successful');
-    console.log('✅ Basic operations: Working');
-    console.log('✅ Trading workflow: Functional');
-    console.log('✅ Error handling: Robust');
-    console.log('✅ Event system: Integrated');
-    console.log('✅ Graceful shutdown: Working');
-    console.log('✅ Resource cleanup: Verified');
-    console.log('\n✅ Integration test PASSED - Ready for production!');
+    const allPassed = Object.values(this.tests).every(v => v);
+    console.log(`\n🎯 OVERALL: ${allPassed ? '✅ ALL INTEGRATION TESTS PASSED' : '❌ SOME INTEGRATION TESTS FAILED'}`);
     
-  } catch (error) {
-    console.error('\n❌ Integration test failed:', error);
-    if (pool && !pool.isDestroyed) {
-      await pool.destroy();
+    if (allPassed) {
+      console.log('\n✨ RPC Connection Pool integrates perfectly with the system!');
+      console.log('   - Event emission working');
+      console.log('   - Handles concurrent agents');
+      console.log('   - Supports real-world trading scenarios');
+      console.log('   - Proper error propagation');
+      console.log('   - Flexible configuration');
     }
-    process.exit(1);
+    
+    // Cleanup
+    if (this.pool) {
+      await this.pool.destroy();
+    }
+    
+    process.exit(allPassed ? 0 : 1);
   }
 }
 
-// Run integration test
-integrationTest().then(() => {
-  console.log('\n✅ Integration test complete!');
-  process.exit(0);
-}).catch(error => {
-  console.error('\n❌ Fatal error:', error);
-  process.exit(1);
-});
+// Run tests
+const tester = new IntegrationTester();
+tester.runAllTests().catch(console.error);

@@ -15,6 +15,49 @@ dotenv.config();
 // Configure DNS caching for faster resolution
 dns.setDefaultResultOrder('ipv4first');
 
+// Token bucket implementation for proper rate limiting
+class TokenBucket {
+  constructor(rpsLimit, windowMs = 1000) {
+    this.maxTokens = rpsLimit;
+    // Start with fewer tokens to prevent initial burst
+    this.tokens = Math.min(5, rpsLimit);
+    this.refillRate = rpsLimit / (windowMs / 1000); // tokens per millisecond
+    this.lastRefill = Date.now();
+    this.windowMs = windowMs;
+  }
+  
+  canConsume(tokens = 1) {
+    this.refill();
+    return this.tokens >= tokens;
+  }
+  
+  consume(tokens = 1) {
+    if (this.canConsume(tokens)) {
+      this.tokens -= tokens;
+      return true;
+    }
+    return false;
+  }
+  
+  refill() {
+    const now = Date.now();
+    const timePassed = now - this.lastRefill;
+    const tokensToAdd = (timePassed / 1000) * this.refillRate;
+    
+    this.tokens = Math.min(this.maxTokens, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+  
+  getStatus() {
+    this.refill();
+    return {
+      tokens: Math.floor(this.tokens),
+      maxTokens: this.maxTokens,
+      utilization: ((this.maxTokens - this.tokens) / this.maxTokens * 100).toFixed(1) + '%'
+    };
+  }
+}
+
 // Per-endpoint configuration with individual rate limits
 const ENDPOINT_CONFIGS = {
   helius: {
@@ -27,17 +70,17 @@ const ENDPOINT_CONFIGS = {
   },
   chainstack: {
     pattern: /chainstack|p2pify/i,
-    rpsLimit: 10,  // Reduced to match actual plan limits
+    rpsLimit: 30,  // Conservative limit below actual
     weight: 30,
-    maxConcurrent: 20,  // Reduced concurrent connections
+    maxConcurrent: 15,
     timeout: 1500,
     priority: 0  // Highest priority due to best latency
   },
   public: {
     pattern: /mainnet-beta/i,
-    rpsLimit: 8,
+    rpsLimit: 8,   // Well below public RPC limits
     weight: 10,
-    maxConcurrent: 20,
+    maxConcurrent: 5,
     timeout: 3000,
     priority: 2
   }
@@ -152,13 +195,8 @@ class RpcConnectionPoolV2 extends EventEmitter {
         url,
         index,
         config: endpointConfig,
-        // Per-endpoint rate limiting
-        rateLimit: {
-          tokens: endpointConfig.rpsLimit,
-          refillRate: endpointConfig.rpsLimit,
-          lastRefill: Date.now(),
-          window: 1000
-        },
+        // Add token bucket rate limiting
+        rateLimiter: new TokenBucket(endpointConfig.rpsLimit),
         // Per-endpoint statistics
         stats: {
           calls: 0,
@@ -265,22 +303,7 @@ class RpcConnectionPoolV2 extends EventEmitter {
         throw new Error('No available endpoints');
       }
       
-      // Check per-endpoint rate limit
-      if (!this.checkRateLimit(endpoint)) {
-        // Re-queue if rate limited
-        this.globalInFlight--;
-        
-        if (Date.now() - request.timestamp < this.config.queueDeadline) {
-          setTimeout(() => {
-            if (!this.isDestroyed) {
-              this.requestQueue.unshift(request);
-            }
-          }, 50);
-          return;
-        }
-        
-        throw new Error('Rate limit exceeded');
-      }
+      // Note: Rate limit token already consumed in selectEndpoint()
       
       // Execute RPC call
       endpoint.stats.inFlight++;
@@ -342,26 +365,48 @@ class RpcConnectionPoolV2 extends EventEmitter {
   }
   
   selectEndpoint(request) {
-    // Filter available endpoints
+    return this.selectBestEndpoint();
+  }
+  
+  selectBestEndpoint() {
+    // Filter endpoints that are actually available
     const available = this.endpoints.filter(ep => {
-      // Skip if circuit breaker is open
+      // Circuit breaker check - skip OPEN breakers
       if (ep.breaker.state === 'OPEN') {
         // Check if cooldown period has passed
-        if (Date.now() - ep.breaker.lastFailure > 30000) {
+        const cooldownMs = ep.breaker.cooldownMs || 30000;
+        const timeSinceOpen = Date.now() - (ep.breaker.openedAt || ep.breaker.lastFailure);
+        if (timeSinceOpen > cooldownMs) {
           ep.breaker.state = 'HALF_OPEN';
           ep.breaker.halfOpenTests = 0;
+          ep.breaker.failures = Math.max(0, ep.breaker.failures - 1); // Decay failures on recovery attempt
         } else {
           return false;
         }
       }
       
-      // Limit half-open tests
+      // Limit half-open tests to prevent thrashing
       if (ep.breaker.state === 'HALF_OPEN' && ep.breaker.halfOpenTests >= 2) {
         return false;
       }
       
-      // Check endpoint health (skip if never checked)
-      if (ep.health.lastCheck > 0 && !ep.health.healthy) {
+      // Health check - skip unhealthy endpoints
+      if (!ep.health.healthy && ep.health.lastCheck > 0) {
+        return false;
+      }
+      
+      // Rate limit check - skip endpoints with no tokens
+      if (!ep.rateLimiter.canConsume(1)) {
+        return false;
+      }
+      
+      // Check rate limit backoff period
+      if (ep.rateLimitBackoff && ep.rateLimitBackoff.until > Date.now()) {
+        return false;
+      }
+      
+      // Capacity check - skip completely saturated endpoints
+      if (ep.stats.inFlight >= ep.config.maxConcurrent) {
         return false;
       }
       
@@ -372,75 +417,72 @@ class RpcConnectionPoolV2 extends EventEmitter {
       return null;
     }
     
-    // Prefer endpoints by priority first, then by score
-    // Sort by priority (lower is better)
-    available.sort((a, b) => a.config.priority - b.config.priority);
-    
-    // Use the highest priority endpoint if it has capacity
-    const primaryEndpoint = available[0];
-    if (primaryEndpoint && 
-        primaryEndpoint.stats.inFlight < primaryEndpoint.config.maxConcurrent * 0.8) {
-      return primaryEndpoint;
+    // If only one endpoint available, use it
+    if (available.length === 1) {
+      available[0].rateLimiter.consume(1);
+      return available[0];
     }
     
-    // Otherwise, weighted selection based on capacity and performance
-    let best = null;
+    // Multi-factor scoring for intelligent selection
+    let bestEndpoint = null;
     let bestScore = -1;
     
     for (const endpoint of available) {
-      // Calculate score based on multiple factors
-      const loadFactor = 1 - (endpoint.stats.inFlight / endpoint.config.maxConcurrent);
-      const latencyFactor = endpoint.health.latency > 0 ? 30 / endpoint.health.latency : 1;
-      const successRate = endpoint.stats.calls > 0 
-        ? endpoint.stats.successes / endpoint.stats.calls 
-        : 0.5;
-      
-      // Give priority bonus
-      const priorityBonus = (2 - endpoint.config.priority) * 20;
-      
-      const score = (
-        priorityBonus +
-        endpoint.config.weight * 0.3 +
-        loadFactor * 100 * 0.3 +
-        latencyFactor * 100 * 0.2 +
-        successRate * 100 * 0.2
-      );
+      const score = this.calculateEndpointScore(endpoint);
       
       if (score > bestScore) {
         bestScore = score;
-        best = endpoint;
+        bestEndpoint = endpoint;
       }
     }
     
-    return best;
+    // Consume rate limit token immediately when endpoint is selected
+    if (bestEndpoint) {
+      bestEndpoint.rateLimiter.consume(1);
+    }
+    
+    return bestEndpoint;
   }
   
-  checkRateLimit(endpoint) {
-    const now = Date.now();
-    const elapsed = now - endpoint.rateLimit.lastRefill;
+  calculateEndpointScore(endpoint) {
+    // Factor 1: Capacity utilization (higher available capacity = better)
+    const capacityFactor = 1 - (endpoint.stats.inFlight / endpoint.config.maxConcurrent);
+    const capacityScore = Math.pow(capacityFactor, 2) * 100; // Exponential preference for available capacity
     
-    // Refill tokens
-    if (elapsed >= endpoint.rateLimit.window) {
-      endpoint.rateLimit.tokens = endpoint.rateLimit.refillRate;
-      endpoint.rateLimit.lastRefill = now;
-    } else {
-      // Partial refill
-      const refill = (elapsed / endpoint.rateLimit.window) * endpoint.rateLimit.refillRate;
-      endpoint.rateLimit.tokens = Math.min(
-        endpoint.rateLimit.refillRate,
-        endpoint.rateLimit.tokens + refill
-      );
-      endpoint.rateLimit.lastRefill = now;
-    }
+    // Factor 2: Latency performance (lower latency = better)
+    const targetLatency = 30; // Target 30ms latency
+    const actualLatency = endpoint.health.latency || targetLatency;
+    const latencyScore = Math.max(0, Math.min(100, (targetLatency / actualLatency) * 100));
     
-    // Check if token available
-    if (endpoint.rateLimit.tokens >= 1) {
-      endpoint.rateLimit.tokens--;
-      return true;
-    }
+    // Factor 3: Rate limit availability (more tokens = better)
+    const rateLimitStatus = endpoint.rateLimiter.getStatus();
+    const rateLimitScore = (rateLimitStatus.tokens / rateLimitStatus.maxTokens) * 100;
     
-    return false;
+    // Factor 4: Success rate history (higher success = better)
+    const totalCalls = endpoint.stats.calls || 1;
+    const successRate = endpoint.stats.successes / totalCalls;
+    const successScore = successRate * 100;
+    
+    // Factor 5: Priority weight (endpoint configuration preference)
+    const priorityScore = endpoint.config.weight || 10;
+    
+    // Factor 6: Circuit breaker state bonus/penalty
+    const breakerScore = endpoint.breaker.state === 'CLOSED' ? 20 : 
+                        endpoint.breaker.state === 'HALF_OPEN' ? 10 : 0;
+    
+    // Weighted combination of all factors
+    const compositeScore = (
+      capacityScore * 0.35 +     // 35% - Most important: available capacity
+      latencyScore * 0.20 +      // 20% - Critical: response speed
+      rateLimitScore * 0.20 +    // 20% - Important: rate limit headroom  
+      successScore * 0.10 +      // 10% - Moderate: historical reliability
+      priorityScore * 0.10 +     // 10% - Configuration preference
+      breakerScore * 0.05        // 5% - Minor: circuit breaker bonus
+    );
+    
+    return compositeScore;
   }
+  
   
   async executeRpcCall(endpoint, request) {
     const url = new URL(endpoint.url);
@@ -503,62 +545,197 @@ class RpcConnectionPoolV2 extends EventEmitter {
     });
   }
   
-  handleFailure(request, error) {
-    // Find the endpoint that failed (if any)
-    const endpoint = this.endpoints.find(ep => ep.stats.inFlight > 0);
+  handleFailure(request, error, endpoint = null) {
+    if (!endpoint) {
+      // Find the endpoint that failed
+      endpoint = this.endpoints.find(ep => ep.stats.inFlight > 0) || 
+                 this.endpoints[0]; // fallback
+    }
     
-    if (endpoint) {
-      endpoint.stats.inFlight--;
-      endpoint.stats.failures++;
-      
-      // Track error types
-      const errorType = this.classifyError(error);
-      endpoint.breaker.errorCounts.set(
-        errorType,
-        (endpoint.breaker.errorCounts.get(errorType) || 0) + 1
-      );
-      
-      // Intelligent circuit breaker logic
-      if (this.config.breakerEnabled) {
-        // Don't open circuit for rate limiting - just back off
-        if (errorType === 'rate_limit') {
-          // Temporarily reduce rate limit
-          endpoint.rateLimit.tokens = Math.max(0, endpoint.rateLimit.tokens - 5);
-          return true; // Retry with backoff
-        }
+    const errorInfo = this.classifyError(error);
+    
+    // Update endpoint statistics
+    endpoint.stats.inFlight = Math.max(0, endpoint.stats.inFlight - 1);
+    endpoint.stats.failures++;
+    
+    // Track error types
+    endpoint.breaker.errorCounts.set(
+      errorInfo.type,
+      (endpoint.breaker.errorCounts.get(errorInfo.type) || 0) + 1
+    );
+    
+    // Handle different error types with appropriate responses
+    switch (errorInfo.type) {
+      case 'rate_limit':
+        this.handleRateLimitError(endpoint, errorInfo);
+        break;
         
-        // Don't open circuit for timeout during high load
-        if (errorType === 'timeout' && this.globalInFlight > this.config.maxGlobalInFlight * 0.8) {
-          return true; // Retry
-        }
+      case 'timeout':
+        this.handleTimeoutError(endpoint, errorInfo);
+        break;
         
-        endpoint.breaker.failures++;
-        endpoint.breaker.lastFailure = Date.now();
-        endpoint.breaker.consecutiveSuccesses = 0;
+      case 'network':
+      case 'server_error':
+        this.handleActualFailure(endpoint, errorInfo);
+        break;
         
-        // Open circuit if too many non-rate-limit failures
-        if (endpoint.breaker.failures >= 5) {
-          endpoint.breaker.state = 'OPEN';
-          this.emit('breaker-open', endpoint.index);
-        }
-      }
+      case 'response_error':
+      case 'unknown':
+        this.handleUnknownFailure(endpoint, errorInfo);
+        break;
+        
+      case 'no_endpoints':
+        // No specific endpoint failure handling needed
+        break;
     }
     
     // Determine if request should be retried
-    const errorType = this.classifyError(error);
-    return errorType === 'timeout' || errorType === 'network' || errorType === 'rate_limit';
+    return this.shouldRetryRequest(request, errorInfo, endpoint);
   }
   
+  handleRateLimitError(endpoint, errorInfo) {
+    // Rate limit errors should NOT open circuit breaker
+    // Instead, reduce available rate limit tokens temporarily
+    if (endpoint.rateLimiter) {
+      endpoint.rateLimiter.tokens = Math.max(0, endpoint.rateLimiter.tokens - 10);
+    }
+    
+    // Apply temporary backoff without circuit breaker impact
+    endpoint.rateLimitBackoff = {
+      until: Date.now() + 5000, // 5 second backoff
+      multiplier: (endpoint.rateLimitBackoff?.multiplier || 1) * 1.5
+    };
+    
+    // Log rate limit event but don't count toward circuit breaker
+    if (this.config.debug) {
+      console.log(`Rate limit backoff applied to endpoint ${endpoint.index}`);
+    }
+  }
+
+  handleTimeoutError(endpoint, errorInfo) {
+    // Timeout during high system load should not immediately open circuit
+    const systemLoad = this.globalInFlight / this.config.maxGlobalInFlight;
+    
+    if (systemLoad > 0.8) {
+      // High system load - timeout is likely load-related, not endpoint failure
+      endpoint.loadTimeouts = (endpoint.loadTimeouts || 0) + 1;
+      
+      // Only count toward circuit breaker if excessive load timeouts
+      if (endpoint.loadTimeouts > 10) {
+        this.incrementCircuitBreakerFailure(endpoint, 0.5); // Half weight
+      }
+    } else {
+      // Low system load - timeout likely indicates endpoint problem
+      this.incrementCircuitBreakerFailure(endpoint, 1.0); // Full weight
+    }
+  }
+
+  handleActualFailure(endpoint, errorInfo) {
+    // These are real endpoint failures that should impact circuit breaker
+    this.incrementCircuitBreakerFailure(endpoint, 1.0);
+    
+    // Set last failure time for circuit breaker cooldown calculations
+    endpoint.breaker.lastFailure = Date.now();
+  }
+
+  handleUnknownFailure(endpoint, errorInfo) {
+    // Conservative approach - count toward circuit breaker but with reduced weight
+    this.incrementCircuitBreakerFailure(endpoint, 0.7);
+  }
+
+  incrementCircuitBreakerFailure(endpoint, weight = 1.0) {
+    if (!this.config.breakerEnabled) return;
+    
+    endpoint.breaker.failures += weight;
+    endpoint.breaker.consecutiveSuccesses = 0;
+    
+    // Dynamic threshold based on error patterns
+    const baseThreshold = 5;
+    const loadFactor = this.globalInFlight / this.config.maxGlobalInFlight;
+    const adjustedThreshold = baseThreshold * (1 + loadFactor); // Higher threshold during load
+    
+    if (endpoint.breaker.failures >= adjustedThreshold && endpoint.breaker.state === 'CLOSED') {
+      endpoint.breaker.state = 'OPEN';
+      endpoint.breaker.openedAt = Date.now();
+      endpoint.breaker.cooldownMs = Math.min(60000, 10000 * Math.pow(1.5, endpoint.breaker.openCount || 0));
+      endpoint.breaker.openCount = (endpoint.breaker.openCount || 0) + 1;
+      
+      if (this.config.debug) {
+        console.log(`Circuit breaker OPENED for endpoint ${endpoint.index}, cooldown: ${endpoint.breaker.cooldownMs}ms`);
+      }
+      
+      this.emit('breaker-open', endpoint.index);
+    }
+  }
+
+  shouldRetryRequest(request, errorInfo, endpoint) {
+    // Don't retry if too many attempts already
+    if (request.attempts >= 3) {
+      return false;
+    }
+    
+    // Retry logic based on error type
+    switch (errorInfo.type) {
+      case 'rate_limit':
+        return true; // Always retry rate limit errors with backoff
+        
+      case 'timeout':
+        // Retry timeouts unless they're excessive
+        return (endpoint.loadTimeouts || 0) < 5;
+        
+      case 'network':
+        return false; // Network errors unlikely to resolve quickly
+        
+      case 'server_error':
+        return Math.random() > 0.5; // 50% retry chance for server errors
+        
+      case 'no_endpoints':
+        return false; // Can't retry if no endpoints available
+        
+      default:
+        return true; // Conservative retry for unknown errors
+    }
+  }
+
   classifyError(error) {
     const message = error.message.toLowerCase();
+    const status = error.status || error.statusCode;
     
-    if (message.includes('timeout')) return 'timeout';
-    if (message.includes('rate') || message.includes('429') || message.includes('rps limit')) return 'rate_limit';
-    if (message.includes('econnrefused') || message.includes('enotfound')) return 'network';
-    if (message.includes('503') || message.includes('502')) return 'server';
-    if (message.includes('no available endpoints')) return 'no_endpoints';
+    // Rate limiting - should trigger backoff, not circuit opening
+    if (status === 429 || message.includes('rate limit') || message.includes('too many requests') || message.includes('rps limit')) {
+      return { type: 'rate_limit', severity: 'temporary', circuitImpact: 'none' };
+    }
     
-    return 'unknown';
+    // Timeout errors - context dependent
+    if (message.includes('timeout') || message.includes('etimedout')) {
+      return { type: 'timeout', severity: 'moderate', circuitImpact: 'conditional' };
+    }
+    
+    // Network connectivity issues - actual failures
+    if (message.includes('econnrefused') || message.includes('enotfound') || 
+        message.includes('network') || message.includes('dns')) {
+      return { type: 'network', severity: 'high', circuitImpact: 'immediate' };
+    }
+    
+    // Server errors - distinguish between types
+    if (status >= 500 || message.includes('500') || message.includes('502') || 
+        message.includes('503') || message.includes('504')) {
+      return { type: 'server_error', severity: 'high', circuitImpact: 'gradual' };
+    }
+    
+    // Invalid response/parsing errors
+    if (message.includes('invalid json') || message.includes('parse') || 
+        message.includes('malformed')) {
+      return { type: 'response_error', severity: 'moderate', circuitImpact: 'gradual' };
+    }
+    
+    // No available endpoints
+    if (message.includes('no available endpoints')) {
+      return { type: 'no_endpoints', severity: 'temporary', circuitImpact: 'none' };
+    }
+    
+    // Unknown errors - treat conservatively
+    return { type: 'unknown', severity: 'moderate', circuitImpact: 'gradual' };
   }
   
   updateStats(endpoint, success, latency) {
@@ -739,21 +916,51 @@ class RpcConnectionPoolV2 extends EventEmitter {
         p95Latency: sortedLatencies[p95Index] || 0,
         p99Latency: sortedLatencies[p99Index] || 0
       },
-      endpoints: this.endpoints.map(ep => ({
-        url: ep.url,
-        calls: ep.stats.calls,
-        successes: ep.stats.successes,
-        failures: ep.stats.failures,
-        successRate: ep.stats.calls > 0 ? (ep.stats.successes / ep.stats.calls * 100).toFixed(2) + '%' : '0%',
-        inFlight: ep.stats.inFlight,
-        avgLatency: ep.stats.calls > 0 
-          ? (ep.stats.totalLatency / ep.stats.calls).toFixed(2)
-          : 0,
-        health: ep.health.healthy ? 'healthy' : 'unhealthy',
-        breaker: ep.breaker.state,
-        rateLimit: `${ep.rateLimit.tokens.toFixed(1)}/${ep.config.rpsLimit}`
-      }))
+      endpoints: this.endpoints.map(ep => {
+        const rateLimitStatus = ep.rateLimiter.getStatus();
+        return {
+          url: ep.url,
+          calls: ep.stats.calls,
+          successes: ep.stats.successes,
+          failures: ep.stats.failures,
+          successRate: ep.stats.calls > 0 ? (ep.stats.successes / ep.stats.calls * 100).toFixed(2) + '%' : '0%',
+          inFlight: ep.stats.inFlight,
+          avgLatency: ep.stats.calls > 0 
+            ? (ep.stats.totalLatency / ep.stats.calls).toFixed(2)
+            : 0,
+          health: ep.health.healthy ? 'healthy' : 'unhealthy',
+          breaker: ep.breaker.state,
+          rateLimit: `${rateLimitStatus.tokens}/${rateLimitStatus.maxTokens}`,
+          rateLimitUtilization: rateLimitStatus.utilization
+        };
+      })
     };
+  }
+  
+  getLoadDistribution() {
+    const distribution = {};
+    let totalRequests = 0;
+    
+    for (const endpoint of this.endpoints) {
+      const requests = endpoint.stats.calls;
+      totalRequests += requests;
+      distribution[endpoint.url] = {
+        requests,
+        percentage: 0, // Calculate after total known
+        inFlight: endpoint.stats.inFlight,
+        capacity: endpoint.config.maxConcurrent,
+        utilization: (endpoint.stats.inFlight / endpoint.config.maxConcurrent * 100).toFixed(1) + '%'
+      };
+    }
+    
+    // Calculate percentages
+    for (const url in distribution) {
+      distribution[url].percentage = totalRequests > 0 
+        ? ((distribution[url].requests / totalRequests) * 100).toFixed(1) + '%'
+        : '0%';
+    }
+    
+    return distribution;
   }
   
   async destroy() {
