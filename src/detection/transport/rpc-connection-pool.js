@@ -15,6 +15,468 @@ dotenv.config();
 // Configure DNS caching for faster resolution
 dns.setDefaultResultOrder('ipv4first');
 
+// Request coalescing cache to reduce duplicate RPC calls
+class RequestCoalescingCache {
+  constructor(defaultTTL = 250) {
+    this.cache = new Map(); // key -> { promise, expiresAt, requestCount }
+    this.defaultTTL = defaultTTL;
+    this.stats = {
+      hits: 0,
+      misses: 0,
+      coalescedRequests: 0,
+      cacheSize: 0
+    };
+  }
+  
+  generateKey(method, params, commitment = 'confirmed') {
+    // Create deterministic key for identical requests
+    return JSON.stringify({ method, params: params || [], commitment });
+  }
+  
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    this.stats.hits++;
+    entry.requestCount++;
+    this.stats.coalescedRequests++;
+    return entry.promise;
+  }
+  
+  set(key, promise, ttl = this.defaultTTL) {
+    const expiresAt = Date.now() + ttl;
+    this.cache.set(key, {
+      promise,
+      expiresAt,
+      requestCount: 1,
+      createdAt: Date.now()
+    });
+    
+    this.stats.misses++;
+    this.cleanup(); // Remove expired entries
+  }
+  
+  cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now > entry.expiresAt) {
+        this.cache.delete(key);
+      }
+    }
+    this.stats.cacheSize = this.cache.size;
+  }
+  
+  getStats() {
+    return {
+      ...this.stats,
+      hitRate: this.stats.hits / (this.stats.hits + this.stats.misses) * 100,
+      coalescingEfficiency: this.stats.coalescedRequests / this.stats.misses
+    };
+  }
+  
+  clear() {
+    this.cache.clear();
+    this.stats.cacheSize = 0;
+  }
+}
+
+// Batch request manager to reduce network overhead
+class BatchRequestManager {
+  constructor(batchWindow = 50, maxBatchSize = 100) {
+    this.batchWindow = batchWindow; // ms to wait for more requests
+    this.maxBatchSize = maxBatchSize;
+    this.pendingBatches = new Map(); // method -> { requests: [], timer: timeout }
+    this.stats = {
+      batchesSent: 0,
+      requestsBatched: 0,
+      individualRequests: 0,
+      batchSavings: 0
+    };
+  }
+  
+  // Methods that can be batched efficiently
+  getBatchableMethod(method) {
+    const batchMethods = {
+      'getAccountInfo': 'getMultipleAccounts',
+      'getBalance': 'getMultipleAccounts', // Can batch balance requests
+      'getProgramAccounts': null, // Cannot batch efficiently
+      'getTokenSupply': null, // Individual calls only
+      'getSlot': null // Individual calls only
+    };
+    return batchMethods[method];
+  }
+  
+  canBatch(method) {
+    return this.getBatchableMethod(method) !== null;
+  }
+  
+  addToBatch(method, params, options, deferred, executor) {
+    const batchMethod = this.getBatchableMethod(method);
+    if (!batchMethod) {
+      return false; // Cannot batch this method
+    }
+    
+    const batchKey = this.createBatchKey(method, options);
+    
+    if (!this.pendingBatches.has(batchKey)) {
+      this.pendingBatches.set(batchKey, {
+        method: batchMethod,
+        requests: [],
+        timer: null,
+        options,
+        executor
+      });
+    }
+    
+    const batch = this.pendingBatches.get(batchKey);
+    batch.requests.push({
+      originalMethod: method,
+      params,
+      deferred,
+      addedAt: Date.now()
+    });
+    
+    // Start batch timer if first request
+    if (batch.requests.length === 1) {
+      batch.timer = setTimeout(() => {
+        this.executeBatch(batchKey);
+      }, this.batchWindow);
+    }
+    
+    // Execute immediately if batch is full
+    if (batch.requests.length >= this.maxBatchSize) {
+      clearTimeout(batch.timer);
+      this.executeBatch(batchKey);
+    }
+    
+    return true;
+  }
+  
+  createBatchKey(method, options) {
+    // Group by method and commitment level
+    const commitment = options.commitment || 'confirmed';
+    return `${method}:${commitment}`;
+  }
+  
+  async executeBatch(batchKey) {
+    const batch = this.pendingBatches.get(batchKey);
+    if (!batch || batch.requests.length === 0) return;
+    
+    this.pendingBatches.delete(batchKey);
+    clearTimeout(batch.timer);
+    
+    try {
+      // Prepare addresses for batch
+      const addresses = batch.requests.map(req => {
+        if (req.originalMethod === 'getAccountInfo') {
+          return req.params[0]; // Address is first parameter
+        } else if (req.originalMethod === 'getBalance') {
+          return req.params[0]; // Address is first parameter
+        }
+        return null;
+      }).filter(Boolean);
+      
+      // Execute batch request through the executor
+      const batchResult = await batch.executor(batch.method, addresses, batch.options);
+      
+      // Update stats
+      this.stats.batchesSent++;
+      this.stats.requestsBatched += batch.requests.length;
+      this.stats.batchSavings += batch.requests.length - 1; // Saved calls
+      
+      // Distribute results back to individual requests
+      // Handle both direct value and result.value structures
+      const resultValue = batchResult?.value || batchResult?.result?.value;
+      if (resultValue) {
+        batch.requests.forEach((req, index) => {
+          const accountData = resultValue[index];
+          
+          if (req.originalMethod === 'getAccountInfo') {
+            req.deferred.resolve({ value: accountData });
+          } else if (req.originalMethod === 'getBalance') {
+            // Extract balance from account data
+            const balance = accountData ? accountData.lamports : 0;
+            req.deferred.resolve({ value: balance });
+          }
+        });
+      } else {
+        // No valid results, reject all
+        const error = new Error('No valid batch results received');
+        batch.requests.forEach(req => {
+          req.deferred.reject(error);
+        });
+      }
+    } catch (error) {
+      // Reject all requests in batch
+      batch.requests.forEach(req => {
+        req.deferred.reject(error);
+      });
+    }
+  }
+  
+  getStats() {
+    return {
+      ...this.stats,
+      avgBatchSize: this.stats.requestsBatched / (this.stats.batchesSent || 1),
+      efficiencyGain: this.stats.batchSavings / (this.stats.requestsBatched || 1)
+    };
+  }
+  
+  clear() {
+    // Clear all pending batches
+    for (const [key, batch] of this.pendingBatches.entries()) {
+      clearTimeout(batch.timer);
+      batch.requests.forEach(req => {
+        req.deferred.reject(new Error('Batch manager cleared'));
+      });
+    }
+    this.pendingBatches.clear();
+  }
+}
+
+// Hedged request manager for improved tail latency
+class HedgedRequestManager {
+  constructor() {
+    this.activeHedges = new Map(); // requestId -> hedge tracking
+    this.stats = {
+      hedgesTriggered: 0,
+      hedgesWon: 0,
+      hedgesCancelled: 0,
+      latencyImprovement: 0,
+      primaryWins: 0
+    };
+  }
+  
+  calculateHedgingDelay(endpoint) {
+    // Use recent P95 latency as hedge trigger point
+    const recentLatencies = endpoint.stats.latencies.slice(-20);
+    if (recentLatencies.length < 5) {
+      return parseInt(process.env.RPC_HEDGING_DELAY_MS) || 200;
+    }
+    
+    // Calculate P95 from recent samples
+    const sorted = [...recentLatencies].sort((a, b) => a - b);
+    const p95Index = Math.floor(sorted.length * 0.95);
+    const p95Latency = sorted[p95Index] || 200;
+    
+    // Hedge at 75% of P95 to catch tail latency
+    return Math.max(50, Math.min(500, Math.floor(p95Latency * 0.75)));
+  }
+  
+  shouldHedge(request, primaryEndpoint, availableEndpoints) {
+    // Skip hedging if disabled
+    if (process.env.RPC_HEDGING_ENABLED !== 'true') {
+      return false;
+    }
+    
+    // Skip hedging for retries
+    if (request.attempts > 0) {
+      return false;
+    }
+    
+    // Skip if not enough alternative endpoints
+    if (availableEndpoints.length < 2) {
+      return false;
+    }
+    
+    // Skip for methods that shouldn't be hedged
+    const nonHedgeMethods = ['sendTransaction', 'simulateTransaction'];
+    if (nonHedgeMethods.includes(request.method)) {
+      return false;
+    }
+    
+    return true;
+  }
+  
+  createHedge(requestId, primaryPromise, request, primaryEndpoint, alternativeEndpoints, executor) {
+    const hedgeDelay = this.calculateHedgingDelay(primaryEndpoint);
+    const maxHedges = parseInt(process.env.RPC_HEDGING_MAX_EXTRA) || 1;
+    
+    const hedgeInfo = {
+      primaryPromise,
+      hedgePromises: [],
+      timers: [],
+      resolved: false,
+      winner: null,
+      startTime: Date.now(),
+      primaryEndpoint,
+      request
+    };
+    
+    this.activeHedges.set(requestId, hedgeInfo);
+    
+    // Set up hedging timer
+    const hedgeTimer = setTimeout(() => {
+      if (hedgeInfo.resolved) return;
+      
+      // Select alternative endpoint
+      const altEndpoint = this.selectAlternativeEndpoint(
+        primaryEndpoint, 
+        alternativeEndpoints
+      );
+      
+      if (altEndpoint) {
+        this.stats.hedgesTriggered++;
+        
+        // Execute hedge request through executor
+        const hedgePromise = executor(request, altEndpoint)
+          .then(result => ({ result, source: 'hedge-0', endpoint: altEndpoint }))
+          .catch(error => ({ error, source: 'hedge-0', endpoint: altEndpoint }));
+        
+        hedgeInfo.hedgePromises.push(hedgePromise);
+        
+        // Set up additional hedges if configured
+        if (hedgeInfo.hedgePromises.length < maxHedges && alternativeEndpoints.length > 2) {
+          const additionalTimer = setTimeout(() => {
+            if (hedgeInfo.resolved) return;
+            
+            const secondAltEndpoint = this.selectAlternativeEndpoint(
+              primaryEndpoint,
+              alternativeEndpoints.filter(ep => ep !== altEndpoint)
+            );
+            
+            if (secondAltEndpoint) {
+              const secondHedge = executor(request, secondAltEndpoint)
+                .then(result => ({ result, source: 'hedge-1', endpoint: secondAltEndpoint }))
+                .catch(error => ({ error, source: 'hedge-1', endpoint: secondAltEndpoint }));
+              
+              hedgeInfo.hedgePromises.push(secondHedge);
+            }
+          }, hedgeDelay);
+          
+          hedgeInfo.timers.push(additionalTimer);
+        }
+      }
+    }, hedgeDelay);
+    
+    hedgeInfo.timers.push(hedgeTimer);
+    
+    return hedgeInfo;
+  }
+  
+  async raceWithHedges(requestId) {
+    const hedgeInfo = this.activeHedges.get(requestId);
+    if (!hedgeInfo) return null;
+    
+    try {
+      // Prepare primary promise with source info
+      const primaryWithSource = hedgeInfo.primaryPromise
+        .then(result => ({ result, source: 'primary', endpoint: hedgeInfo.primaryEndpoint }))
+        .catch(error => Promise.reject(error));
+      
+      // Race primary against all hedges
+      const allPromises = [primaryWithSource, ...hedgeInfo.hedgePromises];
+      
+      // Wait for first successful response
+      const winner = await Promise.race(allPromises.map((p, i) => 
+        p.then(res => {
+          if (res.error) throw res.error;
+          return res;
+        })
+      ));
+      
+      // Mark as resolved and track winner
+      hedgeInfo.resolved = true;
+      hedgeInfo.winner = winner.source;
+      
+      const latencyImprovement = this.calculateLatencyImprovement(hedgeInfo);
+      this.stats.latencyImprovement += latencyImprovement;
+      
+      if (winner.source === 'primary') {
+        this.stats.primaryWins++;
+      } else {
+        this.stats.hedgesWon++;
+      }
+      
+      // Cleanup and return result
+      this.cleanup(requestId);
+      return winner.result;
+      
+    } catch (error) {
+      // If all requests fail, cleanup and throw
+      this.cleanup(requestId);
+      throw error;
+    }
+  }
+  
+  calculateLatencyImprovement(hedgeInfo) {
+    if (!hedgeInfo.winner || hedgeInfo.winner === 'primary') {
+      return 0;
+    }
+    
+    // Estimate improvement based on hedge delay
+    const hedgeDelay = this.calculateHedgingDelay(hedgeInfo.primaryEndpoint);
+    const totalTime = Date.now() - hedgeInfo.startTime;
+    
+    // If hedge won, we saved at least the difference between hedge delay and actual time
+    return Math.max(0, hedgeDelay - totalTime);
+  }
+  
+  cleanup(requestId) {
+    const hedgeInfo = this.activeHedges.get(requestId);
+    if (!hedgeInfo) return;
+    
+    // Clear all timers
+    hedgeInfo.timers.forEach(timer => clearTimeout(timer));
+    
+    // Track cancelled hedges
+    if (!hedgeInfo.resolved) {
+      this.stats.hedgesCancelled += hedgeInfo.hedgePromises.length;
+    }
+    
+    this.activeHedges.delete(requestId);
+  }
+  
+  selectAlternativeEndpoint(primaryEndpoint, availableEndpoints) {
+    // Select different endpoint with best score
+    const alternatives = availableEndpoints.filter(ep => 
+      ep.index !== primaryEndpoint.index &&
+      ep.breaker.state !== 'OPEN' &&
+      ep.health.healthy &&
+      ep.stats.inFlight < ep.config.maxConcurrent
+    );
+    
+    if (alternatives.length === 0) return null;
+    
+    // Choose endpoint with lowest current load and best recent performance
+    return alternatives.sort((a, b) => {
+      const aLoad = a.stats.inFlight / a.config.maxConcurrent;
+      const bLoad = b.stats.inFlight / b.config.maxConcurrent;
+      
+      // Consider both load and recent latency
+      const aScore = aLoad + (a.health.latency / 1000);
+      const bScore = bLoad + (b.health.latency / 1000);
+      
+      return aScore - bScore;
+    })[0];
+  }
+  
+  getStats() {
+    const totalRequests = this.stats.hedgesTriggered || 1;
+    return {
+      ...this.stats,
+      hedgeSuccessRate: this.stats.hedgesTriggered > 0 
+        ? (this.stats.hedgesWon / this.stats.hedgesTriggered * 100).toFixed(1) + '%'
+        : '0%',
+      avgLatencyImprovement: this.stats.hedgesTriggered > 0
+        ? Math.round(this.stats.latencyImprovement / this.stats.hedgesTriggered)
+        : 0
+    };
+  }
+  
+  clear() {
+    // Cleanup all active hedges
+    for (const requestId of this.activeHedges.keys()) {
+      this.cleanup(requestId);
+    }
+  }
+}
+
 // Token bucket implementation for proper rate limiting
 class TokenBucket {
   constructor(rpsLimit, windowMs = 1000) {
@@ -116,6 +578,20 @@ class RpcConnectionPoolV2 extends EventEmitter {
     this.requestId = 0;
     this.globalInFlight = 0;
     this.isDestroyed = false;
+    
+    // Initialize request coalescing cache
+    this.coalescingCache = new RequestCoalescingCache(
+      parseInt(process.env.RPC_COALESCING_TTL_MS) || 250
+    );
+    
+    // Initialize batch request manager
+    this.batchManager = new BatchRequestManager(
+      parseInt(process.env.RPC_BATCH_WINDOW_MS) || 50,
+      parseInt(process.env.RPC_BATCH_MAX_SIZE) || 100
+    );
+    
+    // Initialize hedged request manager
+    this.hedgeManager = new HedgedRequestManager();
     
     // Request queue with backpressure
     this.requestQueue = [];
@@ -249,13 +725,145 @@ class RpcConnectionPoolV2 extends EventEmitter {
   }
   
   /**
-   * Main RPC call method with queuing and intelligent routing
+   * Main RPC call method with batching, coalescing, queuing and intelligent routing
    */
   async call(method, params = [], options = {}) {
     if (this.isDestroyed) {
       throw new Error('RPC pool has been destroyed');
     }
     
+    // Check if batching is enabled and method is batchable
+    if (process.env.RPC_BATCHING_ENABLED === 'true' && this.batchManager.canBatch(method)) {
+      const deferred = this.createDeferred();
+      
+      // Create executor function that the batch manager will use
+      const executor = async (batchMethod, addresses, batchOptions) => {
+        return this.executeNewRequest(batchMethod, [addresses, { encoding: 'jsonParsed', ...batchOptions }], batchOptions);
+      };
+      
+      const added = this.batchManager.addToBatch(method, params, options, deferred, executor);
+      if (added) {
+        return deferred.promise;
+      }
+    }
+    
+    // Check if coalescing is enabled
+    if (process.env.RPC_COALESCING_ENABLED !== 'false') {
+      // Generate coalescing key
+      const coalescingKey = this.coalescingCache.generateKey(
+        method, 
+        params, 
+        options.commitment || 'confirmed'
+      );
+      
+      // Check if identical request is already in flight
+      const existingPromise = this.coalescingCache.get(coalescingKey);
+      if (existingPromise) {
+        // Return the existing promise - multiple waiters share same result
+        return existingPromise;
+      }
+      
+      // Create new request and cache the promise
+      const requestPromise = this.executeNewRequest(method, params, options);
+      this.coalescingCache.set(coalescingKey, requestPromise);
+      
+      // Clean up cache entry after completion (success or failure)
+      requestPromise.finally(() => {
+        // Allow cache TTL to handle cleanup naturally
+        // Don't immediately delete to allow brief result sharing
+      });
+      
+      return requestPromise;
+    }
+    
+    // Both batching and coalescing disabled, use original logic
+    return this.executeNewRequest(method, params, options);
+  }
+  
+  /**
+   * Explicit batch method for advanced users
+   * @param {Array} requests - Array of { method, params, options? }
+   * @returns {Promise<Array>} Array of results
+   */
+  async callBatch(requests) {
+    if (this.isDestroyed) {
+      throw new Error('RPC pool has been destroyed');
+    }
+    
+    // Separate batchable and non-batchable requests
+    const batchableRequests = [];
+    const individualRequests = [];
+    
+    for (const req of requests) {
+      if (process.env.RPC_BATCHING_ENABLED === 'true' && this.batchManager.canBatch(req.method)) {
+        batchableRequests.push(req);
+      } else {
+        individualRequests.push(req);
+      }
+    }
+    
+    const results = [];
+    
+    // Process batchable requests together
+    if (batchableRequests.length > 0) {
+      // Group by method type for batching
+      const methodGroups = new Map();
+      for (const req of batchableRequests) {
+        const key = `${req.method}:${req.options?.commitment || 'confirmed'}`;
+        if (!methodGroups.has(key)) {
+          methodGroups.set(key, []);
+        }
+        methodGroups.get(key).push(req);
+      }
+      
+      // Execute each batch group
+      for (const [key, group] of methodGroups) {
+        const addresses = group.map(req => req.params[0]);
+        const batchMethod = this.batchManager.getBatchableMethod(group[0].method);
+        
+        try {
+          const batchResult = await this.executeNewRequest(
+            batchMethod,
+            [addresses, { encoding: 'jsonParsed', ...(group[0].options || {}) }],
+            group[0].options || {}
+          );
+          
+          // Map results back to original requests
+          if (batchResult && batchResult.value) {
+            group.forEach((req, index) => {
+              const accountData = batchResult.value[index];
+              if (req.method === 'getAccountInfo') {
+                results.push({ value: accountData });
+              } else if (req.method === 'getBalance') {
+                const balance = accountData ? accountData.lamports : 0;
+                results.push({ value: balance });
+              }
+            });
+          }
+        } catch (error) {
+          // Add error for each request in the failed batch
+          group.forEach(() => results.push({ error }));
+        }
+      }
+    }
+    
+    // Process individual requests
+    for (const req of individualRequests) {
+      try {
+        const result = await this.call(req.method, req.params || [], req.options || {});
+        results.push(result);
+      } catch (error) {
+        results.push({ error });
+      }
+    }
+    
+    return results;
+  }
+  
+  /**
+   * Execute a new request (not coalesced)
+   */
+  async executeNewRequest(method, params, options) {
     // Handle requestId overflow
     if (this.requestId >= Number.MAX_SAFE_INTEGER) {
       this.requestId = 0;
@@ -297,48 +905,59 @@ class RpcConnectionPoolV2 extends EventEmitter {
     
     try {
       // Select best endpoint using intelligent load balancing
-      const endpoint = this.selectEndpoint(request);
+      const primaryEndpoint = this.selectEndpoint(request);
       
-      if (!endpoint) {
+      if (!primaryEndpoint) {
         throw new Error('No available endpoints');
       }
       
       // Note: Rate limit token already consumed in selectEndpoint()
       
-      // Execute RPC call
-      endpoint.stats.inFlight++;
+      // Check if we should hedge this request
+      const availableEndpoints = this.endpoints.filter(ep => 
+        ep.breaker.state !== 'OPEN' && ep.health.healthy
+      );
       
-      const result = await this.executeRpcCall(endpoint, request);
-      
-      // Update statistics
-      const latency = Date.now() - startTime;
-      this.updateStats(endpoint, true, latency);
-      
-      // Record telemetry if monitor is configured
-      if (this.monitor && typeof this.monitor.recordLatency === 'function') {
-        this.monitor.recordLatency(request.method, latency, endpoint.url);
-      }
-      if (this.monitor && typeof this.monitor.recordSuccess === 'function') {
-        this.monitor.recordSuccess(request.method, endpoint.url);
-      }
-      
-      // Reset circuit breaker on success
-      if (endpoint.breaker.state !== 'CLOSED') {
-        endpoint.breaker.consecutiveSuccesses++;
-        if (endpoint.breaker.consecutiveSuccesses >= 3) {
-          endpoint.breaker.state = 'CLOSED';
-          endpoint.breaker.failures = 0;
-          endpoint.breaker.consecutiveSuccesses = 0;
-          this.emit('breaker-closed', endpoint.index);
+      if (this.hedgeManager.shouldHedge(request, primaryEndpoint, availableEndpoints)) {
+        // Execute with hedging
+        const result = await this.executeWithHedging(request, primaryEndpoint, availableEndpoints);
+        request.deferred.resolve(result);
+      } else {
+        // Execute without hedging (original logic)
+        primaryEndpoint.stats.inFlight++;
+        
+        const result = await this.executeRpcCall(primaryEndpoint, request);
+        
+        // Update statistics
+        const latency = Date.now() - startTime;
+        this.updateStats(primaryEndpoint, true, latency);
+        
+        // Record telemetry if monitor is configured
+        if (this.monitor && typeof this.monitor.recordLatency === 'function') {
+          this.monitor.recordLatency(request.method, latency, primaryEndpoint.url);
         }
+        if (this.monitor && typeof this.monitor.recordSuccess === 'function') {
+          this.monitor.recordSuccess(request.method, primaryEndpoint.url);
+        }
+        
+        // Reset circuit breaker on success
+        if (primaryEndpoint.breaker.state !== 'CLOSED') {
+          primaryEndpoint.breaker.consecutiveSuccesses++;
+          if (primaryEndpoint.breaker.consecutiveSuccesses >= 3) {
+            primaryEndpoint.breaker.state = 'CLOSED';
+            primaryEndpoint.breaker.failures = 0;
+            primaryEndpoint.breaker.consecutiveSuccesses = 0;
+            this.emit('breaker-closed', primaryEndpoint.index);
+          }
+        }
+        
+        request.deferred.resolve(result);
       }
-      
-      request.deferred.resolve(result);
       
     } catch (error) {
       // Record error telemetry if monitor is configured
       if (this.monitor && typeof this.monitor.recordError === 'function') {
-        this.monitor.recordError(request.method, error, endpoint ? endpoint.url : 'unknown');
+        this.monitor.recordError(request.method, error, 'unknown');
       }
       
       // Handle failure with intelligent retry
@@ -362,6 +981,93 @@ class RpcConnectionPoolV2 extends EventEmitter {
       // Process queued requests
       this.processQueue();
     }
+  }
+  
+  async executeWithHedging(request, primaryEndpoint, availableEndpoints) {
+    const startTime = Date.now();
+    
+    // Execute primary request
+    primaryEndpoint.stats.inFlight++;
+    const primaryPromise = this.executeRpcCall(primaryEndpoint, request)
+      .then(result => {
+        // Update stats for successful primary
+        const latency = Date.now() - startTime;
+        this.updateStats(primaryEndpoint, true, latency);
+        
+        // Record telemetry
+        if (this.monitor && typeof this.monitor.recordLatency === 'function') {
+          this.monitor.recordLatency(request.method, latency, primaryEndpoint.url);
+        }
+        if (this.monitor && typeof this.monitor.recordSuccess === 'function') {
+          this.monitor.recordSuccess(request.method, primaryEndpoint.url);
+        }
+        
+        // Reset circuit breaker on success
+        if (primaryEndpoint.breaker.state !== 'CLOSED') {
+          primaryEndpoint.breaker.consecutiveSuccesses++;
+          if (primaryEndpoint.breaker.consecutiveSuccesses >= 3) {
+            primaryEndpoint.breaker.state = 'CLOSED';
+            primaryEndpoint.breaker.failures = 0;
+            primaryEndpoint.breaker.consecutiveSuccesses = 0;
+            this.emit('breaker-closed', primaryEndpoint.index);
+          }
+        }
+        
+        return result;
+      })
+      .catch(error => {
+        // Update stats for failed primary
+        this.updateStats(primaryEndpoint, false, Date.now() - startTime);
+        throw error;
+      })
+      .finally(() => {
+        primaryEndpoint.stats.inFlight--;
+      });
+    
+    // Create executor for hedge requests
+    const hedgeExecutor = async (req, endpoint) => {
+      endpoint.stats.inFlight++;
+      try {
+        const result = await this.executeRpcCall(endpoint, req);
+        
+        // Update stats for successful hedge
+        const latency = Date.now() - startTime;
+        this.updateStats(endpoint, true, latency);
+        
+        // Reset circuit breaker on success
+        if (endpoint.breaker.state !== 'CLOSED') {
+          endpoint.breaker.consecutiveSuccesses++;
+          if (endpoint.breaker.consecutiveSuccesses >= 3) {
+            endpoint.breaker.state = 'CLOSED';
+            endpoint.breaker.failures = 0;
+            endpoint.breaker.consecutiveSuccesses = 0;
+            this.emit('breaker-closed', endpoint.index);
+          }
+        }
+        
+        return result;
+      } catch (error) {
+        // Update stats for failed hedge
+        this.updateStats(endpoint, false, Date.now() - startTime);
+        throw error;
+      } finally {
+        endpoint.stats.inFlight--;
+      }
+    };
+    
+    // Create hedge with primary promise
+    this.hedgeManager.createHedge(
+      request.id,
+      primaryPromise,
+      request,
+      primaryEndpoint,
+      availableEndpoints,
+      hedgeExecutor
+    );
+    
+    // Race primary against hedges
+    const result = await this.hedgeManager.raceWithHedges(request.id);
+    return result;
   }
   
   selectEndpoint(request) {
@@ -916,6 +1622,9 @@ class RpcConnectionPoolV2 extends EventEmitter {
         p95Latency: sortedLatencies[p95Index] || 0,
         p99Latency: sortedLatencies[p99Index] || 0
       },
+      coalescing: this.coalescingCache.getStats(),
+      batching: this.batchManager.getStats(),
+      hedging: this.hedgeManager.getStats(),
       endpoints: this.endpoints.map(ep => {
         const rateLimitStatus = ep.rateLimiter.getStatus();
         return {
@@ -963,6 +1672,61 @@ class RpcConnectionPoolV2 extends EventEmitter {
     return distribution;
   }
   
+  /**
+   * Health check for orchestrator integration
+   * Returns health status quickly (<100ms)
+   */
+  async healthCheck() {
+    try {
+      // Check if we have any healthy endpoints
+      const healthyEndpoints = this.endpoints.filter(ep => ep.health.healthy);
+      if (healthyEndpoints.length === 0) {
+        return {
+          healthy: false,
+          error: 'No healthy endpoints available',
+          details: {
+            totalEndpoints: this.endpoints.length,
+            healthyEndpoints: 0
+          }
+        };
+      }
+      
+      // Check if pool is destroyed
+      if (this.isDestroyed) {
+        return {
+          healthy: false,
+          error: 'Pool is destroyed'
+        };
+      }
+      
+      // Return healthy if we have at least one working endpoint
+      const stats = this.getStats();
+      return {
+        healthy: true,
+        details: {
+          healthyEndpoints: healthyEndpoints.length,
+          totalEndpoints: this.endpoints.length,
+          successRate: stats.global.successRate,
+          inFlight: stats.global.inFlight,
+          queuedRequests: this.requestQueue.length
+        }
+      };
+    } catch (error) {
+      return {
+        healthy: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Health check alias for health monitor compatibility
+   */
+  async isHealthy() {
+    const result = await this.healthCheck();
+    return result.healthy;
+  }
+  
   async destroy() {
     if (this.isDestroyed) return;
     
@@ -984,6 +1748,15 @@ class RpcConnectionPoolV2 extends EventEmitter {
       request.deferred.reject(new Error('Pool destroyed'));
     }
     this.requestQueue = [];
+    
+    // Clear batch manager
+    this.batchManager.clear();
+    
+    // Clear coalescing cache
+    this.coalescingCache.clear();
+    
+    // Clear hedge manager
+    this.hedgeManager.clear();
     
     // Destroy HTTP agents
     for (const agent of this.agents.values()) {

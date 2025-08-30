@@ -1,6 +1,13 @@
 ✅ System orchestrator imported
-2025-08-29T13:42:30.746Z [INFO] SystemOrchestrator: Starting trading system...
-2025-08-29T13:42:30.747Z [ERROR] SystemOrchestrator: System startup failed {"error":"Configuration invalid: HELIUS_RPC_URL: Required when USE_FAKES=false"}
-2025-08-29T13:42:30.747Z [INFO] SystemOrchestrator: Shutting down trading system...
-2025-08-29T13:42:30.747Z [INFO] SystemOrchestrator: Trading system shut down complete
-❌ System test failed: Configuration invalid: HELIUS_RPC_URL: Required when USE_FAKES=false
+{"timestamp":"2025-08-30T03:03:09.008Z","level":"INFO","component":"SystemOrchestrator","message":"Starting trading system..."}
+{"timestamp":"2025-08-30T03:03:09.013Z","level":"INFO","component":"SystemOrchestrator","message":"Components registered with factory"}
+{"timestamp":"2025-08-30T03:03:09.013Z","level":"INFO","component":"SystemOrchestrator","message":"Starting rpc-connection-pool..."}
+{"timestamp":"2025-08-30T03:03:09.051Z","level":"INFO","component":"ComponentFactory","message":"Component created","componentType":"rpc-connection-pool","useFakes":false,"instanceKey":"rpc-connection-pool_real"}
+{"timestamp":"2025-08-30T03:03:09.051Z","level":"INFO","component":"SystemOrchestrator","message":"rpc-connection-pool started successfully"}
+{"timestamp":"2025-08-30T03:03:09.052Z","level":"INFO","component":"SystemOrchestrator","message":"Trading system started successfully","components":["rpc-connection-pool"],"useFakes":false}
+✅ System started successfully
+Active components: [ 'rpc-connection-pool' ]
+{"timestamp":"2025-08-30T03:03:09.153Z","level":"INFO","component":"SystemOrchestrator","message":"Shutting down trading system..."}
+{"timestamp":"2025-08-30T03:03:09.153Z","level":"INFO","component":"SystemOrchestrator","message":"rpc-connection-pool shut down successfully"}
+{"timestamp":"2025-08-30T03:03:09.153Z","level":"INFO","component":"SystemOrchestrator","message":"Trading system shut down complete"}
+✅ System shutdown gracefully
