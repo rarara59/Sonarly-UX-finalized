@@ -1,0 +1,171 @@
+{
+  "timestamp": "2025-08-31T20:28:16.052Z",
+  "summary": {
+    "passed": 3,
+    "failed": 7,
+    "passRate": "30.0%"
+  },
+  "metrics": {
+    "failuresBeforeOpen": 6,
+    "recoverySuccesses": 0,
+    "thresholdPrecision": 1,
+    "cooldownAccuracy": 0,
+    "openCircuits": 50,
+    "avgExecuteLatency": 0.0018633514999819455,
+    "p99ExecuteLatency": 0.005790999995952006,
+    "memoryPerServiceKB": -9.14296875,
+    "concurrentDuration": 8,
+    "concurrentErrors": 0,
+    "stateTransitions": 4
+  },
+  "tests": [
+    {
+      "name": "CLOSED → OPEN Transition",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6
+      }
+    },
+    {
+      "name": "Recovery Cycle",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0
+      }
+    },
+    {
+      "name": "Failure Threshold Precision",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1
+      }
+    },
+    {
+      "name": "Cooldown Timing Accuracy",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0
+      }
+    },
+    {
+      "name": "Service Isolation",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0,
+        "openCircuits": 50
+      }
+    },
+    {
+      "name": "State Check Latency",
+      "passed": true,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0,
+        "openCircuits": 50,
+        "avgExecuteLatency": 0.0018633514999819455,
+        "p99ExecuteLatency": 0.005790999995952006
+      }
+    },
+    {
+      "name": "Memory Per Service",
+      "passed": true,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0,
+        "openCircuits": 50,
+        "avgExecuteLatency": 0.0018633514999819455,
+        "p99ExecuteLatency": 0.005790999995952006,
+        "memoryPerServiceKB": -9.14296875
+      }
+    },
+    {
+      "name": "Concurrent Safety",
+      "passed": true,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0,
+        "openCircuits": 50,
+        "avgExecuteLatency": 0.0018633514999819455,
+        "p99ExecuteLatency": 0.005790999995952006,
+        "memoryPerServiceKB": -9.14296875,
+        "concurrentDuration": 8,
+        "concurrentErrors": 0
+      }
+    },
+    {
+      "name": "Recovery Detection Speed",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0,
+        "openCircuits": 50,
+        "avgExecuteLatency": 0.0018633514999819455,
+        "p99ExecuteLatency": 0.005790999995952006,
+        "memoryPerServiceKB": -9.14296875,
+        "concurrentDuration": 8,
+        "concurrentErrors": 0
+      }
+    },
+    {
+      "name": "State Persistence",
+      "passed": false,
+      "metrics": {
+        "failuresBeforeOpen": 6,
+        "recoverySuccesses": 0,
+        "thresholdPrecision": 1,
+        "cooldownAccuracy": 0,
+        "openCircuits": 50,
+        "avgExecuteLatency": 0.0018633514999819455,
+        "p99ExecuteLatency": 0.005790999995952006,
+        "memoryPerServiceKB": -9.14296875,
+        "concurrentDuration": 8,
+        "concurrentErrors": 0,
+        "stateTransitions": 4
+      }
+    }
+  ],
+  "requirements": {
+    "stateTransitions": {
+      "target": "100% accuracy",
+      "actual": "6 failures",
+      "passed": false
+    },
+    "failureThreshold": {
+      "target": "Within 1 failure",
+      "actual": "1 difference",
+      "passed": true
+    },
+    "cooldownTiming": {
+      "target": "Within 5%",
+      "actual": "0.0%",
+      "passed": false
+    },
+    "serviceIsolation": {
+      "target": "100 services",
+      "actual": "undefined services",
+      "passed": false
+    },
+    "concurrentSafety": {
+      "target": "0 race conditions",
+      "actual": "0 errors",
+      "passed": true
+    }
+  }
+}

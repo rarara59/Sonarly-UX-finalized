@@ -1,0 +1,247 @@
+{
+  "timestamp": "2025-08-30T22:26:56.646Z",
+  "testDuration": "5 minutes",
+  "totalRequests": 11024,
+  "successRate": "96.44%",
+  "memoryGrowthPerHour": "267.83%",
+  "heapDumps": 6,
+  "memorySnapshots": [
+    {
+      "label": "Initial",
+      "minute": 0,
+      "heapMB": 4.841926574707031,
+      "rssMB": 44.203125,
+      "externalMB": 2.0961837768554688,
+      "arrayBuffersMB": 0.04199981689453125,
+      "totalHeapMB": 7.515625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "0.5min",
+      "minute": 0.5000833333333333,
+      "heapMB": 5.5809326171875,
+      "rssMB": 72.109375,
+      "externalMB": 2.137725830078125,
+      "arrayBuffersMB": 0.02759838104248047,
+      "totalHeapMB": 22.765625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "1.0min",
+      "minute": 1.0000666666666667,
+      "heapMB": 5.801521301269531,
+      "rssMB": 71.109375,
+      "externalMB": 2.7016220092773438,
+      "arrayBuffersMB": 0.02808380126953125,
+      "totalHeapMB": 43.515625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "1.5min",
+      "minute": 1.5000666666666667,
+      "heapMB": 5.9268341064453125,
+      "rssMB": 66.21875,
+      "externalMB": 2.2451820373535156,
+      "arrayBuffersMB": 0.030061721801757812,
+      "totalHeapMB": 24.515625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "2.0min",
+      "minute": 2.0010833333333333,
+      "heapMB": 5.838615417480469,
+      "rssMB": 57.28125,
+      "externalMB": 2.2095413208007812,
+      "arrayBuffersMB": 0.026879310607910156,
+      "totalHeapMB": 41.015625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "2.5min",
+      "minute": 2.5010666666666665,
+      "heapMB": 5.8023681640625,
+      "rssMB": 58.96875,
+      "externalMB": 2.2558555603027344,
+      "arrayBuffersMB": 0.028693199157714844,
+      "totalHeapMB": 24.515625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "3.0min",
+      "minute": 3.0010833333333333,
+      "heapMB": 5.84539794921875,
+      "rssMB": 59.765625,
+      "externalMB": 2.2691049575805664,
+      "arrayBuffersMB": 0.028146743774414062,
+      "totalHeapMB": 40.015625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "3.5min",
+      "minute": 3.5010666666666665,
+      "heapMB": 5.877891540527344,
+      "rssMB": 52.046875,
+      "externalMB": 2.4271888732910156,
+      "arrayBuffersMB": 0.02631664276123047,
+      "totalHeapMB": 24.265625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "4.0min",
+      "minute": 4.0011,
+      "heapMB": 5.9719085693359375,
+      "rssMB": 63.09375,
+      "externalMB": 2.329029083251953,
+      "arrayBuffersMB": 0.030550003051757812,
+      "totalHeapMB": 40.015625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "4.5min",
+      "minute": 4.5011,
+      "heapMB": 6.043937683105469,
+      "rssMB": 54.03125,
+      "externalMB": 2.257472038269043,
+      "arrayBuffersMB": 0.02795696258544922,
+      "totalHeapMB": 23.515625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    },
+    {
+      "label": "Final",
+      "minute": 5,
+      "heapMB": 5.9226226806640625,
+      "rssMB": 65.3125,
+      "externalMB": 2.2828779220581055,
+      "arrayBuffersMB": 0.028693199157714844,
+      "totalHeapMB": 40.265625,
+      "heapContexts": 1,
+      "detachedContexts": 0
+    }
+  ],
+  "objectCounts": [
+    {
+      "label": "Initial",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 0,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592514779
+    },
+    {
+      "label": "0.5min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 1557,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592544999
+    },
+    {
+      "label": "1.0min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 3112,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592575005
+    },
+    {
+      "label": "1.5min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 4665,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592605001
+    },
+    {
+      "label": "2.0min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 6235,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592635059
+    },
+    {
+      "label": "2.5min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 7758,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592665055
+    },
+    {
+      "label": "3.0min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 9336,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592695057
+    },
+    {
+      "label": "3.5min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 10912,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592725057
+    },
+    {
+      "label": "4.0min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 12507,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592755060
+    },
+    {
+      "label": "4.5min",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 14026,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592785073
+    },
+    {
+      "label": "Final",
+      "poolEndpoints": 3,
+      "poolQueueSize": 0,
+      "poolRequestId": 15596,
+      "globalLatencies": 0,
+      "circuitBreakerEvents": 0,
+      "endpointLatencies": 0,
+      "timestamp": 1756592816318
+    }
+  ],
+  "suspectedLeaks": [],
+  "recommendations": [
+    "CRITICAL: Memory growth exceeds 100%/hour"
+  ]
+}

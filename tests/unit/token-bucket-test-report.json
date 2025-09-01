@@ -1,0 +1,194 @@
+{
+  "timestamp": "2025-08-31T19:52:46.856Z",
+  "summary": {
+    "passed": 7,
+    "failed": 3,
+    "passRate": "70.0%"
+  },
+  "metrics": {
+    "rateLimitingAccuracy": 100,
+    "avgTokenCheckLatency": 0.0001505974800050535,
+    "p99TokenCheckLatency": 0.000375000003259629,
+    "burstRate": 98.96041583366653,
+    "burstCapacityUsed": 495,
+    "replenishmentAccuracy": 100,
+    "configSuccessRate": 100,
+    "memoryOperations": 27335104,
+    "memoryIncrease": 10.643646240234375,
+    "peakMemory": 19.37871551513672,
+    "concurrentDuration": 99,
+    "recoveryRate": 50,
+    "recoveryAccuracy": 100
+  },
+  "tests": [
+    {
+      "name": "Rate Limiting Accuracy",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100
+      }
+    },
+    {
+      "name": "Token Check Latency",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629
+      }
+    },
+    {
+      "name": "Burst Handling",
+      "passed": false,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495
+      }
+    },
+    {
+      "name": "Token Replenishment",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100
+      }
+    },
+    {
+      "name": "Configuration Loading",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100,
+        "configSuccessRate": 100
+      }
+    },
+    {
+      "name": "Memory Stability",
+      "passed": false,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100,
+        "configSuccessRate": 100,
+        "memoryOperations": 27335104,
+        "memoryIncrease": 10.643646240234375,
+        "peakMemory": 19.37871551513672
+      }
+    },
+    {
+      "name": "Concurrent Access",
+      "passed": false,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100,
+        "configSuccessRate": 100,
+        "memoryOperations": 27335104,
+        "memoryIncrease": 10.643646240234375,
+        "peakMemory": 19.37871551513672,
+        "concurrentDuration": 99
+      }
+    },
+    {
+      "name": "Recovery After Exhaustion",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100,
+        "configSuccessRate": 100,
+        "memoryOperations": 27335104,
+        "memoryIncrease": 10.643646240234375,
+        "peakMemory": 19.37871551513672,
+        "concurrentDuration": 99,
+        "recoveryRate": 50,
+        "recoveryAccuracy": 100
+      }
+    },
+    {
+      "name": "Event Emission",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100,
+        "configSuccessRate": 100,
+        "memoryOperations": 27335104,
+        "memoryIncrease": 10.643646240234375,
+        "peakMemory": 19.37871551513672,
+        "concurrentDuration": 99,
+        "recoveryRate": 50,
+        "recoveryAccuracy": 100
+      }
+    },
+    {
+      "name": "Health Check",
+      "passed": true,
+      "metrics": {
+        "rateLimitingAccuracy": 100,
+        "avgTokenCheckLatency": 0.0001505974800050535,
+        "p99TokenCheckLatency": 0.000375000003259629,
+        "burstRate": 98.96041583366653,
+        "burstCapacityUsed": 495,
+        "replenishmentAccuracy": 100,
+        "configSuccessRate": 100,
+        "memoryOperations": 27335104,
+        "memoryIncrease": 10.643646240234375,
+        "peakMemory": 19.37871551513672,
+        "concurrentDuration": 99,
+        "recoveryRate": 50,
+        "recoveryAccuracy": 100
+      }
+    }
+  ],
+  "requirements": {
+    "rateLimitingAccuracy": {
+      "target": "95%+",
+      "actual": "100.0%",
+      "passed": true
+    },
+    "tokenCheckLatency": {
+      "target": "<1ms",
+      "actual": "0.0002ms",
+      "passed": true
+    },
+    "memoryUsage": {
+      "target": "<50MB",
+      "actual": "19.38MB",
+      "passed": true
+    },
+    "burstHandling": {
+      "target": "2x rate for 10s",
+      "actual": "98.96 rps",
+      "passed": false
+    },
+    "configurationLoading": {
+      "target": "100%",
+      "actual": "100.0%",
+      "passed": true
+    }
+  }
+}
