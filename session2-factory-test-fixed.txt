@@ -1,6 +1,0 @@
-✅ Component factory imported
-✅ RPC pool registered with factory
-{"timestamp":"2025-08-30T03:18:11.580Z","level":"INFO","component":"ComponentFactory","message":"Component created","componentType":"rpc-connection-pool","useFakes":false,"instanceKey":"rpc-connection-pool_real"}
-✅ Real component created via factory
-✅ Component works through factory: SUCCESS
-   Current slot: 363425927

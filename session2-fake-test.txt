@@ -1,3 +1,0 @@
-✅ Adapter imported
-✅ Fake component created
-✅ Fake component works: 123456789

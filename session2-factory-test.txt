@@ -1,2 +1,0 @@
-✅ Component factory imported
-❌ Factory test failed: Unknown component type: rpc-connection-pool

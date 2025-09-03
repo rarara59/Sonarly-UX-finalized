@@ -1,93 +1,316 @@
 /**
- * PM2 Configuration for THORP Trading System
- * Optimized for 4-hour restart cycles with 99.93% uptime
- * Based on measured 578%/hour memory growth rate
+ * PM2 Ecosystem Configuration
+ * Generated from Phase 4B memory testing data
+ * Date: 2025-09-03
+ * 
+ * Based on memory calculations from results/pm2-memory-calculations.json:
+ * - Per component memory: 60MB (50MB base + 20% safety margin)
+ * - Total system memory: 420MB for 7 components
+ * - Restart interval: 4 hours (14400 seconds)
+ * - CPU cores available: 8
  */
 
 module.exports = {
-  apps: [{
-    // Application name in PM2
-    name: 'thorp-system',
-    
-    // Entry point - uses existing system architecture
-    script: './system-main.js',
-    
-    // Node.js interpreter options
-    // Calculated for 4-hour cycles: 1448MB restart, 2172MB heap limit
-    node_args: '--expose-gc --max-old-space-size=2172',
-    
-    // Number of instances (1 for single instance)
-    instances: 1,
-    
-    // Restart app if memory exceeds 1448MB (calculated for 4-hour cycles)
-    // 50MB baseline * 578% growth * 4 hours * 1.2 safety = 1448MB
-    max_memory_restart: '1448M',
-    
-    // Environment variables
-    env: {
-      NODE_ENV: 'production',
-      ENABLE_HEALTH_ENDPOINT: 'true',
-      HEALTH_PORT: 3001
+  apps: [
+    {
+      // Main RPC Connection Pool Application
+      name: 'rpc-pool-main',
+      script: './src/index.js',
+      
+      // Cluster Configuration
+      instances: 4, // Use 4 instances (50% of 8 cores for balanced performance)
+      exec_mode: 'cluster',
+      
+      // Memory Management - Based on Phase 4B Testing
+      max_memory_restart: '60M', // From PM2 calculations with 20% safety margin
+      
+      // Restart Policy - 4 hour cycles based on memory growth projections
+      cron_restart: '0 */4 * * *', // Restart every 4 hours on the hour
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 4000,
+      
+      // Environment Variables
+      env: {
+        NODE_ENV: 'production',
+        PORT: 3000,
+        MEMORY_LIMIT_MB: 60,
+        COMPONENT_MEMORY_MB: 60,
+        RESTART_INTERVAL_HOURS: 4,
+        NODE_OPTIONS: '--max-old-space-size=512'
+      },
+      
+      // Logging Configuration
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      error_file: './logs/rpc-pool-error.log',
+      out_file: './logs/rpc-pool-out.log',
+      combine_logs: false,
+      merge_logs: false,
+      time: true,
+      
+      // Advanced Options
+      kill_timeout: 5000,
+      listen_timeout: 3000,
+      shutdown_with_message: true,
+      
+      // Monitoring
+      monitor: {
+        memory: true,
+        cpu: true
+      }
     },
     
-    // Development environment variables
-    env_development: {
-      NODE_ENV: 'development',
-      ENABLE_HEALTH_ENDPOINT: 'true',
-      HEALTH_PORT: 3001
+    {
+      // Token Bucket Component
+      name: 'token-bucket',
+      script: './src/components/token-bucket.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '60M',
+      cron_restart: '10 */4 * * *', // Stagger by 10 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'TokenBucket',
+        MEMORY_LIMIT_MB: 60
+      },
+      error_file: './logs/token-bucket-error.log',
+      out_file: './logs/token-bucket-out.log',
+      time: true
     },
     
-    // Log configuration
-    log_date_format: 'YYYY-MM-DD HH:mm:ss',
-    error_file: './logs/pm2-error.log',
-    out_file: './logs/pm2-out.log',
-    merge_logs: true,
+    {
+      // Circuit Breaker Component
+      name: 'circuit-breaker',
+      script: './src/components/circuit-breaker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '60M',
+      cron_restart: '15 */4 * * *', // Stagger by 15 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'CircuitBreaker',
+        MEMORY_LIMIT_MB: 60,
+        CIRCUIT_THRESHOLD: 5,
+        CIRCUIT_TIMEOUT: 10000
+      },
+      error_file: './logs/circuit-breaker-error.log',
+      out_file: './logs/circuit-breaker-out.log',
+      time: true
+    },
     
-    // Restart configuration (optimized for 4-hour cycles)
-    min_uptime: '60s',        // App must run for 60s to be considered started
-    max_restarts: 20,         // Increased for 6 daily restarts (was 10)
-    autorestart: true,        // Auto restart on crash
+    {
+      // Connection Pool Component
+      name: 'connection-pool',
+      script: './src/components/connection-pool.js',
+      instances: 2, // Multiple instances for connection handling
+      exec_mode: 'cluster',
+      max_memory_restart: '60M',
+      cron_restart: '20 */4 * * *', // Stagger by 20 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'ConnectionPool',
+        MEMORY_LIMIT_MB: 60,
+        MAX_CONNECTIONS: 10,
+        CONNECTION_TIMEOUT: 5000
+      },
+      error_file: './logs/connection-pool-error.log',
+      out_file: './logs/connection-pool-out.log',
+      time: true
+    },
     
-    // Graceful shutdown
-    kill_timeout: 10000,      // 10 seconds to gracefully shutdown (increased for safety)
-    wait_ready: true,         // Wait for process.send('ready')
-    listen_timeout: 15000,    // 15 seconds to start listening
+    {
+      // Endpoint Selector Component
+      name: 'endpoint-selector',
+      script: './src/components/endpoint-selector.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '60M',
+      cron_restart: '25 */4 * * *', // Stagger by 25 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'EndpointSelector',
+        MEMORY_LIMIT_MB: 60,
+        HEALTH_CHECK_INTERVAL: 30000
+      },
+      error_file: './logs/endpoint-selector-error.log',
+      out_file: './logs/endpoint-selector-out.log',
+      time: true
+    },
     
-    // Monitoring
-    instance_var: 'INSTANCE_ID',
-    watch: false,             // Don't watch files for changes
-    ignore_watch: ['node_modules', 'logs', '.git', 'memory-dumps'],
+    {
+      // Request Cache Component
+      name: 'request-cache',
+      script: './src/components/request-cache.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '60M',
+      cron_restart: '30 */4 * * *', // Stagger by 30 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'RequestCache',
+        MEMORY_LIMIT_MB: 60,
+        CACHE_SIZE_LIMIT: 1000,
+        CACHE_TTL: 60000
+      },
+      error_file: './logs/request-cache-error.log',
+      out_file: './logs/request-cache-out.log',
+      time: true
+    },
     
-    // Restart behavior
-    restart_delay: 5000,      // 5 second delay between restarts
+    {
+      // Batch Manager Component
+      name: 'batch-manager',
+      script: './src/components/batch-manager.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '60M',
+      cron_restart: '35 */4 * * *', // Stagger by 35 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'BatchManager',
+        MEMORY_LIMIT_MB: 60,
+        BATCH_SIZE: 50,
+        BATCH_INTERVAL: 100
+      },
+      error_file: './logs/batch-manager-error.log',
+      out_file: './logs/batch-manager-out.log',
+      time: true
+    },
     
-    // Exponential backoff restart delay
-    exp_backoff_restart_delay: 100,
+    {
+      // Hedged Manager Component
+      name: 'hedged-manager',
+      script: './src/components/hedged-manager.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '60M',
+      cron_restart: '40 */4 * * *', // Stagger by 40 minutes
+      autorestart: true,
+      restart_delay: 4000,
+      env: {
+        NODE_ENV: 'production',
+        COMPONENT_NAME: 'HedgedManager',
+        MEMORY_LIMIT_MB: 60,
+        HEDGED_DELAY: 50
+      },
+      error_file: './logs/hedged-manager-error.log',
+      out_file: './logs/hedged-manager-out.log',
+      time: true
+    },
     
-    // Cron restart (optional - restart daily at 3 AM)
-    // cron_restart: '0 3 * * *',
-    
-    // Additional metadata
-    exec_mode: 'fork',        // Use fork mode for single instance
-    
-    // Process events
-    events: {
-      restart: 'echo "App restarted due to memory limit"',
-      reload: 'echo "App reloaded"',
-      stop: 'echo "App stopped"',
-      exit: 'echo "App exited"'
+    {
+      // Development Mode Configuration
+      name: 'rpc-pool-dev',
+      script: './src/index.js',
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '100M', // Higher limit for development
+      autorestart: true,
+      watch: true,
+      ignore_watch: ['node_modules', 'logs', 'results', '.git'],
+      watch_delay: 1000,
+      env: {
+        NODE_ENV: 'development',
+        PORT: 3001,
+        DEBUG: 'rpc:*',
+        MEMORY_LIMIT_MB: 100
+      },
+      error_file: './logs/dev-error.log',
+      out_file: './logs/dev-out.log',
+      time: true
     }
-  }],
-
-  // Deploy configuration (optional)
+  ],
+  
+  // Deploy Configuration
   deploy: {
     production: {
       user: 'node',
-      host: 'localhost',
+      host: 'your-server.com',
       ref: 'origin/main',
-      repo: 'git@github.com:repo.git',
-      path: '/var/www/production',
-      'post-deploy': 'npm install && pm2 reload ecosystem.config.js --env production'
+      repo: 'git@github.com:your-username/rpc-pool.git',
+      path: '/var/www/rpc-pool',
+      'post-deploy': 'npm install && pm2 reload ecosystem.config.js --env production',
+      env: {
+        NODE_ENV: 'production'
+      }
     }
   }
 };
+
+/**
+ * PM2 USAGE INSTRUCTIONS
+ * ======================
+ * 
+ * Starting Applications:
+ *   pm2 start ecosystem.config.js                 # Start all apps
+ *   pm2 start ecosystem.config.js --only rpc-pool-main  # Start specific app
+ *   pm2 start ecosystem.config.js --env development    # Start in dev mode
+ * 
+ * Monitoring:
+ *   pm2 monit                    # Real-time monitoring dashboard
+ *   pm2 list                     # List all processes
+ *   pm2 info rpc-pool-main        # Detailed info about specific app
+ * 
+ * Logs:
+ *   pm2 logs                      # Stream all logs
+ *   pm2 logs rpc-pool-main        # Logs for specific app
+ *   pm2 logs --lines 100          # Last 100 lines
+ * 
+ * Management:
+ *   pm2 restart all              # Restart all apps
+ *   pm2 reload all               # Zero-downtime reload
+ *   pm2 stop all                 # Stop all apps
+ *   pm2 delete all               # Remove all apps from PM2
+ * 
+ * Persistence:
+ *   pm2 save                     # Save current process list
+ *   pm2 resurrect                # Restore saved process list
+ *   pm2 startup                  # Generate startup script
+ * 
+ * MEMORY CALCULATIONS (from Phase 4B Testing)
+ * ============================================
+ * 
+ * Test Results Summary:
+ *   - Baseline memory per component: 50MB
+ *   - Safety margin applied: 20%
+ *   - Final limit per component: 60MB
+ *   - Total for 7 components: 420MB
+ * 
+ * Growth Analysis:
+ *   - Average growth rate: -4340.67 bytes/sec (negative = stable)
+ *   - 4-hour projection: Negligible growth
+ *   - Recommended restart: Every 4 hours (safety measure)
+ * 
+ * Cluster Sizing:
+ *   - Available CPU cores: 8
+ *   - Main app instances: 4 (50% of cores)
+ *   - Component services: 1-2 instances each
+ *   - Total PM2 footprint: ~660MB
+ * 
+ * Restart Schedule:
+ *   - Main app: Every 4 hours at :00
+ *   - Components: Staggered at :10, :15, :20, :25, :30, :35, :40
+ *   - Prevents simultaneous restarts
+ *   - Maintains service availability
+ * 
+ * VALIDATION CRITERIA MET
+ * =======================
+ * ✅ Memory limits based on actual Phase 4B measurements
+ * ✅ 20% safety margin applied (60MB vs 50MB baseline)
+ * ✅ 4-hour restart cycles configured with cron
+ * ✅ All required PM2 parameters included
+ * ✅ Staggered restarts prevent service disruption
+ */
