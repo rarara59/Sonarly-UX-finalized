@@ -321,140 +321,41 @@ class ComponentFactory extends EventEmitter {
   }
 
   /**
-   * Component creation methods (to be implemented with actual components)
+   * Component creation methods using actual component classes
    */
   async createTokenBucket() {
-    // Placeholder - will be replaced with actual TokenBucket implementation
-    return {
-      type: 'TokenBucket',
-      config: this.config.tokenBucket,
-      async initialize() { return true; },
-      async hasTokens(count) { return true; },
-      async consume(count) { return true; },
-      async healthCheck() { return { healthy: true, tokens: 100 }; },
-      async shutdown() { return true; }
-    };
+    const { default: TokenBucket } = await import('./token-bucket.js');
+    return new TokenBucket(this.config.tokenBucket);
   }
 
   async createCircuitBreaker() {
-    // Placeholder - will be replaced with actual CircuitBreaker implementation
-    return {
-      type: 'CircuitBreaker',
-      config: this.config.circuitBreaker,
-      state: 'CLOSED',
-      async initialize() { return true; },
-      async execute(key, fn) { return fn(); },
-      async healthCheck() { return { healthy: true, state: 'CLOSED' }; },
-      async shutdown() { return true; }
-    };
+    const { default: CircuitBreaker } = await import('./circuit-breaker.js');
+    return new CircuitBreaker(this.config.circuitBreaker);
   }
 
   async createRequestCache() {
-    // Placeholder - will be replaced with actual RequestCache implementation
-    return {
-      type: 'RequestCache',
-      config: this.config.requestCache,
-      cache: new Map(),
-      async initialize() { return true; },
-      async get(key) { return this.cache.get(key); },
-      async set(key, value, ttl) { 
-        this.cache.set(key, value);
-        setTimeout(() => this.cache.delete(key), ttl);
-        return true;
-      },
-      async healthCheck() { return { healthy: true, size: this.cache.size }; },
-      async shutdown() { 
-        this.cache.clear();
-        return true;
-      }
-    };
+    const { default: RequestCache } = await import('./request-cache.js');
+    return new RequestCache(this.config.requestCache);
   }
 
   async createEndpointSelector() {
-    // Placeholder - will be replaced with actual EndpointSelector implementation
-    return {
-      type: 'EndpointSelector',
-      config: this.config.endpointSelector,
-      endpoints: this.config.endpointSelector.endpoints,
-      currentIndex: 0,
-      async initialize() { return true; },
-      async selectEndpoint() { 
-        const endpoint = this.endpoints[this.currentIndex];
-        this.currentIndex = (this.currentIndex + 1) % this.endpoints.length;
-        return endpoint;
-      },
-      async selectBackupEndpoint() {
-        return this.endpoints[(this.currentIndex + 1) % this.endpoints.length];
-      },
-      async healthCheck() { 
-        return { healthy: true, availableEndpoints: this.endpoints.length };
-      },
-      async shutdown() { return true; }
-    };
+    const { default: EndpointSelector } = await import('./endpoint-selector.js');
+    return new EndpointSelector(this.config.endpointSelector);
   }
 
   async createConnectionPoolCore() {
-    // For now, use the existing RpcConnectionPoolV2 if available
-    try {
-      const { RpcConnectionPoolV2 } = await import('./rpc-connection-pool.js');
-      return new RpcConnectionPoolV2(this.config.connectionPoolCore);
-    } catch (error) {
-      // Fallback to placeholder
-      return {
-        type: 'ConnectionPoolCore',
-        config: this.config.connectionPoolCore,
-        async initialize() { return true; },
-        async execute(method, params) {
-          return { jsonrpc: '2.0', id: 1, result: { method, params } };
-        },
-        async executeWithEndpoint(endpoint, method, params) {
-          return { jsonrpc: '2.0', id: 1, result: { endpoint, method, params } };
-        },
-        async healthCheck() { return { healthy: true, connections: 0 }; },
-        async shutdown() { return true; }
-      };
-    }
+    const { default: ConnectionPoolCore } = await import('./connection-pool-core.js');
+    return new ConnectionPoolCore(this.config.connectionPool);
   }
 
   async createBatchManager(connectionPool) {
-    // Placeholder - will be replaced with actual BatchManager implementation
-    return {
-      type: 'BatchManager',
-      config: this.config.batchManager,
-      connectionPool,
-      pendingBatches: [],
-      async initialize() { return true; },
-      async addRequest(method, params, executor) {
-        return executor([{ method, params }]);
-      },
-      async healthCheck() { 
-        return { healthy: true, pendingBatches: this.pendingBatches.length };
-      },
-      async shutdown() { return true; }
-    };
+    const { default: BatchManager } = await import('./batch-manager.js');
+    return new BatchManager(this.config.batchManager, connectionPool);
   }
 
   async createHedgedManager(endpointSelector, connectionPool) {
-    // Placeholder - will be replaced with actual HedgedManager implementation
-    return {
-      type: 'HedgedManager',
-      config: this.config.hedgedManager,
-      endpointSelector,
-      connectionPool,
-      async initialize() { return true; },
-      async hedgedRequest(primaryRequest, backupRequests, delay) {
-        try {
-          return await primaryRequest();
-        } catch (error) {
-          if (backupRequests.length > 0) {
-            return await backupRequests[0]();
-          }
-          throw error;
-        }
-      },
-      async healthCheck() { return { healthy: true, hedgesActive: 0 }; },
-      async shutdown() { return true; }
-    };
+    const { default: HedgedManager } = await import('./hedged-manager.js');
+    return new HedgedManager(this.config.hedgedManager, { endpointSelector, connectionPool });
   }
 
   /**

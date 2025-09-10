@@ -34,7 +34,8 @@ export class BatchManager extends EventEmitter {
       'getSlot': null, // Individual calls only
       'getSignatureStatuses': 'getSignatureStatuses', // Already accepts array
       'getMultipleAccounts': 'getMultipleAccounts' // Already batched
-    };
+    }
+;
     
     // Custom batch methods can be added
     if (config.customBatchMethods) {
@@ -65,6 +66,14 @@ export class BatchManager extends EventEmitter {
     
     // Track if destroyed
     this.isDestroyed = false;
+  }
+  
+  /**
+   * Initialize the BatchManager (compatibility method)
+   */
+  async initialize() {
+    // Component is already initialized in constructor
+    return true;
   }
   
   /**

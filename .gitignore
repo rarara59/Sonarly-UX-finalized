@@ -1,0 +1,17 @@
+# Memory dumps and performance files
+memory-dumps/
+*.heapsnapshot
+reports/
+results/
+backup-*/
+
+# System files
+.DS_Store
+*.log
+
+# Environment files (keep only .env)
+.env.old
+.env.production
+
+# Node modules
+node_modules/

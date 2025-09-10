@@ -63,7 +63,8 @@ export class ConnectionPoolCore extends EventEmitter {
       avgReuseTime: 0,
       socketLeaks: 0,
       cleanedUpConnections: 0
-    };
+    }
+;
     
     // Cleanup interval
     this.cleanupInterval = null;
@@ -76,6 +77,14 @@ export class ConnectionPoolCore extends EventEmitter {
     
     // Track if destroyed
     this.isDestroyed = false;
+  }
+  
+  /**
+   * Initialize the ConnectionPoolCore (compatibility method)
+   */
+  async initialize() {
+    // Component is already initialized in constructor
+    return true;
   }
   
   /**
@@ -221,6 +230,15 @@ export class ConnectionPoolCore extends EventEmitter {
   /**
    * Execute HTTP/HTTPS request with connection pooling
    */
+  
+  /**
+   * Execute request with specific endpoint (compatibility method)
+   */
+  async executeWithEndpoint(endpoint, options) {
+    // Delegate to execute method with endpoint in options
+    return this.execute({ ...options, endpoint });
+  }
+
   async execute(url, options = {}) {
     if (this.isDestroyed) {
       throw new Error('Connection pool has been destroyed');

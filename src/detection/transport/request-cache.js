@@ -33,6 +33,7 @@ export class RequestCache extends EventEmitter {
     
     // Main cache storage with Map for performance
     this.cache = new Map(); // key -> { data, promise, expiresAt, requestCount, lastAccessed }
+
     
     // LRU tracking
     this.accessOrder = new Map(); // key -> timestamp
@@ -62,6 +63,14 @@ export class RequestCache extends EventEmitter {
     
     // Track if destroyed
     this.isDestroyed = false;
+  }
+  
+  /**
+   * Initialize the RequestCache (compatibility method)
+   */
+  async initialize() {
+    // Component is already initialized in constructor
+    return true;
   }
   
   /**

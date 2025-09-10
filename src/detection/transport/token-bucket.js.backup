@@ -28,14 +28,6 @@ export class TokenBucket extends EventEmitter {
                          parseInt(process.env.BURST_DURATION_MS) || 
                          10000; // 10 seconds burst duration
     
-    // NEW: Quantized timing support for higher accuracy
-    this.rateWindow = config.rateWindow || 
-                      parseInt(process.env.RATE_WINDOW_QUANTUM_MS) || 
-                      50; // 50ms quantized windows for better accuracy
-    this.ratePeriod = this.windowMs || 1000; // Period in ms (default 1 second)
-    // Calculate tokens per window more precisely
-    this.tokensPerWindow = (this.rateLimit * this.rateWindow) / this.ratePeriod;
-    
     // Initialize token bucket
     this.maxTokens = this.rateLimit;
     this.tokens = Math.min(5, this.rateLimit); // Start with fewer tokens to prevent initial burst
@@ -63,14 +55,9 @@ export class TokenBucket extends EventEmitter {
     this.metricsResetInterval = setInterval(() => {
       this.resetMetrics();
     }, 3600000); // Reset every hour
-  }
-  
-  /**
-   * Initialize the TokenBucket (compatibility method)
-   */
-  async initialize() {
-    // Component is already initialized in constructor
-    return true;
+    
+    // Configuration validation
+    this.validateConfiguration();
   }
   
   /**
@@ -175,23 +162,24 @@ export class TokenBucket extends EventEmitter {
   }
   
   /**
-   * Refill tokens based on time passed using quantized windows for accuracy
+   * Refill tokens based on time passed
    */
   refill() {
     const now = Date.now();
-    const windowsSinceRefill = Math.floor((now - this.lastRefill) / this.rateWindow);
+    const timePassed = now - this.lastRefill;
     
-    if (windowsSinceRefill >= 1) {
-      // Use integer math for precise token calculation
-      const tokensToAdd = windowsSinceRefill * this.tokensPerWindow;
-      
-      // Apply appropriate max based on mode
-      const currentMax = this.burstMode ? this.burstCapacity : this.maxTokens;
-      this.tokens = Math.min(currentMax, this.tokens + tokensToAdd);
-      
-      // Update lastRefill to exact window boundary for accuracy
-      this.lastRefill += (windowsSinceRefill * this.rateWindow);
+    if (timePassed <= 0) {
+      return;
     }
+    
+    // Calculate tokens to add based on refill rate
+    const tokensToAdd = (timePassed / 1000) * this.refillRate;
+    
+    // Apply appropriate max based on mode
+    const currentMax = this.burstMode ? this.burstCapacity : this.maxTokens;
+    this.tokens = Math.min(currentMax, this.tokens + tokensToAdd);
+    
+    this.lastRefill = now;
   }
   
   /**

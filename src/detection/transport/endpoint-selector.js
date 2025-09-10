@@ -71,7 +71,8 @@ export class EndpointSelector extends EventEmitter {
     // Metrics tracking
     this.metrics = {
       totalSelections: 0,
-      endpointSelections: {},
+      endpointSelections: {}
+,
       failovers: 0,
       recoveries: 0,
       avgSelectionLatency: 0,
@@ -87,6 +88,14 @@ export class EndpointSelector extends EventEmitter {
     if (config.endpoints && config.endpoints.length > 0) {
       this.initializeEndpoints(config.endpoints);
     }
+  }
+  
+  /**
+   * Initialize the EndpointSelector (compatibility method)
+   */
+  async initialize() {
+    // Component is already initialized in constructor
+    return true;
   }
   
   /**
@@ -166,33 +175,26 @@ export class EndpointSelector extends EventEmitter {
         this.updateSelectionMetrics(anyEndpoint, startTime);
         return anyEndpoint;
       }
-      
-      throw new Error('No available endpoints');
     }
     
-    // Select based on strategy
-    let selected = null;
+    return null;
+  }
+  
+  /**
+   * Select a backup endpoint (compatibility method)
+   */
+  selectBackupEndpoint(excludeEndpoint) {
+    // Get available endpoints excluding the primary
+    const available = this.getAvailableEndpoints().filter(
+      ep => ep.url !== excludeEndpoint
+    );
     
-    switch (this.selectionStrategy) {
-      case 'round-robin':
-        selected = this.selectRoundRobin(available);
-        break;
-      case 'random':
-        selected = this.selectRandom(available);
-        break;
-      case 'weighted-score':
-        selected = this.selectByScore(available);
-        break;
-      case 'weighted-round-robin':
-      default:
-        selected = this.selectWeightedRoundRobin(available);
-        break;
+    if (available.length === 0) {
+      return null;
     }
     
-    // Update metrics
-    this.updateSelectionMetrics(selected, startTime);
-    
-    return selected;
+    // Use round-robin selection for backup
+    return this.selectRoundRobin(available);
   }
   
   /**

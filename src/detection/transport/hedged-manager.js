@@ -52,7 +52,8 @@ export class HedgedManager extends EventEmitter {
       cancellationSuccess: 0,
       cancellationFailures: 0,
       memoryLeaks: 0
-    };
+    }
+;
     
     // Memory management
     this.cleanupInterval = setInterval(() => {
@@ -61,6 +62,14 @@ export class HedgedManager extends EventEmitter {
     
     // Validate configuration
     this.validateConfiguration();
+  }
+  
+  /**
+   * Initialize the HedgedManager (compatibility method)
+   */
+  async initialize() {
+    // Component is already initialized in constructor
+    return true;
   }
   
   /**
