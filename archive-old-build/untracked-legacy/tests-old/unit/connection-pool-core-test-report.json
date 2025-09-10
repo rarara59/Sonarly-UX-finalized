@@ -1,0 +1,132 @@
+{
+  "timestamp": "2025-08-31T22:17:30.014Z",
+  "summary": {
+    "passed": 8,
+    "failed": 1,
+    "passRate": "88.9%"
+  },
+  "metrics": {
+    "socketReusePercentage": "99.00%",
+    "socketLeaks": 0,
+    "keepAliveEfficiency": "Maintained",
+    "concurrentHandling": "100 successful, 0 failed",
+    "connectionLatency": "1.74ms",
+    "reuseLatency": "0.00ms",
+    "memoryPerConnection": "47.07KB",
+    "cleanupTimingAccuracy": "0.1% variance",
+    "longRunningStability": "0 leaks, 0 errors"
+  },
+  "tests": [
+    {
+      "name": "Socket Reuse Efficiency",
+      "passed": true,
+      "metric": "socketReusePercentage",
+      "expected": ">=90%",
+      "actual": "99.00%",
+      "connections": 1,
+      "requests": 100
+    },
+    {
+      "name": "Connection Lifecycle",
+      "passed": true,
+      "metric": "socketLeaks",
+      "expected": 0,
+      "actual": 0,
+      "cleanedUp": 0
+    },
+    {
+      "name": "Keep-Alive Functionality",
+      "passed": true,
+      "metric": "keepAliveEfficiency",
+      "expected": "Connection maintained",
+      "actual": "Maintained",
+      "connectionCounts": {
+        "initial": 1,
+        "afterKeepAlive": 1,
+        "final": 1
+      }
+    },
+    {
+      "name": "Concurrent Connections",
+      "passed": true,
+      "metric": "concurrentHandling",
+      "expected": "100 successful",
+      "actual": "100 successful, 0 failed",
+      "connectionsUsed": 50,
+      "duration": 53
+    },
+    {
+      "name": "Connection Latency",
+      "passed": true,
+      "metric": "connectionLatency",
+      "expected": "<50ms",
+      "actual": "1.74ms",
+      "max": "3.96ms",
+      "poolAvg": "3.00ms"
+    },
+    {
+      "name": "Reuse Latency",
+      "passed": true,
+      "metric": "reuseLatency",
+      "expected": "<5ms",
+      "actual": "0.00ms",
+      "samples": 0,
+      "poolAvg": "0.00ms"
+    },
+    {
+      "name": "Memory Usage",
+      "passed": false,
+      "metric": "memoryPerConnection",
+      "expected": "<5KB",
+      "actual": "47.07KB",
+      "totalIncrease": "470.73KB",
+      "activeAgents": 1
+    },
+    {
+      "name": "Cleanup Timing",
+      "passed": true,
+      "metric": "cleanupTimingAccuracy",
+      "expected": "Within 10% of target",
+      "actual": "0.1% variance",
+      "cleanupCycles": 3,
+      "avgInterval": "1001ms"
+    },
+    {
+      "name": "Long-Running Stability",
+      "passed": true,
+      "metric": "longRunningStability",
+      "expected": "Zero leaks, zero errors",
+      "actual": "0 leaks, 0 errors",
+      "requestCount": 580,
+      "memoryGrowth": "0.85MB",
+      "socketReuse": "100.00%"
+    }
+  ],
+  "requirements": {
+    "socketReuseEfficiency": {
+      "target": "90%+ reuse",
+      "actual": "99.00%",
+      "passed": true
+    },
+    "connectionCleanup": {
+      "target": "Zero socket leaks",
+      "actual": "Not measured",
+      "passed": true
+    },
+    "connectionLatency": {
+      "target": "<50ms",
+      "actual": "1.74ms",
+      "passed": true
+    },
+    "reuseLatency": {
+      "target": "<5ms",
+      "actual": "0.00ms",
+      "passed": true
+    },
+    "memoryPerConnection": {
+      "target": "<5KB",
+      "actual": "47.07KB",
+      "passed": false
+    }
+  }
+}

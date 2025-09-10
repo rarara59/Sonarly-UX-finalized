@@ -1,0 +1,137 @@
+{
+  "timestamp": "2025-09-01T00:37:31.835Z",
+  "summary": {
+    "passed": 9,
+    "failed": 1,
+    "passRate": "90.0%"
+  },
+  "metrics": {
+    "hedgingDelayAccuracy": "2.0% variance",
+    "promiseCleanup": "Complete cleanup",
+    "cancellationSpeed": "6ms",
+    "successImprovement": "80.0% improvement",
+    "resourceCleanup": "0 active, 0 leaks",
+    "concurrentSafety": "No conflicts",
+    "hedgingOverhead": "2.85ms",
+    "adaptiveDelay": "130ms",
+    "nonHedgeableMethods": "Correctly skipped",
+    "memoryLeakDetection": "0 leaks"
+  },
+  "tests": [
+    {
+      "name": "Hedging Delay Accuracy",
+      "passed": true,
+      "metric": "hedgingDelayAccuracy",
+      "expected": "Within 10% of target",
+      "actual": "2.0% variance",
+      "targetDelay": 100,
+      "actualDelay": 102,
+      "variance": 2
+    },
+    {
+      "name": "Promise Race Cleanup",
+      "passed": true,
+      "metric": "promiseCleanup",
+      "expected": "100% cleanup",
+      "actual": "Complete cleanup",
+      "backupsCancelled": 1,
+      "cleanupTime": 0
+    },
+    {
+      "name": "Cancellation Speed",
+      "passed": true,
+      "metric": "cancellationSpeed",
+      "expected": "<100ms",
+      "actual": "6ms",
+      "successRate": "100.0%"
+    },
+    {
+      "name": "Success Rate Improvement",
+      "passed": false,
+      "metric": "successImprovement",
+      "expected": "95%+ improvement",
+      "actual": "80.0% improvement",
+      "singleRate": "50.0%",
+      "hedgedRate": "90.0%"
+    },
+    {
+      "name": "Resource Cleanup",
+      "passed": true,
+      "metric": "resourceCleanup",
+      "expected": "100% cleanup, 0 leaks",
+      "actual": "0 active, 0 leaks",
+      "hedgesCancelled": 10
+    },
+    {
+      "name": "Concurrent Safety",
+      "passed": true,
+      "metric": "concurrentSafety",
+      "expected": "0 race conditions",
+      "actual": "No conflicts",
+      "successful": 100,
+      "hedgesTriggered": 0
+    },
+    {
+      "name": "Hedging Overhead",
+      "passed": true,
+      "metric": "hedgingOverhead",
+      "expected": "<20ms overhead",
+      "actual": "2.85ms",
+      "avgSingle": "51.30ms",
+      "avgHedged": "54.15ms"
+    },
+    {
+      "name": "Adaptive Delay",
+      "passed": true,
+      "metric": "adaptiveDelay",
+      "expected": "130ms",
+      "actual": "130ms",
+      "p95Latency": 130,
+      "variance": 0
+    },
+    {
+      "name": "Non-Hedgeable Methods",
+      "passed": true,
+      "metric": "nonHedgeableMethods",
+      "expected": "No hedging for sendTransaction",
+      "actual": "Correctly skipped",
+      "hedgedRequests": 0
+    },
+    {
+      "name": "Memory Leak Detection",
+      "passed": true,
+      "metric": "memoryLeakDetection",
+      "expected": "0 leaked promises",
+      "actual": "0 leaks",
+      "memoryGrowth": "-0.25MB",
+      "activeHedges": 0
+    }
+  ],
+  "requirements": {
+    "timingAccuracy": {
+      "target": "Within 10%",
+      "actual": "2.0% variance",
+      "passed": true
+    },
+    "resourceCleanup": {
+      "target": "100% cleanup",
+      "actual": "Complete cleanup",
+      "passed": true
+    },
+    "cancellationSpeed": {
+      "target": "<100ms",
+      "actual": "6ms",
+      "passed": true
+    },
+    "successImprovement": {
+      "target": "95%+ improvement",
+      "actual": "80.0% improvement",
+      "passed": false
+    },
+    "memoryLeaks": {
+      "target": "0 leaks",
+      "actual": "0 leaks",
+      "passed": true
+    }
+  }
+}
