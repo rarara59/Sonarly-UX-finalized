@@ -1,28 +1,52 @@
 {
   "expo": {
-    "name": "SonarlyApp2",
-    "slug": "SonarlyApp2",
+    "name": "Sonarly",
+    "slug": "sonarly",
     "version": "1.0.0",
+    "developmentClient": false,
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./src/assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./src/assets/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "app.sonarly.ios",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Sonarly needs camera access to measure heart rate for creating personalized soundscapes",
+        "NSMicrophoneUsageDescription": "Sonarly needs microphone access for audio recording",
+        "UIBackgroundModes": ["audio"],
+        "CFBundleIconName": "AppIcon"
+      },
+      "icon": "./src/assets/icon.png",
+      "buildNumber": "1"
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./src/assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      }
+      },
+      "package": "com.yourcompany.sonarly",
+      "permissions": [
+        "CAMERA",
+        "FLASHLIGHT",
+        "RECORD_AUDIO"
+      ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./src/assets/favicon.png"
+    },
+    "plugins": [],
+    "extra": {
+      "eas": {
+        "projectId": "your-project-id"
+      }
     }
   }
 }
